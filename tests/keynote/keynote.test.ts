@@ -495,7 +495,9 @@ describe("Keynote bridge", () => {
     const mediaObject = deck.deck.slides[0]?.objects.find((object) => object.type === "media");
     assert.equal(mediaObject?.type, "media");
     assert.equal(mediaObject?.mediaType, "video");
+    assert.deepEqual(mediaObject?.bounds, { x: 95, y: 58, width: 320, height: 180 });
     assert.equal(mediaObject?.metadata?.nativeArchiveIdentifier, "333");
+    assert.equal(mediaObject?.metadata?.nativeGeometryCandidate?.reason, "typed Keynote media geometry from archive message type 3007");
     const event = deck.deck.slides[0]?.timeline?.events[0];
     assert.equal(event?.kind, "media");
     assert.equal(event?.kind === "media" ? event.action : undefined, "play");

@@ -2851,6 +2851,7 @@ function findIwaMovieStartMediaAssetMatchesFromScan(scan: IwaScanResult, assets:
       evidence: `typed-message:3007:movie-start-target:${message.archiveIdentifier}`,
       confidence: 0.58,
       source: "archive" as const,
+      geometryCandidate: message.geometryCandidates[0],
       archiveMessage: message
     }));
 }
@@ -3514,7 +3515,7 @@ function inferTypedImageGeometryCandidatesFromPayload(
   messageInfo: IwaArchiveMessageInfo,
   payload: Uint8Array
 ): NativeIwaGeometryCandidate[] {
-  if (messageInfo.type !== 3005 && messageInfo.type !== 3006) {
+  if (!isTypedVisualGeometryMessage(messageInfo.type)) {
     return [];
   }
 
@@ -3549,7 +3550,7 @@ function inferTypedImageGeometryCandidatesFromPayload(
       source: "protobuf",
       confidence: 0.97,
       groupPath: "1.1",
-      reason: `typed Keynote image geometry from archive message type ${messageInfo.type}`
+      reason: `typed Keynote ${messageInfo.type === 3007 ? "media" : "image"} geometry from archive message type ${messageInfo.type}`
     }
   ];
 }
@@ -3558,7 +3559,7 @@ function inferTypedImageGeometryCandidates(
   messageInfo: IwaArchiveMessageInfo,
   numericCandidates: IwaNumericCandidate[]
 ): NativeIwaGeometryCandidate[] {
-  if (messageInfo.type !== 3005 && messageInfo.type !== 3006) {
+  if (!isTypedVisualGeometryMessage(messageInfo.type)) {
     return [];
   }
 
@@ -3585,9 +3586,13 @@ function inferTypedImageGeometryCandidates(
       source: "protobuf",
       confidence: 0.94,
       groupPath: "1.1",
-      reason: `typed Keynote image geometry from archive message type ${messageInfo.type}`
+      reason: `typed Keynote ${messageInfo.type === 3007 ? "media" : "image"} geometry from archive message type ${messageInfo.type}`
     }
   ];
+}
+
+function isTypedVisualGeometryMessage(type: number | undefined): boolean {
+  return type === 3005 || type === 3006 || type === 3007;
 }
 
 function nativeTextContentEvidenceFromPayload(
