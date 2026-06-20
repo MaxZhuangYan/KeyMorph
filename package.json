@@ -11,7 +11,8 @@
     "pptx:to-ir": "node --experimental-transform-types src/cli.ts pptx-to-ir",
     "ir:to-pptx": "node --experimental-transform-types src/cli.ts ir-to-pptx",
     "ir:to-html": "node --experimental-transform-types src/cli.ts ir-to-html",
-    "ir:to-video": "node --experimental-transform-types src/cli.ts ir-to-video"
+    "ir:to-video": "node --experimental-transform-types src/cli.ts ir-to-video",
+    "ir:report": "node --experimental-transform-types src/cli.ts ir-report"
   },
   "engines": {
     "node": ">=24"

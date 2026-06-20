@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 
 import { createDemoDeck } from "./demo/createDemoDeck.ts";
 import { renderHtmlDocument } from "./runtime/index.ts";
-import { scoreConversion } from "./report/index.ts";
+import { createLossReport, scoreConversion } from "./report/index.ts";
 import { exportIrToPptx, parsePptxToIr } from "./pptx/index.ts";
 import { exportIrToVideo } from "./video/index.ts";
 import type { DeckIR } from "./ir/index.ts";
@@ -70,9 +70,15 @@ async function main(): Promise<void> {
       await exportIrToVideo(await readJson<DeckIR>(input), output);
       return;
     }
+    case "ir-report": {
+      if (!input || !output) throw new Error("Usage: ir-report <input.ir.json> <output.report.json>");
+      const deck = await readJson<DeckIR>(input);
+      await writeJson(output, createLossReport(deck.conversion ?? { status: "success", messages: [] }));
+      return;
+    }
     default:
       throw new Error(
-        "Usage: keymorph <demo|pptx-to-ir|ir-to-html|ir-to-pptx|ir-to-video> [input] [output]"
+        "Usage: keymorph <demo|pptx-to-ir|ir-to-html|ir-to-pptx|ir-to-video|ir-report> [input] [output]"
       );
   }
 }

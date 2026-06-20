@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import { scoreConversion } from "../../src/report/index.ts";
+import { createLossReport, scoreConversion } from "../../src/report/index.ts";
 
 describe("conversion report scoring", () => {
   test("scores unsupported, degraded, and uncertain mappings", () => {
@@ -40,5 +40,41 @@ describe("conversion report scoring", () => {
     assert.equal(score.degradedAnimationCount, 1);
     assert.equal(score.uncertainMappingCount, 1);
     assert.ok(score.fidelityScore < 1);
+  });
+
+  test("creates a structured loss report", () => {
+    const loss = createLossReport({
+      status: "partial",
+      messages: [],
+      unsupportedFeatures: [
+        {
+          code: "pptx-anim",
+          severity: "warning",
+          area: "animation",
+          description: "Unsupported timeline node",
+          fallback: "morph"
+        },
+        {
+          code: "slide-transition",
+          severity: "warning",
+          area: "transition",
+          description: "Unsupported transition",
+          fallback: "video"
+        }
+      ],
+      degradedFeatures: [
+        {
+          code: "fade-easing",
+          severity: "warning",
+          area: "animation",
+          description: "Approximated easing",
+          fallback: "linear"
+        }
+      ]
+    });
+
+    assert.equal(loss.animationLostCount, 1);
+    assert.equal(loss.unsupportedTransitions.length, 1);
+    assert.match(loss.degradedAnimations[0], /fade-easing/);
   });
 });

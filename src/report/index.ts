@@ -9,6 +9,13 @@ export interface ConversionScore {
   report: ConversionReport;
 }
 
+export interface ConversionLossReport extends ConversionScore {
+  degradedAnimations: string[];
+  unsupportedAnimations: string[];
+  unsupportedTransitions: string[];
+  generatedAt: string;
+}
+
 export function scoreConversion(report: ConversionReport): ConversionScore {
   const unsupported = report.unsupportedFeatures ?? [];
   const degraded = report.degradedFeatures ?? [];
@@ -36,5 +43,25 @@ export function scoreConversion(report: ConversionReport): ConversionScore {
     fidelityScore,
     recommendedFixes: Array.from(recommendedFixes),
     report
+  };
+}
+
+export function createLossReport(report: ConversionReport): ConversionLossReport {
+  const score = scoreConversion(report);
+  const unsupported = report.unsupportedFeatures ?? [];
+  const degraded = report.degradedFeatures ?? [];
+
+  return {
+    ...score,
+    degradedAnimations: degraded
+      .filter((item) => item.area === "animation")
+      .map((item) => `${item.code}: ${item.description}`),
+    unsupportedAnimations: unsupported
+      .filter((item) => item.area === "animation")
+      .map((item) => `${item.code}: ${item.description}`),
+    unsupportedTransitions: unsupported
+      .filter((item) => item.area === "transition")
+      .map((item) => `${item.code}: ${item.description}`),
+    generatedAt: new Date().toISOString()
   };
 }

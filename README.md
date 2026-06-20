@@ -26,6 +26,7 @@ The system optimizes for visual fidelity and records any unsupported animation o
 npm run build
 npm test
 npm run demo
+npm run ir:report -- demo/out/demo.ir.json demo/out/conversion-report.json
 ```
 
 This checkpoint intentionally has no external npm runtime dependencies. It uses Node 24's built-in TypeScript transform.
