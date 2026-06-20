@@ -2496,18 +2496,35 @@ function decodeTextCandidate(bytes: Uint8Array, minLength: number): string | und
 }
 
 function cleanTextCandidate(value: string): string | undefined {
-  let text = value.replace(/\u0000/g, "").replace(/\s+/g, " ").trim();
+  let text = stripInvalidTextChars(value).replace(/\u0000/g, "").replace(/\s+/g, " ").trim();
   for (const marker of CONTAINER_MARKERS) {
     text = text.replaceAll(marker, " ");
   }
+  text = cleanHumanTextResidue(text);
   text = text.replace(/^[|:;,\-_.\s]+|[|:;,\-_.\s]+$/g, "").replace(/\s+/g, " ").trim();
   if (!text || isContainerMarker(text)) {
+    return undefined;
+  }
+  if (!looksLikePresentationText(text)) {
     return undefined;
   }
   return text;
 }
 
+function cleanHumanTextResidue(value: string): string {
+  let text = value.trim();
+  text = text.replace(/[\s$*\\]+$/g, "").trim();
+  if (/[\p{Script=Han}]/u.test(text)) {
+    text = text.replace(/\s*["'“”‘’][A-Za-z0-9]{1,4}$/u, "").trim();
+    text = text.replace(/[\s$*\\]+$/g, "").trim();
+  }
+  return text;
+}
+
 function looksLikePresentationText(text: string): boolean {
+  if (isLikelyNativeNoiseText(text) || hasBinaryResidue(text)) {
+    return false;
+  }
   const printable = Array.from(text).filter((char) => {
     const code = char.charCodeAt(0);
     return code >= 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
@@ -2516,6 +2533,18 @@ function looksLikePresentationText(text: string): boolean {
     return false;
   }
   if (/^(TSP|TSK|TSD|TSWP|KN|KPF|SFA|SFU|NS)\./.test(text) || /^com\.apple\./.test(text)) {
+    return false;
+  }
+  if (/^(apple|com\.apple|x-apple):/i.test(text) || /^apple[-.:]/i.test(text)) {
+    return false;
+  }
+  if (/^(decimal|double|float|string|boolean|integer|uint|sint|fixed|sfixed)$/i.test(text)) {
+    return false;
+  }
+  if (/^(path|transition|build|animation|effect)$/i.test(text) && text.length < 14) {
+    return false;
+  }
+  if (/^(xbo\s+transition|image\s+\d+\p{L}?|picture\s+\d+\p{L}?|图片\s*\d+\p{L}?|圖像\s*\d+\p{L}?|影像\s*\d+\p{L}?)$/iu.test(text)) {
     return false;
   }
   if (isContainerMarker(text)) {
@@ -2530,7 +2559,93 @@ function looksLikePresentationText(text: string): boolean {
   if (text.length > 80 && !/\s/.test(text) && /[./:_-]/.test(text)) {
     return false;
   }
+  if (text.length <= 4 && !/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text)) {
+    return false;
+  }
+  if (text.length <= 8 && /[^A-Za-z0-9\s\p{L}\p{N}]/u.test(text)) {
+    return false;
+  }
+  if (text.length <= 10 && hasMixedLowSignalScripts(text)) {
+    return false;
+  }
+  if (!hasHumanTextSignal(text)) {
+    return false;
+  }
   return /[\p{L}\p{N}]/u.test(text);
+}
+
+function isLikelyNativeNoiseText(text: string): boolean {
+  const lower = text.toLowerCase();
+  if (hasInternalKeynoteToken(text)) {
+    return true;
+  }
+  if (/\b(decimal|double|float|string|boolean|integer|uint|sint|fixed|sfixed)\b/.test(lower) && /[.$*@\\]/.test(text)) {
+    return true;
+  }
+  if (/\bmagic-move-implied-motion-path\b/.test(lower)) {
+    return true;
+  }
+  if (/\bxbo transition\b/i.test(text) && /[$*@\\]|\bdecimal\b/i.test(text)) {
+    return true;
+  }
+  if (/\btransition\b/i.test(text) && /\bmagic[- ]move\b/i.test(text) && /[$*@\\]/.test(text)) {
+    return true;
+  }
+  if (/[\p{Script=Han}]/u.test(text) && /[A-Za-z0-9][*\\]$/.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function stripInvalidTextChars(value: string): string {
+  return Array.from(value)
+    .filter((char) => {
+      const code = char.codePointAt(0) ?? 0;
+      return code === 0x09 || code === 0x0a || code === 0x0d || (code >= 0x20 && code <= 0xd7ff) || (code >= 0xe000 && code <= 0xfffd) || (code >= 0x10000 && code <= 0x10ffff);
+    })
+    .join("");
+}
+
+function hasInternalKeynoteToken(text: string): boolean {
+  return /(^|[\s$*])apple:[a-z0-9._:-]+/i.test(text) || /\bmagic-move-implied-motion-path\b/i.test(text);
+}
+
+function hasBinaryResidue(text: string): boolean {
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text)) {
+    return true;
+  }
+  if (/^[A-Za-z0-9@*.$\\/_-]{1,8}$/.test(text) && /[.@*$\\/_-]/.test(text)) {
+    return true;
+  }
+  if (/^[\p{L}\p{N}\s"'.,:;!?%&()[\]{}<>/@#$*+\\_-]+$/u.test(text)) {
+    const asciiSymbols = Array.from(text).filter((char) => /["'.,:;!?%&()[\]{}<>/@#$*+\\_-]/.test(char)).length;
+    const lettersAndNumbers = Array.from(text).filter((char) => /[\p{L}\p{N}]/u.test(char)).length;
+    if (lettersAndNumbers > 0 && asciiSymbols / lettersAndNumbers > 0.28) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasMixedLowSignalScripts(text: string): boolean {
+  const hasCyrillic = /[\p{Script=Cyrillic}]/u.test(text);
+  const hasLatin = /[A-Za-z]/.test(text);
+  const hasDigit = /\d/.test(text);
+  const hasHan = /[\p{Script=Han}]/u.test(text);
+  return !hasHan && hasCyrillic && (hasLatin || hasDigit);
+}
+
+function hasHumanTextSignal(text: string): boolean {
+  if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text)) {
+    return true;
+  }
+  if (/\s/.test(text) && /[A-Za-z]{2,}/.test(text)) {
+    return true;
+  }
+  if (/^[A-Z][A-Za-z0-9]+(?:[ -][A-Za-z0-9]+)+$/.test(text)) {
+    return true;
+  }
+  return false;
 }
 
 function isContainerMarker(text: string): boolean {

@@ -245,6 +245,32 @@ describe("Keynote bridge", () => {
     assert.equal(deck.conversion?.metadata?.lossReport?.evidenceCounts?.quickLookPreviewWithDimensionsCount, 1);
   });
 
+  test("filters Keynote internal tokens and binary residue out of recovered slide text", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-noise-filter-"));
+    const keyPath = path.join(dir, "noise.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        protoString("Transition"),
+        protoString("apple:magic-move-implied-motion-path"),
+        protoString("XBO Transition\u0012$a"),
+        protoString("AI Agent 社会模拟游戏"),
+        protoString("图片 8"),
+        protoString("E.l"),
+        protoString("decimal"),
+        protoString("$apple:magic-move-implied-motion-path"),
+        protoString("*b.S")
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const text = deck.deck.slides[0]?.objects.filter((object) => object.type === "text").map((object) => object.text.plainText);
+
+    assert.deepEqual(text, ["AI Agent 社会模拟游戏"]);
+  });
+
   test("parses a ZIP-backed .key package with loose Index IWA entries", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-zip-"));
     const keyPath = path.join(dir, "sample.key");

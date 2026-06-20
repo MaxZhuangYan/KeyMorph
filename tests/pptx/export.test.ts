@@ -32,6 +32,24 @@ describe("PPTX export", () => {
     assert.match(JSON.stringify(parsed), /KeyMorph/);
   });
 
+  test("strips XML-invalid control characters from exported text", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-xml-safety-"));
+    const out = path.join(dir, "safe-text.pptx");
+    const deck = createDemoDeck();
+    const textObject = deck.deck.slides[0].objects.find((object) => object.type === "text");
+    if (!textObject || textObject.type !== "text") throw new Error("Expected demo text object.");
+    textObject.name = "Unsafe\u0012Name";
+    textObject.text.plainText = "XBO Transition\u0012$a";
+    textObject.text.runs = [{ text: "XBO Transition\u0012$a", style: { fontFamily: "Arial", fontSize: 28, color: "#111827" } }];
+
+    await exportIrToPptx(deck, out);
+    const slideXml = await readPptxXml(out, "ppt/slides/slide1.xml");
+
+    assert.equal(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(slideXml), false);
+    assert.match(slideXml, /XBO Transition\$a/);
+    assert.doesNotMatch(slideXml, /Unsafe\u0012Name/);
+  });
+
   test("round-trips simple keyframe and visibility timing through PPTX XML", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-test-"));
     const out = path.join(dir, "animated.pptx");

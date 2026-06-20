@@ -2222,7 +2222,7 @@ function stripHash(color: string): string {
 }
 
 function escapeXml(value: unknown): string {
-  return String(value ?? "").replace(/[<>&'"]/g, (char) => {
+  return stripInvalidXmlChars(String(value ?? "")).replace(/[<>&'"]/g, (char) => {
     switch (char) {
       case "<":
         return "&lt;";
@@ -2236,6 +2236,15 @@ function escapeXml(value: unknown): string {
         return "&quot;";
     }
   });
+}
+
+function stripInvalidXmlChars(value: string): string {
+  return Array.from(value)
+    .filter((char) => {
+      const code = char.codePointAt(0) ?? 0;
+      return code === 0x09 || code === 0x0a || code === 0x0d || (code >= 0x20 && code <= 0xd7ff) || (code >= 0xe000 && code <= 0xfffd) || (code >= 0x10000 && code <= 0x10ffff);
+    })
+    .join("");
 }
 
 function unescapeXml(value: string): string {
