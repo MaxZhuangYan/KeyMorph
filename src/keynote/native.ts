@@ -3,7 +3,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { inflateRawSync } from "node:zlib";
 
-import { IR_VERSION, type Asset, type DeckIR, type IRObject, type JSONRecord, type Slide } from "../ir/index.ts";
+import { IR_VERSION, type AnimationEvent, type Asset, type DeckIR, type IRObject, type JSONRecord, type Slide } from "../ir/index.ts";
 
 const DEFAULT_DECK_SIZE = { width: 1280, height: 720 };
 const MAX_TEXT_CANDIDATES_PER_STREAM = 80;
@@ -18,7 +18,7 @@ const MAX_NESTED_PROTOBUF_DEPTH = 3;
 const MAX_NESTED_PROTOBUF_BYTES = 256 * 1024;
 const MAX_FIELD_SUMMARIES_PER_STREAM = 48;
 const MAX_ARCHIVE_RECORD_EVIDENCE_PER_STREAM = 48;
-const MAX_TYPED_ARCHIVE_MESSAGE_EVIDENCE_PER_STREAM = 96;
+const MAX_TYPED_ARCHIVE_MESSAGE_EVIDENCE_PER_STREAM = 512;
 const MAX_SNAPPY_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MAX_VISUAL_NUMERIC_VALUE = 100000;
 const MAX_EMBEDDED_ASSET_BYTES = 2 * 1024 * 1024;
@@ -90,6 +90,8 @@ export interface NativeIwaStreamMetadata {
   archiveRecords: NativeIwaArchiveRecordEvidence[];
   typedArchiveMessageCount: number;
   typedArchiveMessages: NativeIwaArchiveMessageEvidence[];
+  buildRecordCount: number;
+  buildTimingRecordCount: number;
   protobufFieldCount: number;
   protobufFieldPathCount: number;
   nestedMessageCount: number;
@@ -129,6 +131,36 @@ export interface NativeIwaArchiveMessageEvidence {
   textCandidates: string[];
   geometryCandidates: NativeIwaGeometryCandidate[];
   fieldSummaries: NativeIwaFieldSummary[];
+  build?: NativeIwaBuildEvidence;
+  buildTiming?: NativeIwaBuildTimingEvidence;
+}
+
+export interface NativeIwaBuildEvidence {
+  kind: "build";
+  buildId?: string;
+  targetNativeId?: string;
+  objectReferences: string[];
+  delivery?: string;
+  direction?: string;
+  effect?: string;
+  durationMs?: number;
+  delayMs?: number;
+  timingBase?: number;
+  confidence: number;
+  sourceFieldPaths: string[];
+}
+
+export interface NativeIwaBuildTimingEvidence {
+  kind: "buildTiming";
+  timingId?: string;
+  buildId?: string;
+  durationMs?: number;
+  delayMs?: number;
+  group?: number;
+  startsWithPrevious?: boolean;
+  afterPrevious?: boolean;
+  confidence: number;
+  sourceFieldPaths: string[];
 }
 
 export interface NativeIwaFieldSummary {
@@ -391,6 +423,17 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
   const totalArchiveRecordCount = iwaStreams.reduce((total, stream) => total + stream.archiveRecordCount, 0);
   const totalArchivePayloadCount = iwaStreams.reduce((total, stream) => total + stream.archivePayloadCount, 0);
   const totalTypedArchiveMessageCount = iwaStreams.reduce((total, stream) => total + stream.typedArchiveMessageCount, 0);
+  const totalNativeBuildRecordCount = iwaStreams.reduce((total, stream) => total + stream.buildRecordCount, 0);
+  const totalNativeBuildTimingRecordCount = iwaStreams.reduce((total, stream) => total + stream.buildTimingRecordCount, 0);
+  const recoveredNativeBuildAnimationCount = slides.reduce(
+    (total, slide) => total + (slide.timeline?.events ?? []).filter((event) => event.metadata?.nativeSource === "keynote-iwa-build").length,
+    0
+  );
+  const unresolvedNativeBuildRecordCount = slides.reduce(
+    (total, slide) => total + Number(slide.metadata?.nativeBuildAnimationUnresolvedCount ?? 0),
+    0
+  );
+  const recoveredNativeBuildRecordCount = Math.max(0, totalNativeBuildRecordCount - unresolvedNativeBuildRecordCount);
   const quickLookPreviewCount = parts.quickLookPreviews.length;
   const quickLookPreviewWithDimensionsCount = parts.quickLookPreviews.filter((preview) => preview.width !== undefined && preview.height !== undefined).length;
   const imageAssetCount = assets.assets.filter((asset) => asset.kind === "image").length;
@@ -407,13 +450,18 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       "private-iwa-schema",
       "approximate-object-placement",
       "no-keynote-gui-render",
-      "native-animation-not-reconstructed"
+      recoveredNativeBuildAnimationCount > 0 ? "partial-native-build-animation-reconstruction" : "native-animation-not-reconstructed"
     ],
     evidenceCounts: {
       iwaStreamCount: parts.iwaEntries.length,
       archiveRecordCount: totalArchiveRecordCount,
       archivePayloadCount: totalArchivePayloadCount,
       typedArchiveMessageCount: totalTypedArchiveMessageCount,
+      buildRecordCount: totalNativeBuildRecordCount,
+      buildTimingRecordCount: totalNativeBuildTimingRecordCount,
+      recoveredBuildRecordCount: recoveredNativeBuildRecordCount,
+      recoveredBuildAnimationCount: recoveredNativeBuildAnimationCount,
+      unresolvedBuildRecordCount: unresolvedNativeBuildRecordCount,
       protobufFieldCount: totalProtobufFieldCount,
       nestedMessageCount: totalNestedMessageCount,
       numericCandidateCount: totalNumericCandidateCount,
@@ -445,8 +493,10 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       severity: "warning" as const,
       area: "animation" as const,
       description:
-        totalAnimationHintCount > 0
-          ? `Detected ${totalAnimationHintCount} native animation hint(s), including ${totalMagicMoveHintCount} Magic Move and ${totalMorphHintCount} morph-like hint(s), but Keynote timing data is private and not reconstructed by the native fallback.`
+        totalNativeBuildRecordCount > 0
+          ? `Decoded ${totalNativeBuildRecordCount} native Keynote build record(s) and ${totalNativeBuildTimingRecordCount} timing wrapper(s); ${recoveredNativeBuildAnimationCount} resolved target(s) were degraded to IR playback events while unresolved/private effects remain unsupported.`
+          : totalAnimationHintCount > 0
+          ? `Detected ${totalAnimationHintCount} native animation hint(s), including ${totalMagicMoveHintCount} Magic Move and ${totalMorphHintCount} morph-like hint(s), but most Keynote timing data remains private.`
           : "Keynote builds, transitions, Magic Move, and timing data are not mapped by the native fallback.",
       fallback: "Use the Keynote PPTX bridge for the best available animation downgrade path."
     },
@@ -493,6 +543,18 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
             description:
               "Some package asset references were matched from slide IWA string payloads and inserted as approximate image/media objects.",
             fallback: "Inspect the source Keynote deck or bridge through PPTX for exact placement."
+          }
+        ]
+      : []),
+    ...(unresolvedNativeBuildRecordCount > 0
+      ? [
+          {
+            code: "keynote-native-build-target-loss",
+            severity: "warning" as const,
+            area: "animation" as const,
+            description:
+              `Decoded ${totalNativeBuildRecordCount} Keynote build record(s), but ${unresolvedNativeBuildRecordCount} could not be attached to a recovered IR object target.`,
+            fallback: "Preserve build/timing evidence in slide metadata and recover only effects whose target archive id maps to a known object."
           }
         ]
       : []),
@@ -558,6 +620,19 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
             description:
               `Detected ${totalGroupingHintCount} slide/object grouping hint(s) from nested field paths and mixed text/reference/geometry evidence.`,
             confidence: 0.41
+          }
+        ]
+      : []),
+    ...(totalNativeBuildRecordCount > 0
+      ? [
+          {
+            code: "keynote-native-build-timing-scan",
+            severity: recoveredNativeBuildAnimationCount > 0 ? ("info" as const) : ("warning" as const),
+            description:
+              recoveredNativeBuildAnimationCount > 0
+                ? `Decoded native Keynote build/timing records and recovered ${recoveredNativeBuildRecordCount} build record(s) into ${recoveredNativeBuildAnimationCount} conservative opacity/media event(s).`
+                : `Decoded ${totalNativeBuildRecordCount} native Keynote build record(s), but no target object could be mapped safely.`,
+            confidence: recoveredNativeBuildAnimationCount > 0 ? 0.62 : 0.46
           }
         ]
       : []),
@@ -693,6 +768,21 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
             totalAnimationHintCount > 0
               ? `Detected ${totalAnimationHintCount} native animation hint(s), including ${totalMagicMoveHintCount} Magic Move and ${totalMorphHintCount} morph-like hint(s); mappings remain uncertain.`
               : "No Magic Move or morph-like native animation hints were detected in visible IWA payloads."
+        },
+        {
+          severity: totalNativeBuildRecordCount > 0 ? (recoveredNativeBuildAnimationCount > 0 ? "info" : "warning") : "info",
+          code:
+            totalNativeBuildRecordCount > 0
+              ? recoveredNativeBuildAnimationCount > 0
+                ? "keynote-native-build-animations-recovered"
+                : "keynote-native-build-animations-unresolved"
+              : "keynote-native-build-animations-not-detected",
+          message:
+            totalNativeBuildRecordCount > 0
+              ? recoveredNativeBuildAnimationCount > 0
+                ? `Decoded ${totalNativeBuildRecordCount} native Keynote build record(s), recovered ${recoveredNativeBuildRecordCount} build target(s), and generated ${recoveredNativeBuildAnimationCount} conservative animation event(s).`
+                : `Decoded ${totalNativeBuildRecordCount} native Keynote build record(s), but none mapped to recovered IR objects safely.`
+              : "No native Keynote build records were decoded from typed IWA payloads."
         }
       ],
       unsupportedFeatures,
@@ -701,7 +791,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       statistics: {
         slideCount: slides.length,
         objectCount,
-        animationCount: 0,
+        animationCount: recoveredNativeBuildAnimationCount,
         assetCount: deckAssets.length,
         unsupportedFeatureCount: unsupportedFeatures.length,
         degradedFeatureCount: degradedFeatures.length,
@@ -733,6 +823,11 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         totalArchiveRecordCount,
         totalArchivePayloadCount,
         totalTypedArchiveMessageCount,
+        totalNativeBuildRecordCount,
+        totalNativeBuildTimingRecordCount,
+        recoveredNativeBuildRecordCount,
+        recoveredNativeBuildAnimationCount,
+        unresolvedNativeBuildRecordCount,
         slideOrderEvidence: slideOrderEvidence
           ? {
               sourcePath: slideOrderEvidence.sourcePath,
@@ -773,6 +868,8 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
           archiveRecords: stream.archiveRecords,
           typedArchiveMessageCount: stream.typedArchiveMessageCount,
           typedArchiveMessages: stream.typedArchiveMessages,
+          buildRecordCount: stream.buildRecordCount,
+          buildTimingRecordCount: stream.buildTimingRecordCount,
           protobufFieldCount: stream.protobufFieldCount,
           protobufFieldPathCount: stream.protobufFieldPathCount,
           nestedMessageCount: stream.nestedMessageCount,
@@ -1090,6 +1187,8 @@ function classifyIwaStreams(
       archiveRecords: scan.archiveRecords,
       typedArchiveMessageCount: scan.typedArchiveMessageCount,
       typedArchiveMessages: scan.archiveMessages,
+      buildRecordCount: scan.archiveMessages.filter((message) => message.build).length,
+      buildTimingRecordCount: scan.archiveMessages.filter((message) => message.buildTiming).length,
       protobufFieldCount: scan.protobufFieldCount,
       protobufFieldPathCount: scan.fieldSummaries.length,
       nestedMessageCount: scan.nestedMessageCount,
@@ -1197,6 +1296,7 @@ function buildNativeSlides(
         : textObjects.length > 0 || assetObjects.length > 0
         ? [...textObjects, ...assetObjects]
         : [createPlaceholderObject(slideId, entry.path, deckSize)];
+    const buildAnimationRecovery = recoverNativeBuildAnimations(slideId, objects, scan.archiveMessages);
 
     return {
       id: slideId,
@@ -1204,7 +1304,21 @@ function buildNativeSlides(
       name: readSlideName(entry.path, index),
       background: { type: "solid" as const, color: "#ffffff" },
       objects,
-      timeline: { durationMs: 2500, events: [], dependencyGraph: { edges: [] } },
+      timeline: {
+        durationMs: buildAnimationRecovery.durationMs,
+        events: buildAnimationRecovery.events,
+        dependencyGraph: { edges: [] },
+        ...(buildAnimationRecovery.buildRecords.length > 0 || buildAnimationRecovery.timingRecords.length > 0
+          ? {
+              metadata: {
+                nativeBuildRecordCount: buildAnimationRecovery.buildRecords.length,
+                nativeBuildTimingRecordCount: buildAnimationRecovery.timingRecords.length,
+                nativeBuildAnimationRecoveredCount: buildAnimationRecovery.events.length,
+                nativeBuildAnimationUnresolvedCount: buildAnimationRecovery.unresolvedBuildCount
+              }
+            }
+          : {})
+      },
       metadata: {
         nativeSourcePath: entry.path,
         nativeTextCandidateCount: textCandidates.length,
@@ -1221,6 +1335,16 @@ function buildNativeSlides(
         ...(scan.archiveRecords.length > 0 ? { nativeArchiveRecords: scan.archiveRecords.slice(0, 12) } : {}),
         nativeTypedArchiveMessageCount: scan.typedArchiveMessageCount,
         ...(scan.archiveMessages.length > 0 ? { nativeTypedArchiveMessages: scan.archiveMessages.slice(0, 24) } : {}),
+        nativeBuildRecordCount: buildAnimationRecovery.buildRecords.length,
+        nativeBuildTimingRecordCount: buildAnimationRecovery.timingRecords.length,
+        nativeBuildAnimationRecoveredCount: buildAnimationRecovery.events.length,
+        nativeBuildAnimationUnresolvedCount: buildAnimationRecovery.unresolvedBuildCount,
+        ...(buildAnimationRecovery.buildRecords.length > 0
+          ? { nativeBuildRecords: buildAnimationRecovery.buildRecords.slice(0, 24) }
+          : {}),
+        ...(buildAnimationRecovery.timingRecords.length > 0
+          ? { nativeBuildTimingRecords: buildAnimationRecovery.timingRecords.slice(0, 24) }
+          : {}),
         ...(slideOrderEvidence
           ? {
               nativeSlideOrderSourcePath: slideOrderEvidence.sourcePath,
@@ -1711,6 +1835,323 @@ function createAssetObject(
   };
 }
 
+interface NativeBuildAnimationRecovery {
+  events: AnimationEvent[];
+  durationMs: number;
+  buildRecords: NativeIwaBuildEvidence[];
+  timingRecords: NativeIwaBuildTimingEvidence[];
+  unresolvedBuildCount: number;
+}
+
+function recoverNativeBuildAnimations(
+  slideId: string,
+  objects: IRObject[],
+  messages: NativeIwaArchiveMessageEvidence[]
+): NativeBuildAnimationRecovery {
+  const buildRecords = messages.map((message) => message.build).filter((build): build is NativeIwaBuildEvidence => Boolean(build));
+  const timingRecords = messages
+    .map((message) => message.buildTiming)
+    .filter((timing): timing is NativeIwaBuildTimingEvidence => Boolean(timing));
+  if (buildRecords.length === 0) {
+    return { events: [], durationMs: 2500, buildRecords, timingRecords, unresolvedBuildCount: 0 };
+  }
+
+  const objectLookup = createNativeBuildObjectLookup(objects);
+  const timingByBuildId = new Map<string, NativeIwaBuildTimingEvidence>();
+  for (const timing of timingRecords) {
+    if (timing.buildId && !timingByBuildId.has(timing.buildId)) {
+      timingByBuildId.set(timing.buildId, timing);
+    }
+  }
+  const buildById = new Map<string, NativeIwaBuildEvidence>();
+  for (const build of buildRecords) {
+    if (build.buildId && !buildById.has(build.buildId)) {
+      buildById.set(build.buildId, build);
+    }
+  }
+  const sequencedBuilds = sequenceNativeBuildRecords(buildRecords, timingRecords, buildById);
+
+  const events: AnimationEvent[] = [];
+  let cursorMs = 0;
+  let unresolvedBuildCount = 0;
+  for (const [index, build] of sequencedBuilds.entries()) {
+    const timing = build.buildId ? timingByBuildId.get(build.buildId) : undefined;
+    const resolutions = resolveNativeBuildTargets(build, objectLookup);
+    const durationMs = clampNativeBuildDuration(timing?.durationMs ?? build.durationMs);
+    const delayMs = clampNativeBuildDelay(timing?.delayMs ?? build.delayMs);
+    const startMs = cursorMs + delayMs;
+    let generatedEventCount = 0;
+    for (const [targetIndex, resolution] of resolutions.entries()) {
+      const event = nativeBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs);
+      if (event) {
+        events.push(event);
+        generatedEventCount += 1;
+      }
+    }
+    if (generatedEventCount > 0) {
+      cursorMs = Math.max(cursorMs, startMs + durationMs);
+    } else {
+      unresolvedBuildCount += 1;
+    }
+  }
+
+  return {
+    events,
+    durationMs: Math.max(2500, events.reduce((max, event) => Math.max(max, eventEndMs(event)), 0) + 500),
+    buildRecords,
+    timingRecords,
+    unresolvedBuildCount
+  };
+}
+
+function createNativeBuildObjectLookup(objects: IRObject[]): Map<string, Array<{ object: IRObject; method: string }>> {
+  const lookup = new Map<string, Array<{ object: IRObject; method: string }>>();
+  for (const object of flattenNativeObjects(objects)) {
+    addNativeBuildObjectLookupValue(lookup, object.id, object, "object-id");
+    if (object.morphKey) {
+      addNativeBuildObjectLookupValue(lookup, object.morphKey, object, "morph-key");
+    }
+    addNativeBuildObjectLookupValue(lookup, object.metadata?.nativeArchiveIdentifier, object, "archive-identifier");
+    addNativeBuildObjectLookupValues(lookup, object.metadata?.nativeArchiveObjectReferences, object, "archive-object-reference");
+  }
+  return lookup;
+}
+
+function sequenceNativeBuildRecords(
+  buildRecords: NativeIwaBuildEvidence[],
+  timingRecords: NativeIwaBuildTimingEvidence[],
+  buildById: Map<string, NativeIwaBuildEvidence>
+): NativeIwaBuildEvidence[] {
+  const ordered: NativeIwaBuildEvidence[] = [];
+  const seen = new Set<NativeIwaBuildEvidence>();
+  for (const timing of timingRecords) {
+    const build = timing.buildId ? buildById.get(timing.buildId) : undefined;
+    if (!build || seen.has(build)) {
+      continue;
+    }
+    seen.add(build);
+    ordered.push(build);
+  }
+  for (const build of buildRecords) {
+    if (!seen.has(build)) {
+      ordered.push(build);
+    }
+  }
+  return ordered;
+}
+
+function flattenNativeObjects(objects: IRObject[]): IRObject[] {
+  const out: IRObject[] = [];
+  for (const object of objects) {
+    out.push(object);
+    if (object.type === "group") {
+      out.push(...flattenNativeObjects(object.children));
+    }
+  }
+  return out;
+}
+
+function addNativeBuildObjectLookupValues(
+  lookup: Map<string, Array<{ object: IRObject; method: string }>>,
+  values: unknown,
+  object: IRObject,
+  method: string
+): void {
+  if (!Array.isArray(values)) {
+    return;
+  }
+  for (const value of values) {
+    addNativeBuildObjectLookupValue(lookup, value, object, method);
+  }
+}
+
+function addNativeBuildObjectLookupValue(
+  lookup: Map<string, Array<{ object: IRObject; method: string }>>,
+  value: unknown,
+  object: IRObject,
+  method: string
+): void {
+  const key = nativeBuildLookupKey(value);
+  if (!key) {
+    return;
+  }
+  const list = lookup.get(key) ?? [];
+  if (!list.some((entry) => entry.object.id === object.id && entry.method === method)) {
+    list.push({ object, method });
+  }
+  lookup.set(key, list);
+}
+
+function resolveNativeBuildTargets(
+  build: NativeIwaBuildEvidence,
+  lookup: Map<string, Array<{ object: IRObject; method: string }>>
+): Array<{ object: IRObject; method: string; nativeTargetId?: string }> {
+  const targetIds = uniqueStrings([build.targetNativeId, ...build.objectReferences].filter((value): value is string => Boolean(value)));
+  for (const targetId of targetIds) {
+    const key = nativeBuildLookupKey(targetId);
+    const matches = key ? lookup.get(key) ?? [] : [];
+    const unique = uniqueObjectMatches(matches);
+    if (unique.length > 0) {
+      return unique.map((match) => ({
+        object: match.object,
+        method: match.method,
+        nativeTargetId: targetId
+      }));
+    }
+  }
+  return [];
+}
+
+function uniqueObjectMatches(matches: Array<{ object: IRObject; method: string }>): Array<{ object: IRObject; method: string }> {
+  const out: Array<{ object: IRObject; method: string }> = [];
+  const seen = new Set<string>();
+  for (const match of matches) {
+    if (seen.has(match.object.id)) {
+      continue;
+    }
+    seen.add(match.object.id);
+    out.push(match);
+  }
+  return out;
+}
+
+function nativeBuildEventFromEvidence(
+  slideId: string,
+  index: number,
+  targetIndex: number,
+  build: NativeIwaBuildEvidence,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  resolution: { object: IRObject; method: string; nativeTargetId?: string },
+  startMs: number,
+  durationMs: number
+): AnimationEvent | undefined {
+  const direction = normalizeNativeBuildDirection(build.direction, build.effect);
+  if (build.effect && /movie-start/i.test(build.effect) && resolution.object.type === "media") {
+    return {
+      id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, "media-play"),
+      kind: "media",
+      label: "Keynote movie start",
+      targetId: resolution.object.id,
+      action: "play",
+      start: { type: "absolute", atMs: startMs },
+      durationMs: 0,
+      fill: "forwards",
+      metadata: nativeBuildEventMetadata(build, timing, resolution, "media-play")
+    };
+  }
+  if (direction !== "in" && direction !== "out") {
+    return undefined;
+  }
+  if (build.effect && /motion-path|movie-start/i.test(build.effect)) {
+    return undefined;
+  }
+  const from = direction === "out" ? 1 : 0;
+  const to = direction === "out" ? 0 : 1;
+  return {
+    id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, `opacity-${direction}`),
+    kind: "keyframes",
+    label: `Keynote ${direction === "out" ? "build out" : "build in"}`,
+    targetId: resolution.object.id,
+    start: { type: "absolute", atMs: startMs },
+    durationMs,
+    fill: "both",
+    easing: "easeInOut",
+    tracks: [
+      {
+        property: "opacity",
+        interpolation: "number",
+        keyframes: [
+          { offset: 0, value: from },
+          { offset: 1, value: to }
+        ]
+      }
+    ],
+    metadata: nativeBuildEventMetadata(build, timing, resolution, `opacity-${direction}`)
+  };
+}
+
+function nativeBuildEventMetadata(
+  build: NativeIwaBuildEvidence,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  resolution: { method: string; nativeTargetId?: string },
+  fallback: string
+): JSONRecord {
+  return {
+    nativeSource: "keynote-iwa-build",
+    nativeBuildFallback: fallback,
+    ...(build.buildId ? { nativeBuildId: build.buildId } : {}),
+    ...(timing?.timingId ? { nativeBuildTimingId: timing.timingId } : {}),
+    ...(timing?.buildId ? { nativeBuildTimingBuildId: timing.buildId } : {}),
+    ...(build.targetNativeId ? { nativeBuildTargetId: build.targetNativeId } : {}),
+    ...(resolution.nativeTargetId ? { nativeResolvedTargetId: resolution.nativeTargetId } : {}),
+    nativeResolvedTargetBy: resolution.method,
+    nativeBuildObjectReferences: build.objectReferences,
+    ...(build.delivery ? { nativeBuildDelivery: build.delivery } : {}),
+    ...(build.direction ? { nativeBuildDirection: build.direction } : {}),
+    ...(build.effect ? { nativeBuildEffect: build.effect } : {}),
+    nativeBuildConfidence: build.confidence,
+    ...(timing ? { nativeBuildTimingConfidence: timing.confidence } : {}),
+    ...(timing?.group !== undefined ? { nativeBuildTimingGroup: timing.group } : {}),
+    ...(timing?.startsWithPrevious !== undefined ? { nativeBuildStartsWithPrevious: timing.startsWithPrevious } : {}),
+    ...(timing?.afterPrevious !== undefined ? { nativeBuildAfterPrevious: timing.afterPrevious } : {})
+  };
+}
+
+function normalizeNativeBuildDirection(direction: string | undefined, effect: string | undefined): "in" | "out" | "action" | undefined {
+  const normalized = `${direction ?? ""} ${effect ?? ""}`.toLowerCase();
+  if (/\bout\b/.test(normalized)) return "out";
+  if (/\baction\b|motion-path|movie-start/.test(normalized)) return "action";
+  if (/\bin\b/.test(normalized)) return "in";
+  if (/appear|dissolve|blur|fade|build/i.test(normalized)) return "in";
+  return undefined;
+}
+
+function nativeBuildEventId(
+  slideId: string,
+  build: NativeIwaBuildEvidence,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  index: number,
+  targetIndex: number,
+  targetId: string,
+  suffix: string
+): string {
+  const stableId = build.buildId ?? timing?.timingId ?? build.targetNativeId ?? String(index + 1);
+  const targetSuffix = targetIndex > 0 ? `-${nativeBuildSlug(targetId)}` : "";
+  return `${slideId}-native-build-${nativeBuildSlug(stableId)}${targetSuffix}-${suffix}`;
+}
+
+function nativeBuildSlug(value: string): string {
+  const slug = value.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || "unknown";
+}
+
+function eventEndMs(event: AnimationEvent): number {
+  const start = event.start?.type === "absolute" ? event.start.atMs : event.delayMs ?? 0;
+  return Math.max(0, start) + Math.max(0, event.durationMs ?? 0);
+}
+
+function clampNativeBuildDuration(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return 500;
+  }
+  return Math.max(1, Math.min(120000, Math.round(value)));
+}
+
+function clampNativeBuildDelay(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.min(120000, Math.round(value)));
+}
+
+function nativeBuildLookupKey(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") {
+    return undefined;
+  }
+  const normalized = String(value).trim();
+  return normalized ? normalized.toLowerCase() : undefined;
+}
+
 function scanIwaEntry(data: Uint8Array): IwaScanResult {
   return scanIwaPayloads(expandIwaPayloads(data));
 }
@@ -1743,13 +2184,16 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
     for (const item of scanData) {
       const data = item.data;
       const protobufScan = scanProtobufPayload(data, orderBase);
+      const suppressPresentationText = isNativeInternalTextMessageType(item.archiveMessage?.messageInfo.type);
       protobufFieldCount += protobufScan.protobufFieldCount;
       nestedMessageCount += protobufScan.nestedMessageCount;
       for (const summary of protobufScan.fieldSummaries) {
         mergeFieldSummary(fieldSummaries, summary);
       }
-      for (const candidate of protobufScan.textCandidates) {
-        addBestTextCandidate(textCandidates, candidate);
+      if (!suppressPresentationText) {
+        for (const candidate of protobufScan.textCandidates) {
+          addBestTextCandidate(textCandidates, candidate);
+        }
       }
       for (const candidate of protobufScan.referenceCandidates) {
         addBestReferenceCandidate(referenceCandidates, candidate);
@@ -1773,8 +2217,10 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
 
       const rawScan = scanRawStrings(data, orderBase + data.byteLength + 1);
       rawStringCount += rawScan.rawStringCount;
-      for (const candidate of rawScan.textCandidates) {
-        addBestTextCandidate(textCandidates, candidate);
+      if (!suppressPresentationText) {
+        for (const candidate of rawScan.textCandidates) {
+          addBestTextCandidate(textCandidates, candidate);
+        }
       }
       for (const candidate of rawScan.referenceCandidates) {
         addBestReferenceCandidate(referenceCandidates, candidate);
@@ -1821,6 +2267,10 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
   };
 }
 
+function isNativeInternalTextMessageType(type: number | undefined): boolean {
+  return type === 8 || type === 153 || type === 3097;
+}
+
 function findIwaAssetMatchesFromScan(scan: IwaScanResult, assets: NativeAssetCatalog): NativeAssetMatch[] {
   if (assets.assets.length === 0) {
     return [];
@@ -1854,7 +2304,8 @@ function findIwaAssetMatchesFromScan(scan: IwaScanResult, assets: NativeAssetCat
   for (const message of scan.archiveMessages) {
     for (const dataId of message.dataReferences) {
       for (const asset of assets.byDataId.get(normalizeDataId(dataId)) ?? []) {
-        const existing = matches.get(asset.assetId);
+        const key = archiveAssetMatchKey(asset.assetId, message);
+        const existing = matches.get(key);
         const match: NativeAssetMatch = {
           asset,
           evidence: `typed-message:${message.type ?? "unknown"}:data-id:${dataId}`,
@@ -1863,14 +2314,80 @@ function findIwaAssetMatchesFromScan(scan: IwaScanResult, assets: NativeAssetCat
           geometryCandidate: message.geometryCandidates[0],
           archiveMessage: message
         };
+        const generic = matches.get(asset.assetId);
+        if (generic && !generic.archiveMessage) {
+          matches.delete(asset.assetId);
+        }
         if (!existing || match.confidence > existing.confidence || (!existing.geometryCandidate && match.geometryCandidate)) {
-          matches.set(asset.assetId, match);
+          matches.set(key, match);
         }
       }
     }
   }
+  for (const match of findIwaMovieStartMediaAssetMatchesFromScan(scan, assets)) {
+    const key = match.archiveMessage ? archiveAssetMatchKey(match.asset.assetId, match.archiveMessage) : match.asset.assetId;
+    const existing = matches.get(key);
+    const generic = matches.get(match.asset.assetId);
+    if (generic && !generic.archiveMessage) {
+      matches.delete(match.asset.assetId);
+    }
+    if (!existing || match.confidence > existing.confidence || !existing.archiveMessage) {
+      matches.set(key, match);
+    }
+  }
 
   return Array.from(matches.values()).sort((left, right) => comparePartPaths(left.asset.path, right.asset.path));
+}
+
+function archiveAssetMatchKey(assetId: string, message: NativeIwaArchiveMessageEvidence): string {
+  return [
+    assetId,
+    "archive",
+    message.archiveIdentifier ?? "unknown",
+    message.type ?? "unknown",
+    message.messageIndex,
+    message.payloadOffset
+  ].join(":");
+}
+
+function findIwaMovieStartMediaAssetMatchesFromScan(scan: IwaScanResult, assets: NativeAssetCatalog): NativeAssetMatch[] {
+  const mediaAssets = Array.from(
+    new Map(
+      Array.from(assets.byPath.values())
+        .filter((asset) => asset.kind === "video" || asset.kind === "audio")
+        .map((asset) => [asset.assetId, asset])
+    ).values()
+  );
+  if (mediaAssets.length !== 1) {
+    return [];
+  }
+  const mediaAsset = mediaAssets[0];
+  if (!mediaAsset) {
+    return [];
+  }
+  const movieStartTargets = new Set(
+    scan.archiveMessages
+      .map((message) => message.build)
+      .filter((build): build is NativeIwaBuildEvidence => Boolean(build?.targetNativeId && /movie-start/i.test(build.effect ?? "")))
+      .map((build) => build.targetNativeId!)
+  );
+  if (movieStartTargets.size === 0) {
+    return [];
+  }
+  return scan.archiveMessages
+    .filter(
+      (message) =>
+        message.type === 3007 &&
+        message.archiveIdentifier !== undefined &&
+        movieStartTargets.has(message.archiveIdentifier)
+    )
+    .map((message) => ({
+      asset: mediaAsset,
+      evidence: `typed-message:3007:movie-start-target:${message.archiveIdentifier}`,
+      confidence: 0.58,
+      source: "archive" as const,
+      archiveMessage: message
+    }));
 }
 
 function typedArchiveAssetMatchConfidence(message: NativeIwaArchiveMessageEvidence): number {
@@ -2130,6 +2647,155 @@ function numericValueFromSequentialField(field: {
   return undefined;
 }
 
+function stringValueAtFieldPath(data: Uint8Array, fieldPath: number[]): string | undefined {
+  return stringValuesAtFieldPath(data, fieldPath)[0];
+}
+
+function stringValuesAtFieldPath(data: Uint8Array, fieldPath: number[]): string[] {
+  if (fieldPath.length === 0) {
+    return [];
+  }
+  const fields = readSequentialProtobufFields(data);
+  if (!fields) {
+    return [];
+  }
+  const [fieldNumber, ...rest] = fieldPath;
+  const matches = fields.filter((field) => field.fieldNumber === fieldNumber);
+  const values: string[] = [];
+  for (const field of matches) {
+    if (!field.value) {
+      continue;
+    }
+    if (rest.length === 0) {
+      const text = cleanNativeBuildString(field.value);
+      if (text) {
+        values.push(text);
+      }
+      continue;
+    }
+    values.push(...stringValuesAtFieldPath(field.value, rest));
+  }
+  return uniqueStrings(values);
+}
+
+function cleanNativeBuildString(value: Uint8Array): string | undefined {
+  const text = decodeUtf8(value)?.replace(/\u0000/g, "").replace(/\s+/g, " ").trim();
+  if (!text || text.includes("\ufffd") || text.length > 256) {
+    return undefined;
+  }
+  return text;
+}
+
+function nativeBuildEvidenceFromPayload(
+  record: IwaArchiveRecord,
+  messageInfo: IwaArchiveMessageInfo,
+  payload: Uint8Array
+): NativeIwaBuildEvidence | undefined {
+  if (messageInfo.type !== 8) {
+    return undefined;
+  }
+  const targetNativeId = nativeIdFromNumber(numericValueAtFieldPath(payload, [1, 1]));
+  const delivery = stringValueAtFieldPath(payload, [2]);
+  const direction = stringValueAtFieldPath(payload, [4, 18, 1]);
+  const effect = stringValueAtFieldPath(payload, [4, 18, 2]) ?? nativeBuildEffectFromStrings(extractArchiveEvidenceStrings(payload));
+  const durationMs = nativeSecondsToMs(numericValueAtFieldPath(payload, [4, 18, 3]));
+  const delayMs = nativeSecondsToMs(numericValueAtFieldPath(payload, [4, 18, 5]) ?? numericValueAtFieldPath(payload, [3]));
+  const timingBase = numericValueAtFieldPath(payload, [4, 17]);
+  const sourceFieldPaths = [
+    ...(targetNativeId ? ["1.1"] : []),
+    ...(delivery ? ["2"] : []),
+    ...(delayMs !== undefined ? ["3", "4.18.5"] : []),
+    ...(timingBase !== undefined ? ["4.17"] : []),
+    ...(direction ? ["4.18.1"] : []),
+    ...(effect ? ["4.18.2"] : []),
+    ...(durationMs !== undefined ? ["4.18.3"] : [])
+  ];
+  const confidence = roundConfidence(
+    0.28 +
+      (targetNativeId ? 0.2 : 0) +
+      (effect ? 0.2 : 0) +
+      (direction ? 0.12 : 0) +
+      (durationMs !== undefined ? 0.1 : 0) +
+      (record.identifier ? 0.06 : 0) +
+      (messageInfo.objectReferences.length > 0 ? 0.04 : 0)
+  );
+  return {
+    kind: "build",
+    ...(record.identifier ? { buildId: record.identifier } : {}),
+    ...(targetNativeId ? { targetNativeId } : {}),
+    objectReferences: messageInfo.objectReferences.slice(0, 24),
+    ...(delivery ? { delivery } : {}),
+    ...(direction ? { direction } : {}),
+    ...(effect ? { effect } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(delayMs !== undefined ? { delayMs } : {}),
+    ...(timingBase !== undefined ? { timingBase } : {}),
+    confidence,
+    sourceFieldPaths: uniqueStrings(sourceFieldPaths)
+  };
+}
+
+function nativeBuildTimingEvidenceFromPayload(
+  record: IwaArchiveRecord,
+  messageInfo: IwaArchiveMessageInfo,
+  payload: Uint8Array
+): NativeIwaBuildTimingEvidence | undefined {
+  if (messageInfo.type !== 153) {
+    return undefined;
+  }
+  const buildId = nativeIdFromNumber(numericValueAtFieldPath(payload, [1, 1]));
+  const delayMs = nativeSecondsToMs(numericValueAtFieldPath(payload, [3]));
+  const durationMs = nativeSecondsToMs(numericValueAtFieldPath(payload, [4]));
+  const startsWithPreviousRaw = numericValueAtFieldPath(payload, [5]);
+  const afterPreviousRaw = numericValueAtFieldPath(payload, [6]);
+  const group = numericValueAtFieldPath(payload, [7, 2]);
+  const sourceFieldPaths = [
+    ...(buildId ? ["1.1"] : []),
+    ...(delayMs !== undefined ? ["3"] : []),
+    ...(durationMs !== undefined ? ["4"] : []),
+    ...(startsWithPreviousRaw !== undefined ? ["5"] : []),
+    ...(afterPreviousRaw !== undefined ? ["6"] : []),
+    ...(group !== undefined ? ["7.2"] : [])
+  ];
+  const confidence = roundConfidence(
+    0.32 +
+      (buildId ? 0.28 : 0) +
+      (durationMs !== undefined ? 0.16 : 0) +
+      (record.identifier ? 0.08 : 0) +
+      (group !== undefined ? 0.04 : 0)
+  );
+  return {
+    kind: "buildTiming",
+    ...(record.identifier ? { timingId: record.identifier } : {}),
+    ...(buildId ? { buildId } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(delayMs !== undefined ? { delayMs } : {}),
+    ...(group !== undefined ? { group } : {}),
+    ...(startsWithPreviousRaw !== undefined ? { startsWithPrevious: startsWithPreviousRaw !== 0 } : {}),
+    ...(afterPreviousRaw !== undefined ? { afterPrevious: afterPreviousRaw !== 0 } : {}),
+    confidence,
+    sourceFieldPaths: uniqueStrings(sourceFieldPaths)
+  };
+}
+
+function nativeBuildEffectFromStrings(values: string[]): string | undefined {
+  return values.find((value) => /^(?:apple:|com\.apple\.iWork\.Keynote\.)/.test(value));
+}
+
+function nativeSecondsToMs(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value) || value < 0 || value > 3600) {
+    return undefined;
+  }
+  return Math.round(value * 1000);
+}
+
+function nativeIdFromNumber(value: number | undefined): string | undefined {
+  if (value === undefined || !Number.isInteger(value) || value <= 0) {
+    return undefined;
+  }
+  return String(value);
+}
+
 function archiveMessagePayloadsFromRecords(
   data: Uint8Array,
   records: IwaArchiveRecord[]
@@ -2177,6 +2843,8 @@ function createArchiveMessageEvidence(
     ...scan.textCandidates.map((candidate) => candidate.text),
     ...extractArchiveEvidenceStrings(payload)
   ]).slice(0, 24);
+  const build = nativeBuildEvidenceFromPayload(record, messageInfo, payload);
+  const buildTiming = nativeBuildTimingEvidenceFromPayload(record, messageInfo, payload);
   return {
     archiveOffset: record.archiveOffset,
     ...(record.identifier ? { archiveIdentifier: record.identifier } : {}),
@@ -2189,7 +2857,9 @@ function createArchiveMessageEvidence(
     dataReferences,
     textCandidates,
     geometryCandidates,
-    fieldSummaries: scan.fieldSummaries.slice(0, 24)
+    fieldSummaries: scan.fieldSummaries.slice(0, 24),
+    ...(build ? { build } : {}),
+    ...(buildTiming ? { buildTiming } : {})
   };
 }
 

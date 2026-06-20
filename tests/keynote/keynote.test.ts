@@ -340,38 +340,39 @@ describe("Keynote bridge", () => {
     await mkdir(path.join(keyPath, "Index"), { recursive: true });
     await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
 
-    const imagePayload = concat([
-      protoBytes(
-        concat([
-          protoBytes(
-            concat([
-              protoBytes(concat([protoFixed32(1, 100), protoFixed32(2, 120)]), 1),
-              protoBytes(concat([protoFixed32(1, 320), protoFixed32(2, 180)]), 2)
-            ]),
-            1
-          )
-        ]),
-        1
-      ),
-      protoBytes(protoVarint(1, 42), 11)
-    ]);
-    const buildPayload = concat([protoVarint(1, 1234), protoString("apple:bc-appear", 4)]);
+    const imagePayload = nativeImagePlacementPayload(42, { x: 100, y: 120, width: 320, height: 180 });
     await writeFile(
       path.join(keyPath, "Index", "Slide-1.iwa"),
-      iwaArchiveRecord(9001, [
-        { type: 3005, payload: imagePayload, dataReferences: [42], objectReferences: [777] },
-        { type: 8, payload: buildPayload, objectReferences: [777] },
-        { type: 3097, payload: new Uint8Array() }
+      concat([
+        iwaArchiveRecord(777, [{ type: 3005, payload: imagePayload, dataReferences: [42], objectReferences: [777] }]),
+        iwaArchiveRecord(9001, [
+          {
+            type: 8,
+            payload: nativeBuildPayload({
+              targetId: 777,
+              direction: "In",
+              effect: "apple:bc-appear",
+              durationSeconds: 0.5
+            })
+          }
+        ]),
+        iwaArchiveRecord(9002, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 0.5 }) }]),
+        iwaArchiveRecord(9003, [{ type: 3097, payload: new Uint8Array() }])
       ])
     );
 
     const detection = await detectNativeKeynotePackage(keyPath);
     const stream = detection.iwaStreams?.[0];
-    assert.equal(stream?.archiveRecordCount, 1);
-    assert.deepEqual(stream?.archiveRecords[0]?.messageTypes, [3005, 8, 3097]);
-    assert.equal(stream?.typedArchiveMessageCount, 3);
+    assert.equal(stream?.archiveRecordCount, 4);
+    assert.equal(stream?.archiveRecords.some((record) => record.messageTypes.includes(3005)), true);
+    assert.equal(stream?.archiveRecords.some((record) => record.messageTypes.includes(8)), true);
+    assert.equal(stream?.archiveRecords.some((record) => record.messageTypes.includes(153)), true);
+    assert.equal(stream?.archiveRecords.some((record) => record.messageTypes.includes(3097)), true);
+    assert.equal(stream?.typedArchiveMessageCount, 4);
     assert.equal(stream?.typedArchiveMessages.some((message) => message.type === 3005 && message.dataReferences.includes("42")), true);
     assert.equal(stream?.typedArchiveMessages.some((message) => message.type === 3097 && message.payloadLength === 0), true);
+    assert.equal(stream?.buildRecordCount, 1);
+    assert.equal(stream?.buildTimingRecordCount, 1);
 
     const deck = await parseNativeKeynoteToIr(keyPath);
     assert.equal(validateIR(deck).valid, true);
@@ -382,15 +383,101 @@ describe("Keynote bridge", () => {
     assert.equal(object?.metadata?.nativeArchiveMessageType, 3005);
     assert.equal(object?.metadata?.nativeAssetDataId, "42");
     assert.deepEqual(object?.metadata?.nativeArchiveObjectReferences, ["777"]);
-    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessageCount, 3);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessageCount, 4);
     assert.equal(
       deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessages?.some(
-        (message) => message.type === 8 && message.textCandidates.includes("apple:bc-appear")
+        (message) => message.type === 8 && message.build?.effect === "apple:bc-appear" && message.build.targetNativeId === "777"
       ),
       true
     );
-    assert.equal(deck.deck.slides[0]?.timeline?.events.length, 0);
-    assert.equal(deck.conversion?.metadata?.totalTypedArchiveMessageCount, 3);
+    const event = deck.deck.slides[0]?.timeline?.events[0];
+    assert.equal(event?.kind, "keyframes");
+    assert.equal(event?.kind === "keyframes" ? event.targetId : undefined, object?.id);
+    assert.equal(event?.durationMs, 500);
+    assert.equal(event?.metadata?.nativeBuildEffect, "apple:bc-appear");
+    assert.deepEqual(event?.kind === "keyframes" ? event.tracks[0]?.keyframes : undefined, [
+      { offset: 0, value: 0 },
+      { offset: 1, value: 1 }
+    ]);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationRecoveredCount, 1);
+    assert.equal(deck.conversion?.statistics.animationCount, 1);
+    assert.equal(deck.conversion?.metadata?.totalTypedArchiveMessageCount, 4);
+    assert.equal(deck.conversion?.metadata?.totalNativeBuildRecordCount, 1);
+    assert.equal(deck.conversion?.metadata?.totalNativeBuildTimingRecordCount, 1);
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-build-animations-recovered"), true);
+  });
+
+  test("preserves repeated native image placements so build targets can resolve", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-repeated-placement-"));
+    const keyPath = path.join(dir, "repeat.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    const firstPayload = nativeImagePlacementPayload(42, { x: 10, y: 20, width: 100, height: 80 });
+    const secondPayload = nativeImagePlacementPayload(42, { x: 210, y: 20, width: 100, height: 80 });
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(111, [{ type: 3005, payload: firstPayload, dataReferences: [42] }]),
+        iwaArchiveRecord(222, [{ type: 3005, payload: secondPayload, dataReferences: [42] }]),
+        iwaArchiveRecord(9001, [
+          {
+            type: 8,
+            payload: nativeBuildPayload({ targetId: 222, direction: "In", effect: "com.apple.iWork.Keynote.Blur", durationSeconds: 0.5 })
+          }
+        ]),
+        iwaArchiveRecord(9002, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 0.5 }) }])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const imageObjects = deck.deck.slides[0]?.objects.filter((object) => object.type === "image") ?? [];
+    assert.equal(imageObjects.length, 2);
+    assert.deepEqual(
+      imageObjects.map((object) => object.metadata?.nativeArchiveIdentifier).sort(),
+      ["111", "222"]
+    );
+    const event = deck.deck.slides[0]?.timeline?.events[0];
+    assert.equal(event?.kind, "keyframes");
+    assert.equal(event?.targetId, imageObjects.find((object) => object.metadata?.nativeArchiveIdentifier === "222")?.id);
+    assert.equal(event?.metadata?.nativeBuildTargetId, "222");
+  });
+
+  test("creates a conservative media object for a unique movie-start 3007 target", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-movie-start-"));
+    const keyPath = path.join(dir, "movie.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "clip-77.mp4"), new Uint8Array([0, 0, 0, 20, 102, 116, 121, 112]));
+
+    const moviePayload = nativeImagePlacementPayload(0, { x: 95, y: 58, width: 320, height: 180 });
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(333, [{ type: 3007, payload: moviePayload }]),
+        iwaArchiveRecord(9001, [
+          {
+            type: 8,
+            payload: nativeBuildPayload({ targetId: 333, direction: "In", effect: "apple:movie-start", durationSeconds: 0.5 })
+          }
+        ]),
+        iwaArchiveRecord(9002, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 0.5 }) }])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const mediaObject = deck.deck.slides[0]?.objects.find((object) => object.type === "media");
+    assert.equal(mediaObject?.type, "media");
+    assert.equal(mediaObject?.mediaType, "video");
+    assert.equal(mediaObject?.metadata?.nativeArchiveIdentifier, "333");
+    const event = deck.deck.slides[0]?.timeline?.events[0];
+    assert.equal(event?.kind, "media");
+    assert.equal(event?.kind === "media" ? event.action : undefined, "play");
+    assert.equal(event?.targetId, mediaObject?.id);
+    assert.equal(event?.metadata?.nativeBuildEffect, "apple:movie-start");
   });
 
   test("parses a ZIP-backed .key package with loose Index IWA entries", async () => {
@@ -479,6 +566,73 @@ function protoFixed32(fieldNumber: number, value: number): Uint8Array {
   const out = new Uint8Array(4);
   new DataView(out.buffer).setFloat32(0, value, true);
   return concat([varint((fieldNumber << 3) | 5), out]);
+}
+
+function protoFixed64(fieldNumber: number, value: number): Uint8Array {
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setFloat64(0, value, true);
+  return concat([varint((fieldNumber << 3) | 1), out]);
+}
+
+function nativeImagePlacementPayload(
+  dataId: number,
+  bounds: { x: number; y: number; width: number; height: number }
+): Uint8Array {
+  return concat([
+    protoBytes(
+      concat([
+        protoBytes(
+          concat([
+            protoBytes(concat([protoFixed32(1, bounds.x), protoFixed32(2, bounds.y)]), 1),
+            protoBytes(concat([protoFixed32(1, bounds.width), protoFixed32(2, bounds.height)]), 2)
+          ]),
+          1
+        )
+      ]),
+      1
+    ),
+    ...(dataId > 0 ? [protoBytes(protoVarint(1, dataId), 11)] : [])
+  ]);
+}
+
+function nativeBuildPayload(values: {
+  targetId: number;
+  direction: string;
+  effect: string;
+  durationSeconds: number;
+  delaySeconds?: number;
+}): Uint8Array {
+  return concat([
+    protoBytes(protoVarint(1, values.targetId), 1),
+    protoString("All at Once", 2),
+    protoFixed64(3, values.delaySeconds ?? 0),
+    protoBytes(
+      concat([
+        protoFixed64(17, 60),
+        protoBytes(
+          concat([
+            protoString(values.direction, 1),
+            protoString(values.effect, 2),
+            protoFixed64(3, values.durationSeconds),
+            protoFixed64(5, values.delaySeconds ?? 0)
+          ]),
+          18
+        )
+      ]),
+      4
+    )
+  ]);
+}
+
+function nativeBuildTimingPayload(values: { buildId: number; durationSeconds: number; delaySeconds?: number }): Uint8Array {
+  return concat([
+    protoBytes(protoVarint(1, values.buildId), 1),
+    protoFixed64(3, values.delaySeconds ?? 0),
+    protoFixed64(4, values.durationSeconds),
+    protoVarint(5, 0),
+    protoVarint(6, 1),
+    protoBytes(protoVarint(2, 1), 7)
+  ]);
 }
 
 function iwaArchiveRecord(
