@@ -3,7 +3,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { inflateRawSync } from "node:zlib";
 
-import { IR_VERSION, type AnimationEvent, type Asset, type DeckIR, type IRObject, type JSONRecord, type Slide } from "../ir/index.ts";
+import { IR_VERSION, type AnimationEvent, type Asset, type DeckIR, type IRObject, type JSONRecord, type KeyframeTrack, type Slide } from "../ir/index.ts";
 
 const DEFAULT_DECK_SIZE = { width: 1280, height: 720 };
 const MAX_TEXT_CANDIDATES_PER_STREAM = 80;
@@ -2281,6 +2281,18 @@ function nativeBuildEventFromEvidence(
   if (build.effect && /wipe/i.test(build.effect) && resolution.object.bounds) {
     return nativeWipeBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs, direction);
   }
+  if (build.effect && /blur/i.test(build.effect)) {
+    return nativeBlurBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs, direction);
+  }
+  if (build.effect && /dissolve/i.test(build.effect)) {
+    return nativeDissolveBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs, direction);
+  }
+  if (build.effect && /crumble/i.test(build.effect)) {
+    return nativeCrumbleBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs, direction);
+  }
+  if (build.effect && /anvil/i.test(build.effect)) {
+    return nativeAnvilBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs, direction);
+  }
   const from = direction === "out" ? 1 : 0;
   const to = direction === "out" ? 0 : 1;
   return {
@@ -2303,6 +2315,150 @@ function nativeBuildEventFromEvidence(
       }
     ],
     metadata: nativeBuildEventMetadata(build, timing, resolution, `opacity-${direction}`)
+  };
+}
+
+function nativeBlurBuildEventFromEvidence(
+  slideId: string,
+  index: number,
+  targetIndex: number,
+  build: NativeIwaBuildEvidence,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  resolution: { object: IRObject; method: string; nativeTargetId?: string },
+  startMs: number,
+  durationMs: number,
+  direction: "in" | "out"
+): AnimationEvent {
+  const fromOpacity = direction === "out" ? 1 : 0;
+  const toOpacity = direction === "out" ? 0 : 1;
+  const fromBlur = direction === "out" ? 0 : 18;
+  const toBlur = direction === "out" ? 18 : 0;
+  return {
+    id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, `blur-${direction}`),
+    kind: "keyframes",
+    label: `Keynote blur ${direction}`,
+    targetId: resolution.object.id,
+    start: { type: "absolute", atMs: startMs },
+    durationMs,
+    fill: "both",
+    easing: "easeInOut",
+    tracks: [
+      twoPointTrack("opacity", fromOpacity, toOpacity),
+      twoPointTrack("filter.blurPx", fromBlur, toBlur)
+    ],
+    metadata: {
+      ...nativeBuildEventMetadata(build, timing, resolution, `blur-${direction}`),
+      nativeBuildDegradation: "Keynote blur radius/curve is approximated with a fixed CSS blur track."
+    }
+  };
+}
+
+function nativeDissolveBuildEventFromEvidence(
+  slideId: string,
+  index: number,
+  targetIndex: number,
+  build: NativeIwaBuildEvidence,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  resolution: { object: IRObject; method: string; nativeTargetId?: string },
+  startMs: number,
+  durationMs: number,
+  direction: "in" | "out"
+): AnimationEvent {
+  const from = direction === "out" ? 1 : 0;
+  const to = direction === "out" ? 0 : 1;
+  return {
+    id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, `dissolve-${direction}`),
+    kind: "keyframes",
+    label: `Keynote dissolve ${direction}`,
+    targetId: resolution.object.id,
+    start: { type: "absolute", atMs: startMs },
+    durationMs,
+    fill: "both",
+    easing: "easeInOut",
+    tracks: [twoPointTrack("opacity", from, to)],
+    metadata: {
+      ...nativeBuildEventMetadata(build, timing, resolution, `dissolve-${direction}`),
+      nativeBuildDegradation: build.effect && /character/i.test(build.effect) ? "Per-character dissolve is approximated as object-level opacity." : "Dissolve is approximated as object-level opacity."
+    }
+  };
+}
+
+function nativeCrumbleBuildEventFromEvidence(
+  slideId: string,
+  index: number,
+  targetIndex: number,
+  build: NativeIwaBuildEvidence,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  resolution: { object: IRObject; method: string; nativeTargetId?: string },
+  startMs: number,
+  durationMs: number,
+  direction: "in" | "out"
+): AnimationEvent {
+  const entering = direction === "in";
+  return {
+    id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, `crumble-${direction}`),
+    kind: "keyframes",
+    label: `Keynote crumble ${direction}`,
+    targetId: resolution.object.id,
+    start: { type: "absolute", atMs: startMs },
+    durationMs,
+    fill: "both",
+    easing: "easeInOut",
+    tracks: [
+      twoPointTrack("opacity", entering ? 0 : 1, entering ? 1 : 0),
+      twoPointTrack("transform.translateY", entering ? 18 : 0, entering ? 0 : 36),
+      twoPointTrack("transform.rotateDeg", entering ? -4 : 0, entering ? 0 : 8),
+      twoPointTrack("transform.scale", entering ? 0.96 : 1, entering ? 1 : 0.9)
+    ],
+    metadata: {
+      ...nativeBuildEventMetadata(build, timing, resolution, `crumble-${direction}`),
+      nativeBuildDegradation: "Keynote crumble particle/shatter behavior is approximated with object-level fall, rotation, scale, and opacity."
+    }
+  };
+}
+
+function nativeAnvilBuildEventFromEvidence(
+  slideId: string,
+  index: number,
+  targetIndex: number,
+  build: NativeIwaBuildEvidence,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  resolution: { object: IRObject; method: string; nativeTargetId?: string },
+  startMs: number,
+  durationMs: number,
+  direction: "in" | "out"
+): AnimationEvent {
+  const entering = direction === "in";
+  return {
+    id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, `anvil-${direction}`),
+    kind: "keyframes",
+    label: `Keynote anvil ${direction}`,
+    targetId: resolution.object.id,
+    start: { type: "absolute", atMs: startMs },
+    durationMs,
+    fill: "both",
+    easing: entering ? "backOut" : "easeInOut",
+    tracks: [
+      twoPointTrack("opacity", entering ? 0 : 1, entering ? 1 : 0),
+      twoPointTrack("transform.translateY", entering ? -48 : 0, entering ? 0 : 48),
+      twoPointTrack("transform.scale", entering ? 1.16 : 1, entering ? 1 : 0.86),
+      twoPointTrack("transform.rotateDeg", entering ? -2 : 0, entering ? 0 : 4)
+    ],
+    metadata: {
+      ...nativeBuildEventMetadata(build, timing, resolution, `anvil-${direction}`),
+      nativeBuildDegradation: "Keynote anvil impact/physics behavior is approximated with object-level drop, scale, rotation, and opacity."
+    }
+  };
+}
+
+function twoPointTrack(property: string, from: number, to: number): KeyframeTrack {
+  return {
+    property,
+    interpolation: "number",
+    keyframes: [
+      { offset: 0, value: from },
+      { offset: 1, value: to }
+    ]
   };
 }
 

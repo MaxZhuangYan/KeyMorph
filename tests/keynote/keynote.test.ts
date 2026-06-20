@@ -460,6 +460,12 @@ describe("Keynote bridge", () => {
     assert.equal(event?.kind, "keyframes");
     assert.equal(event?.targetId, imageObjects.find((object) => object.metadata?.nativeArchiveIdentifier === "222")?.id);
     assert.equal(event?.metadata?.nativeBuildTargetId, "222");
+    assert.equal(event?.metadata?.nativeBuildFallback, "blur-in");
+    assert.equal(typeof event?.metadata?.nativeBuildDegradation, "string");
+    assert.deepEqual(event?.kind === "keyframes" ? event.tracks.find((track) => track.property === "filter.blurPx")?.keyframes : undefined, [
+      { offset: 0, value: 18 },
+      { offset: 1, value: 0 }
+    ]);
   });
 
   test("creates a conservative media object for a unique movie-start 3007 target", async () => {
@@ -750,6 +756,48 @@ describe("Keynote bridge", () => {
     assert.deepEqual(event.tracks.find((track) => track.property === "bounds")?.keyframes, [
       { offset: 0, value: { x: 10, y: 20, width: 1, height: 80 } },
       { offset: 1, value: { x: 10, y: 20, width: 100, height: 80 } }
+    ]);
+  });
+
+  test("maps native Keynote anvil and crumble to object-level motion fallbacks", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-physical-builds-"));
+    const keyPath = path.join(dir, "physical.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(111, [
+          { type: 3005, payload: nativeImagePlacementPayload(42, { x: 10, y: 20, width: 100, height: 80 }), dataReferences: [42] }
+        ]),
+        iwaArchiveRecord(9001, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "In", effect: "com.apple.iWork.Keynote.BUKAnvil", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9002, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 1 }) }]),
+        iwaArchiveRecord(9003, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "Out", effect: "com.apple.iWork.Keynote.Crumble", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9004, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 9003, durationSeconds: 1 }) }])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const events = deck.deck.slides[0]?.timeline?.events ?? [];
+    assert.equal(events.length, 2);
+    assert.equal(events[0]?.metadata?.nativeBuildFallback, "anvil-in");
+    assert.equal(events[1]?.metadata?.nativeBuildFallback, "crumble-out");
+    assert.equal(typeof events[0]?.metadata?.nativeBuildDegradation, "string");
+    assert.equal(typeof events[1]?.metadata?.nativeBuildDegradation, "string");
+    assert.deepEqual(events[0]?.kind === "keyframes" ? events[0].tracks.find((track) => track.property === "transform.translateY")?.keyframes : undefined, [
+      { offset: 0, value: -48 },
+      { offset: 1, value: 0 }
+    ]);
+    assert.deepEqual(events[1]?.kind === "keyframes" ? events[1].tracks.find((track) => track.property === "transform.rotateDeg")?.keyframes : undefined, [
+      { offset: 0, value: 0 },
+      { offset: 1, value: 8 }
     ]);
   });
 
