@@ -118,4 +118,13 @@ describe("product bundle workflow", () => {
     assert.equal(manifest.sourceKind, "ir");
     assert.equal(manifest.artifacts.runtimeHtml, "runtime.html");
   });
+
+  test("dev UI includes Simplified and Traditional Chinese language options", async () => {
+    const source = await readFile(path.resolve("scripts/dev.mjs"), "utf8");
+
+    assert.match(source, /<option value="zh-Hans">简体中文<\/option>/);
+    assert.match(source, /<option value="zh-Hant">繁體中文<\/option>/);
+    assert.match(source, /把演示文稿拖到这里/);
+    assert.match(source, /把簡報拖到這裡/);
+  });
 });
