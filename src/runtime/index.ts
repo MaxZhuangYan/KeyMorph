@@ -1893,7 +1893,7 @@ function resolveObjectSourceUrl(source: ObjectSource | undefined, deck: DeckIR |
   if (!source) return "";
   if (source.dataUri ?? source.uri) return source.dataUri ?? source.uri ?? "";
   const asset = source.assetId ? deck?.deck.assets?.find((candidate) => candidate.id === source.assetId) : undefined;
-  return asset?.uri ?? "";
+  return asset?.uri ?? asset?.dataUri ?? "";
 }
 
 function objectStyle(object: IRObject): string {

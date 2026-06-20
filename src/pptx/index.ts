@@ -402,7 +402,7 @@ function resolveObjectSource(source: { assetId?: string; uri?: string; dataUri?:
   if (!source) return undefined;
   if (source.dataUri ?? source.uri) return source.dataUri ?? source.uri;
   const asset = source.assetId ? deck.deck.assets?.find((candidate) => candidate.id === source.assetId) : undefined;
-  return asset?.uri;
+  return asset?.uri ?? asset?.dataUri;
 }
 
 function decodeDataUri(source: string | undefined): { contentType: string; data: Uint8Array } | undefined {

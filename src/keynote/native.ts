@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { inflateRawSync } from "node:zlib";
 
@@ -22,6 +25,7 @@ const MAX_TYPED_ARCHIVE_MESSAGE_EVIDENCE_PER_STREAM = 512;
 const MAX_SNAPPY_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MAX_VISUAL_NUMERIC_VALUE = 100000;
 const MAX_EMBEDDED_ASSET_BYTES = 2 * 1024 * 1024;
+const MAX_RENDERABLE_NATIVE_ASSET_BYTES = 32 * 1024 * 1024;
 const LOW_CONFIDENCE_TEXT_FALLBACK_THRESHOLD = 0.45;
 
 export interface NativeKeynoteDetection {
@@ -270,10 +274,28 @@ interface NativeAssetReference {
   name: string;
   kind: Asset["kind"];
   mimeType?: string;
+  sourceMimeType?: string;
   width?: number;
   height?: number;
   dataId?: string;
   embedded?: boolean;
+  renderProxy?: NativeAssetRenderProxy;
+}
+
+interface NativeAssetRenderProxy {
+  mimeType: string;
+  format: "png";
+  byteLength: number;
+  checksum: string;
+  sourceMimeType?: string;
+}
+
+interface NativeRenderableAssetData {
+  data: Uint8Array;
+  mimeType: string;
+  format: "source" | "png";
+  proxy: boolean;
+  dimensions?: { width: number; height: number; source: string };
 }
 
 interface NativeAssetCatalog {
@@ -1049,22 +1071,34 @@ function createNativeAssetCatalog(
     }
 
     const classification = classifyAssetPath(assetPath);
-    const imageDimensions = classification.kind === "image" ? readImageDimensions(data, classification.mimeType) : undefined;
+    const renderable = createNativeRenderableAssetData(assetPath, data, classification.mimeType);
+    const imageDimensions =
+      renderable?.dimensions ?? (classification.kind === "image" ? readImageDimensions(data, classification.mimeType) : undefined);
     const assetId = stableAssetId(assetPath);
     const dataId = dataIdFromAssetPath(assetPath);
-    const embedded = shouldEmbedNativeAsset(data, classification.mimeType);
+    const embedded = renderable !== undefined;
     const asset: Asset = {
       id: assetId,
       kind: classification.kind,
-      uri: embedded ? dataUri(classification.mimeType, data) : undefined,
+      uri: embedded && renderable ? dataUri(renderable.mimeType, renderable.data) : undefined,
       name,
-      mimeType: classification.mimeType,
+      mimeType: renderable?.mimeType ?? classification.mimeType,
       ...(imageDimensions ? { width: imageDimensions.width, height: imageDimensions.height } : {}),
       checksum: `sha256:${sha256Hex(data)}`,
       metadata: {
         nativeSourcePath: assetPath,
         byteLength: data.byteLength,
         nativeDataEmbedded: embedded,
+        ...(renderable && renderable.data !== data
+          ? {
+              nativeRenderableProxy: true,
+              nativeRenderableProxyFormat: renderable.format,
+              nativeRenderableProxyMimeType: renderable.mimeType,
+              nativeRenderableProxyByteLength: renderable.data.byteLength,
+              nativeRenderableProxyChecksum: `sha256:${sha256Hex(renderable.data)}`,
+              nativeSourceMimeType: classification.mimeType ?? ""
+            }
+          : {}),
         ...(dataId ? { nativeDataId: dataId } : {}),
         ...(isSnapshotAssetPath(assetPath)
           ? {
@@ -1088,9 +1122,21 @@ function createNativeAssetCatalog(
       name,
       kind: asset.kind,
       mimeType: asset.mimeType,
+      sourceMimeType: classification.mimeType,
       width: asset.width,
       height: asset.height,
       embedded,
+      ...(renderable?.proxy
+        ? {
+            renderProxy: {
+              mimeType: renderable.mimeType,
+              format: renderable.format,
+              byteLength: renderable.data.byteLength,
+              checksum: `sha256:${sha256Hex(renderable.data)}`,
+              sourceMimeType: classification.mimeType
+            }
+          }
+        : {}),
       ...(dataId ? { dataId } : {})
     };
 
@@ -1168,6 +1214,57 @@ function createNativeAssetCatalog(
 
 function shouldEmbedNativeAsset(data: Uint8Array, mimeType: string | undefined): boolean {
   return Boolean(mimeType?.startsWith("image/")) && mimeType !== "image/tiff" && data.byteLength <= MAX_EMBEDDED_ASSET_BYTES;
+}
+
+function createNativeRenderableAssetData(
+  assetPath: string,
+  data: Uint8Array,
+  mimeType: string | undefined
+): NativeRenderableAssetData | undefined {
+  const sourceDimensions = readImageDimensions(data, mimeType);
+  if (isBrowserRenderableImageMimeType(mimeType)) {
+    if (shouldEmbedNativeAsset(data, mimeType)) {
+      return { data, mimeType: mimeType!, format: "source", proxy: false, dimensions: sourceDimensions };
+    }
+    return undefined;
+  }
+
+  if (mimeType === "image/tiff" || mimeType === "image/heic") {
+    const converted = convertNativeImageToPng(assetPath, data);
+    if (!converted || converted.byteLength > MAX_RENDERABLE_NATIVE_ASSET_BYTES) {
+      return undefined;
+    }
+    return {
+      data: converted,
+      mimeType: "image/png",
+      format: "png",
+      proxy: true,
+      dimensions: readPngDimensions(converted) ?? sourceDimensions
+    };
+  }
+  return undefined;
+}
+
+function isBrowserRenderableImageMimeType(mimeType: string | undefined): boolean {
+  return ["image/png", "image/jpeg", "image/gif", "image/webp", "image/svg+xml"].includes(mimeType ?? "");
+}
+
+function convertNativeImageToPng(assetPath: string, data: Uint8Array): Uint8Array | undefined {
+  if (!existsSync("/usr/bin/sips")) {
+    return undefined;
+  }
+  const dir = mkdtempSync(path.join(tmpdir(), "keymorph-native-image-"));
+  const inputPath = path.join(dir, `input${path.extname(assetPath) || ".image"}`);
+  const outputPath = path.join(dir, "output.png");
+  try {
+    writeFileSync(inputPath, data);
+    execFileSync("/usr/bin/sips", ["-s", "format", "png", inputPath, "--out", outputPath], { stdio: "ignore" });
+    return new Uint8Array(readFileSync(outputPath));
+  } catch {
+    return undefined;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 function dataUri(mimeType: string | undefined, data: Uint8Array): string {
@@ -1935,6 +2032,16 @@ function createAssetObject(
           nativeAssetHeight: asset.height
         }
       : {}),
+    ...(asset.renderProxy
+      ? {
+          nativeAssetRenderableProxy: true,
+          nativeAssetRenderableProxyFormat: asset.renderProxy.format,
+          nativeAssetRenderableProxyMimeType: asset.renderProxy.mimeType,
+          nativeAssetRenderableProxyByteLength: asset.renderProxy.byteLength,
+          nativeAssetRenderableProxyChecksum: asset.renderProxy.checksum,
+          nativeAssetSourceMimeType: asset.renderProxy.sourceMimeType ?? ""
+        }
+      : {}),
     nativeAssetEvidence: match.evidence,
     nativeAssetMatchConfidence: match.confidence,
     nativeAssetFieldPath: match.fieldPath,
@@ -1944,8 +2051,10 @@ function createAssetObject(
           nativeSuppressedAssetVariants: match.suppressedAssets.map((asset) => ({
             path: asset.path,
             mimeType: asset.mimeType,
+            ...(asset.sourceMimeType && asset.sourceMimeType !== asset.mimeType ? { sourceMimeType: asset.sourceMimeType } : {}),
             ...(asset.width !== undefined && asset.height !== undefined ? { width: asset.width, height: asset.height } : {}),
-            embedded: asset.embedded === true
+            embedded: asset.embedded === true,
+            ...(asset.renderProxy ? { renderProxy: true } : {})
           }))
         }
       : {}),
@@ -1986,6 +2095,8 @@ function createAssetObject(
         metadata: {
           nativeAssetPath: asset.path,
           mimeType: asset.mimeType,
+          ...(asset.sourceMimeType && asset.sourceMimeType !== asset.mimeType ? { sourceMimeType: asset.sourceMimeType } : {}),
+          ...(asset.renderProxy ? { renderProxy: true, renderProxyFormat: asset.renderProxy.format } : {}),
           ...(asset.width !== undefined && asset.height !== undefined
             ? {
                 width: asset.width,
@@ -2011,6 +2122,8 @@ function createAssetObject(
         metadata: {
           nativeAssetPath: asset.path,
           mimeType: asset.mimeType,
+          ...(asset.sourceMimeType && asset.sourceMimeType !== asset.mimeType ? { sourceMimeType: asset.sourceMimeType } : {}),
+          ...(asset.renderProxy ? { renderProxy: true, renderProxyFormat: asset.renderProxy.format } : {}),
           ...(asset.width !== undefined && asset.height !== undefined
             ? {
                 width: asset.width,
@@ -2877,7 +2990,7 @@ function compareNativeAssetVariantMatches(left: NativeAssetMatch, right: NativeA
 
 function nativeAssetDisplayRank(asset: NativeAssetReference): number {
   if (asset.kind !== "image") return 3;
-  if (asset.embedded) return 3;
+  if (asset.embedded || asset.renderProxy) return 3;
   if (asset.mimeType === "image/tiff" || asset.mimeType === "image/heic") return 1;
   return 2;
 }
@@ -2891,7 +3004,9 @@ function nativeAssetVariantPenalty(asset: NativeAssetReference): number {
   let penalty = 0;
   if (/(?:^|[-_])small(?:[-_.]|$)/.test(name)) penalty += 20;
   if (/(?:^|[-_])filtered(?:[-_.]|$)/.test(name)) penalty += 8;
-  if (asset.mimeType === "image/tiff" || asset.mimeType === "image/heic") penalty += 4;
+  if ((asset.sourceMimeType ?? asset.mimeType) === "image/tiff" || (asset.sourceMimeType ?? asset.mimeType) === "image/heic") {
+    penalty += asset.renderProxy ? 0 : 4;
+  }
   return penalty;
 }
 
@@ -5554,6 +5669,7 @@ function readImageDimensions(
     readJpegDimensions(data) ??
     readGifDimensions(data) ??
     readWebpDimensions(data) ??
+    (mimeType === "image/svg+xml" ? readSvgDimensions(data) : undefined) ??
     (mimeType === "image/tiff" ? readTiffDimensions(data) : undefined)
   );
 }
@@ -5651,6 +5767,48 @@ function readWebpDimensions(data: Uint8Array): { width: number; height: number; 
     return validateImageDimensions(width, height, "webp-vp8l");
   }
   return undefined;
+}
+
+function readSvgDimensions(data: Uint8Array): { width: number; height: number; source: string } | undefined {
+  const text = decodeUtf8(data);
+  if (!text || !/<svg[\s>]/i.test(text)) {
+    return undefined;
+  }
+  const svgTag = text.match(/<svg\b[^>]*>/i)?.[0];
+  if (!svgTag) {
+    return undefined;
+  }
+  const width = parseSvgLength(readXmlAttribute(svgTag, "width"));
+  const height = parseSvgLength(readXmlAttribute(svgTag, "height"));
+  if (width !== undefined && height !== undefined) {
+    return validateImageDimensions(width, height, "svg-size");
+  }
+  const viewBox = readXmlAttribute(svgTag, "viewBox");
+  if (viewBox) {
+    const values = viewBox.trim().split(/[\s,]+/).map(Number);
+    if (values.length >= 4) {
+      return validateImageDimensions(values[2]!, values[3]!, "svg-viewbox");
+    }
+  }
+  return undefined;
+}
+
+function readXmlAttribute(tag: string, name: string): string | undefined {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = tag.match(new RegExp(`\\s${escaped}\\s*=\\s*(['"])(.*?)\\1`, "i"));
+  return match?.[2] ? unescapeXml(match[2]) : undefined;
+}
+
+function parseSvgLength(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const match = value.trim().match(/^([+-]?(?:\d+\.?\d*|\.\d+))(?:px)?$/i);
+  if (!match) {
+    return undefined;
+  }
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function readTiffDimensions(data: Uint8Array): { width: number; height: number; source: string } | undefined {
@@ -5865,6 +6023,8 @@ function classifyAssetPath(assetPath: string): { kind: Asset["kind"]; mimeType?:
       return { kind: "image", mimeType: "image/heic" };
     case ".webp":
       return { kind: "image", mimeType: "image/webp" };
+    case ".svg":
+      return { kind: "image", mimeType: "image/svg+xml" };
     case ".mp4":
       return { kind: "video", mimeType: "video/mp4" };
     case ".m4v":

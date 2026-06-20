@@ -48,6 +48,7 @@ export interface Asset {
   id: IRID;
   kind: "image" | "video" | "audio" | "font" | "data" | "other";
   uri?: string;
+  dataUri?: string;
   mimeType?: string;
   name?: string;
   width?: number;
