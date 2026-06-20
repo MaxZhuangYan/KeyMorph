@@ -137,6 +137,23 @@ describe("Keynote bridge", () => {
     assert.equal(deck.conversion?.metadata?.totalNestedMessageCount, 1);
   });
 
+  test("reads native slide size from Document.iwa when plist dimensions are unavailable", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-document-size-"));
+    const keyPath = path.join(dir, "document-size.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(
+      path.join(keyPath, "Index", "Document.iwa"),
+      iwaArchiveRecord(700, [{ type: 2, payload: nativeDocumentSizePayload(1920, 1080) }])
+    );
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("Native size slide"));
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.deepEqual(deck.deck.size, { width: 1920, height: 1080, unit: "px" });
+    assert.equal(deck.metadata?.custom?.nativeDeckSizeSource, "document-iwa");
+    assert.equal(deck.deck.slides[0]?.objects[0]?.bounds?.width, 1632);
+  });
+
   test("extracts package asset references into IR assets and approximate objects", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-assets-"));
     const keyPath = path.join(dir, "assets.key");
@@ -716,6 +733,10 @@ function nativeImagePlacementPayload(
     ),
     ...(dataId > 0 ? [protoBytes(protoVarint(1, dataId), 11)] : [])
   ]);
+}
+
+function nativeDocumentSizePayload(width: number, height: number): Uint8Array {
+  return concat([protoFixed32(1, width), protoFixed32(2, height)]);
 }
 
 function nativeBuildPayload(values: {

@@ -315,6 +315,7 @@ interface NativeMetadata {
   createdAt?: string;
   updatedAt?: string;
   size?: { width: number; height: number };
+  sizeSource?: string;
   documentIdentifier?: string;
   paths: string[];
   values: JSONRecord;
@@ -409,7 +410,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
     throw new Error("Native Keynote package was not detected. Expected Index.zip or Index/*.iwa streams.");
   }
 
-  const metadata = readNativeMetadata(keynotePackage.entries);
+  const metadata = readNativeMetadata(parts.entries);
   const deckSize = metadata.size ?? DEFAULT_DECK_SIZE;
   const assets = createNativeAssetCatalog(parts.assetPaths, parts.entries, parts.quickLookPreviews);
   const iwaStreams = classifyIwaStreams(parts.iwaEntries, assets);
@@ -714,6 +715,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         nativePreviewImageAssetCount: previewImageAssetCount,
         nativeQuickLookPreviews: parts.quickLookPreviews,
         nativeMetadataPaths: metadata.paths,
+        ...(metadata.sizeSource ? { nativeDeckSizeSource: metadata.sizeSource } : {}),
         ...(metadata.documentIdentifier ? { nativeDocumentIdentifier: metadata.documentIdentifier } : {})
       }
     },
@@ -1258,6 +1260,9 @@ function readNativeMetadata(entries: Map<string, Uint8Array>): NativeMetadata {
     }
   }
 
+  const plistSize = readDeckSize(values);
+  const documentSize = plistSize ? undefined : readNativeDocumentDeckSize(entries);
+
   return {
     title: stringValue(values, ["title", "Title", "documentTitle", "DocumentTitle", "name", "Name", "kMDItemTitle"]),
     author: stringValue(values, ["author", "Author", "creator", "Creator", "kMDItemAuthors", "NSHumanReadableCopyright"]),
@@ -1270,7 +1275,8 @@ function readNativeMetadata(entries: Map<string, Uint8Array>): NativeMetadata {
       "kMDItemFSContentChangeDate",
       "kMDItemLastUsedDate"
     ]),
-    size: readDeckSize(values),
+    size: plistSize ?? documentSize,
+    sizeSource: plistSize ? "metadata-plist" : documentSize ? "document-iwa" : undefined,
     documentIdentifier: stringValue(values, [
       "documentIdentifier",
       "DocumentIdentifier",
@@ -5104,6 +5110,56 @@ function readDeckSize(values: JSONRecord): { width: number; height: number } | u
     return undefined;
   }
   return { width, height };
+}
+
+function readNativeDocumentDeckSize(entries: Map<string, Uint8Array>): { width: number; height: number } | undefined {
+  const documentEntry = Array.from(entries.entries()).find(([entryPath]) => /^Index\/Document\.iwa$/i.test(normalizePartPath(entryPath)));
+  if (!documentEntry) {
+    return undefined;
+  }
+  const scan = scanIwaEntry(documentEntry[1]);
+  const candidates = scan.archiveMessages
+    .filter((message) => message.type === 2)
+    .map((message) => nativeDocumentDeckSizeCandidate(message))
+    .filter((size): size is { width: number; height: number; confidence: number } => Boolean(size))
+    .sort((left, right) => right.confidence - left.confidence || right.width * right.height - left.width * left.height);
+  const best = candidates[0];
+  return best ? { width: best.width, height: best.height } : undefined;
+}
+
+function nativeDocumentDeckSizeCandidate(
+  message: NativeIwaArchiveMessageEvidence
+): { width: number; height: number; confidence: number } | undefined {
+  const byPath = new Map(message.fieldSummaries.map((summary) => [summary.fieldPath, summary]));
+  const width = byPath.get("1")?.sampleNumericValue;
+  const height = byPath.get("2")?.sampleNumericValue;
+  if (!isPlausibleNativeDeckSize(width, height)) {
+    return undefined;
+  }
+  const confidence = roundConfidence(
+    0.72 +
+      (message.archiveIdentifier ? 0.08 : 0) +
+      (byPath.get("1")?.occurrences === 1 ? 0.04 : 0) +
+      (byPath.get("2")?.occurrences === 1 ? 0.04 : 0)
+  );
+  return {
+    width: Math.round(width),
+    height: Math.round(height),
+    confidence
+  };
+}
+
+function isPlausibleNativeDeckSize(width: number | undefined, height: number | undefined): boolean {
+  return (
+    width !== undefined &&
+    height !== undefined &&
+    Number.isFinite(width) &&
+    Number.isFinite(height) &&
+    width >= 320 &&
+    height >= 240 &&
+    width <= 10000 &&
+    height <= 10000
+  );
 }
 
 function createQuickLookPreviewMetadata(entryPath: string, data: Uint8Array): NativeQuickLookPreviewMetadata {
