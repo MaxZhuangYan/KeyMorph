@@ -39,6 +39,8 @@ describe("conversion report scoring", () => {
     assert.equal(score.animationLostCount, 1);
     assert.equal(score.degradedAnimationCount, 1);
     assert.equal(score.uncertainMappingCount, 1);
+    assert.equal(score.riskLevel, "medium");
+    assert.ok(score.penaltyBreakdown.length >= 3);
     assert.ok(score.fidelityScore < 1);
   });
 
@@ -75,6 +77,8 @@ describe("conversion report scoring", () => {
 
     assert.equal(loss.animationLostCount, 1);
     assert.equal(loss.unsupportedTransitions.length, 1);
+    assert.equal(loss.unsupportedFeatures.length, 2);
+    assert.equal(loss.degradedFeatures.length, 1);
     assert.match(loss.degradedAnimations[0], /fade-easing/);
   });
 });
