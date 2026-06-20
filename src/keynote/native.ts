@@ -175,6 +175,7 @@ export interface NativeIwaMotionPathEvidence {
   kind: "motionPath";
   relative: boolean;
   points: Array<{ x: number; y: number }>;
+  extentPoints?: Array<{ x: number; y: number }>;
   confidence: number;
   sourceFieldPaths: string[];
 }
@@ -2560,6 +2561,7 @@ function nativeBuildEventMetadata(
       ? {
           nativeMotionPathRelative: build.motionPath.relative,
           nativeMotionPathPoints: build.motionPath.points,
+          ...(build.motionPath.extentPoints ? { nativeMotionPathExtentPoints: build.motionPath.extentPoints } : {}),
           nativeMotionPathConfidence: build.motionPath.confidence,
           nativeMotionPathFieldPaths: build.motionPath.sourceFieldPaths
         }
@@ -3397,10 +3399,12 @@ function nativeMotionPathEvidenceFromPayload(payload: Uint8Array): NativeIwaMoti
   if (Math.abs(points[1]!.x) < 0.001 && Math.abs(points[1]!.y) < 0.001) {
     return undefined;
   }
+  const extentPoints = nativeMotionPathExtentPoints(pathPayload);
   return {
     kind: "motionPath",
     relative: true,
     points,
+    ...(extentPoints.length > 0 ? { extentPoints } : {}),
     confidence: pointClusters.length === 2 ? 0.86 : 0.78,
     sourceFieldPaths: [
       "4.22",
@@ -3409,9 +3413,24 @@ function nativeMotionPathEvidenceFromPayload(payload: Uint8Array): NativeIwaMoti
       "4.22.8.1.1.2.1",
       "4.22.8.1.1.2.2",
       "4.22.8.1.1.3.1",
-      "4.22.8.1.1.3.2"
+      "4.22.8.1.1.3.2",
+      ...(extentPoints.length > 0 ? ["4.22.8.2.1", "4.22.8.2.2"] : [])
     ]
   };
+}
+
+function nativeMotionPathExtentPoints(payload: Uint8Array): Array<{ x: number; y: number }> {
+  const extentPayloads = bytesValuesAtFieldPath(payload, [8, 2]);
+  return extentPayloads
+    .map((extentPayload) => {
+      const x = numericValueAtFieldPath(extentPayload, [1]);
+      const y = numericValueAtFieldPath(extentPayload, [2]);
+      if (x === undefined || y === undefined || !Number.isFinite(x) || !Number.isFinite(y)) {
+        return undefined;
+      }
+      return { x: roundGeometryNumber(x), y: roundGeometryNumber(y) };
+    })
+    .filter((point): point is { x: number; y: number } => Boolean(point));
 }
 
 function nativeMotionPathPointClusters(payload: Uint8Array): Array<{ x: number; y: number }> {

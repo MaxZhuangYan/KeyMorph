@@ -621,6 +621,18 @@ describe("Keynote bridge", () => {
       { offset: 1, value: -252 }
     ]);
     assert.equal(motion.metadata?.nativeMotionPathRelative, true);
+    assert.deepEqual(motion.metadata?.nativeMotionPathExtentPoints, [{ x: 50, y: 252 }]);
+    assert.deepEqual(motion.metadata?.nativeMotionPathFieldPaths, [
+      "4.22",
+      "4.22.8.1.1.1.1",
+      "4.22.8.1.1.1.2",
+      "4.22.8.1.1.2.1",
+      "4.22.8.1.1.2.2",
+      "4.22.8.1.1.3.1",
+      "4.22.8.1.1.3.2",
+      "4.22.8.2.1",
+      "4.22.8.2.2"
+    ]);
     assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationUnresolvedCount, 0);
   });
 
@@ -1037,7 +1049,8 @@ function nativeTextDrawablePayload(values: {
 function nativeMotionPathPayload(point: { x: number; y: number }): Uint8Array {
   const zero = nativeMotionPathPointCluster({ x: 0, y: 0 });
   const end = nativeMotionPathPointCluster(point);
-  return protoBytes(protoBytes(concat([zero, end]), 1), 8);
+  const extent = nativeMotionPathPoint({ x: Math.abs(point.x), y: Math.abs(point.y) });
+  return protoBytes(concat([protoBytes(concat([zero, end]), 1), protoBytes(extent, 2)]), 8);
 }
 
 function nativeMotionPathPointCluster(point: { x: number; y: number }): Uint8Array {
