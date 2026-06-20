@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { deflateRawSync } from "node:zlib";
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 
 import { IR_VERSION, type ConversionReport, type DeckIR, type IRObject, type Slide } from "../ir/index.ts";
 
@@ -8,58 +8,23 @@ const WIDE_LAYOUT = { width: 13.333333, height: 7.5 };
 
 export async function parsePptxToIr(filePath: string): Promise<DeckIR> {
   const data = await readFile(filePath);
-  const report: ConversionReport = {
-    source: { kind: "pptx", uri: filePath },
-    status: "partial",
-    generatedAt: new Date().toISOString(),
-    tool: "keymorph-pptx-parser-mvp",
-    messages: [
-      {
-        severity: "warning",
-        code: "pptx-import-mvp",
-        message:
-          "This checkpoint verifies that the PPTX package is readable but does not yet extract full PresentationML."
-      }
-    ],
-    unsupportedFeatures: [
-      {
-        code: "presentationml-static-extraction",
-        severity: "warning",
-        area: "layout",
-        description: "PPTX shape, text, image, and animation XML extraction is deferred to the next checkpoint.",
-        fallback: "Create a placeholder IR slide with a loss report."
-      }
-    ],
-    degradedFeatures: [],
-    uncertainMappings: [],
-    statistics: {
-      slideCount: 1,
-      objectCount: 1,
-      animationCount: 0,
-      unsupportedFeatureCount: 1
-    },
-    metadata: {
-      byteLength: data.byteLength
-    }
-  };
-
-  return {
-    irVersion: IR_VERSION,
-    metadata: { title: "Imported PPTX", sourceApplication: "PowerPoint" },
-    deck: {
-      id: "pptx-import",
-      title: "Imported PPTX",
-      size: { width: 1280, height: 720, unit: "px" },
-      slides: [
+  const entries = readZipEntries(data);
+  const presentationXml = getTextEntry(entries, "ppt/presentation.xml");
+  const slidePaths = presentationXml ? readSlidePaths(entries, presentationXml) : [];
+  const size = presentationXml ? readSlideSize(presentationXml) : { width: 1280, height: 720 };
+  const slides = slidePaths.map((slidePath, index) => parseSlideXml(getTextEntry(entries, slidePath) ?? "", index));
+  const parsedSlides = slides.length
+    ? slides
+    : [
         {
           id: "slide-1",
           index: 0,
           name: "Import placeholder",
-          background: { type: "solid", color: "#ffffff" },
+          background: { type: "solid" as const, color: "#ffffff" },
           objects: [
             {
               id: "import-placeholder",
-              type: "text",
+              type: "text" as const,
               name: "Import placeholder",
               bounds: { x: 96, y: 96, width: 960, height: 96 },
               opacity: 1,
@@ -76,7 +41,52 @@ export async function parsePptxToIr(filePath: string): Promise<DeckIR> {
           ],
           timeline: { durationMs: 2500, events: [], dependencyGraph: { edges: [] } }
         }
-      ]
+      ];
+
+  const report: ConversionReport = {
+    source: { kind: "pptx", uri: filePath },
+    status: slidePaths.length ? "partial" : "failed",
+    generatedAt: new Date().toISOString(),
+    tool: "keymorph-pptx-parser-mvp",
+    messages: [
+      {
+        severity: slidePaths.length ? "info" : "warning",
+        code: slidePaths.length ? "pptx-static-import" : "pptx-import-placeholder",
+        message: slidePaths.length
+          ? "Extracted static slide text and shape placeholders from PresentationML."
+          : "The PPTX package was readable, but no slide parts were discovered."
+      }
+    ],
+    unsupportedFeatures: [
+      {
+        code: "presentationml-animation-extraction",
+        severity: "warning",
+        area: "animation",
+        description: "PowerPoint animation timing nodes are not yet mapped in the static parser.",
+        fallback: "Preserve static visual objects and record animation loss."
+      }
+    ],
+    degradedFeatures: [],
+    uncertainMappings: [],
+    statistics: {
+      slideCount: parsedSlides.length,
+      objectCount: parsedSlides.reduce((total, slide) => total + slide.objects.length, 0),
+      animationCount: 0,
+      unsupportedFeatureCount: 1
+    },
+    metadata: {
+      byteLength: data.byteLength
+    }
+  };
+
+  return {
+    irVersion: IR_VERSION,
+    metadata: { title: "Imported PPTX", sourceApplication: "PowerPoint" },
+    deck: {
+      id: "pptx-import",
+      title: "Imported PPTX",
+      size: { width: size.width, height: size.height, unit: "px" },
+      slides: parsedSlides
     },
     conversion: report
   };
@@ -110,6 +120,123 @@ function createPptxFiles(deck: DeckIR): Map<string, string | Uint8Array> {
   });
 
   return files;
+}
+
+function parseSlideXml(source: string, index: number): Slide {
+  const objects: IRObject[] = [];
+  const shapeSources = source.match(/<p:sp\b[\s\S]*?<\/p:sp>/g) ?? [];
+
+  shapeSources.forEach((shapeXml, objectIndex) => {
+    const id = `slide-${index + 1}-object-${objectIndex + 1}`;
+    const text = readShapeText(shapeXml);
+    const bounds = readShapeBounds(shapeXml, { x: 96 + objectIndex * 28, y: 96 + objectIndex * 28, width: 400, height: 100 });
+    if (text) {
+      objects.push({
+        id,
+        type: "text",
+        name: readShapeName(shapeXml) ?? "Text",
+        bounds,
+        opacity: 1,
+        text: {
+          plainText: text,
+          runs: [{ text, style: { fontFamily: "Arial", fontSize: 28, color: "#111827" } }]
+        }
+      });
+    } else if (!shapeXml.includes("<p:nvGrpSpPr")) {
+      objects.push({
+        id,
+        type: "shape",
+        name: readShapeName(shapeXml) ?? "Shape",
+        shape: readShapePreset(shapeXml),
+        bounds,
+        opacity: 1,
+        style: {
+          fill: { type: "solid", color: readShapeFill(shapeXml) ?? "#e2e8f0" },
+          stroke: { color: "#94a3b8", width: 1 }
+        }
+      });
+    }
+  });
+
+  return {
+    id: `slide-${index + 1}`,
+    index,
+    name: `Slide ${index + 1}`,
+    background: { type: "solid", color: readSlideBackground(source) ?? "#ffffff" },
+    objects,
+    timeline: {
+      durationMs: 2500,
+      events: [],
+      dependencyGraph: { edges: [] }
+    }
+  };
+}
+
+function readSlidePaths(entries: Map<string, Uint8Array>, presentationXml: string): string[] {
+  const rels = parseRelationships(getTextEntry(entries, "ppt/_rels/presentation.xml.rels") ?? "");
+  const slideRefs = Array.from(presentationXml.matchAll(/<p:sldId\b[^>]*r:id="([^"]+)"/g)).map((match) => match[1]);
+  return slideRefs
+    .map((relationshipId) => rels.get(relationshipId))
+    .filter((target): target is string => Boolean(target))
+    .map((target) => normalizePartPath(`ppt/${target}`));
+}
+
+function readSlideSize(presentationXml: string): { width: number; height: number } {
+  const match = presentationXml.match(/<p:sldSz\b[^>]*cx="(\d+)"[^>]*cy="(\d+)"/);
+  if (!match) return { width: 1280, height: 720 };
+  return {
+    width: Math.round((Number(match[1]) / EMU_PER_INCH) * 96),
+    height: Math.round((Number(match[2]) / EMU_PER_INCH) * 96)
+  };
+}
+
+function parseRelationships(source: string): Map<string, string> {
+  const relationships = new Map<string, string>();
+  for (const match of source.matchAll(/<Relationship\b[^>]*Id="([^"]+)"[^>]*Target="([^"]+)"/g)) {
+    relationships.set(match[1], match[2]);
+  }
+  return relationships;
+}
+
+function readShapeText(source: string): string {
+  return Array.from(source.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g))
+    .map((match) => unescapeXml(match[1]))
+    .join("");
+}
+
+function readShapeName(source: string): string | undefined {
+  const match = source.match(/<p:cNvPr\b[^>]*name="([^"]*)"/);
+  return match ? unescapeXml(match[1]) : undefined;
+}
+
+function readShapeBounds(source: string, fallback: { x: number; y: number; width: number; height: number }) {
+  const offset = source.match(/<a:off\b[^>]*x="(-?\d+)"[^>]*y="(-?\d+)"/);
+  const extent = source.match(/<a:ext\b[^>]*cx="(\d+)"[^>]*cy="(\d+)"/);
+  if (!offset || !extent) return fallback;
+  return {
+    x: emuToWidePx(Number(offset[1]), WIDE_LAYOUT.width),
+    y: emuToWidePx(Number(offset[2]), WIDE_LAYOUT.height),
+    width: emuToWidePx(Number(extent[1]), WIDE_LAYOUT.width),
+    height: emuToWidePx(Number(extent[2]), WIDE_LAYOUT.height)
+  };
+}
+
+function readShapePreset(source: string): "rect" | "roundRect" | "ellipse" | "triangle" {
+  const match = source.match(/<a:prstGeom\b[^>]*prst="([^"]+)"/);
+  if (match?.[1] === "ellipse") return "ellipse";
+  if (match?.[1] === "roundRect") return "roundRect";
+  if (match?.[1] === "triangle") return "triangle";
+  return "rect";
+}
+
+function readShapeFill(source: string): string | undefined {
+  const match = source.match(/<a:solidFill>[\s\S]*?<a:srgbClr\b[^>]*val="([0-9A-Fa-f]{6})"/);
+  return match ? `#${match[1]}` : undefined;
+}
+
+function readSlideBackground(source: string): string | undefined {
+  const match = source.match(/<p:bg>[\s\S]*?<a:srgbClr\b[^>]*val="([0-9A-Fa-f]{6})"/);
+  return match ? `#${match[1]}` : undefined;
 }
 
 function presentationXml(deck: DeckIR): string {
@@ -392,6 +519,11 @@ function pxToEmu(px: number, deckPixels: number, inches: number): number {
   return Math.round((px / deckPixels) * inches * EMU_PER_INCH);
 }
 
+function emuToWidePx(emu: number, inches: number): number {
+  const pixels = inches === WIDE_LAYOUT.width ? 1280 : 720;
+  return Math.round((emu / (inches * EMU_PER_INCH)) * pixels);
+}
+
 function fontSizeToOpenXml(px: number): number {
   return Math.round(px * 0.75 * 100);
 }
@@ -438,8 +570,77 @@ function escapeXml(value: unknown): string {
   });
 }
 
+function unescapeXml(value: string): string {
+  return value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
+}
+
 function textBytes(value: string): Uint8Array {
   return new TextEncoder().encode(value);
+}
+
+function getTextEntry(entries: Map<string, Uint8Array>, path: string): string | undefined {
+  const value = entries.get(normalizePartPath(path));
+  return value ? new TextDecoder().decode(value) : undefined;
+}
+
+function readZipEntries(data: Uint8Array): Map<string, Uint8Array> {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const entries = new Map<string, Uint8Array>();
+  let offset = 0;
+
+  while (offset + 30 <= data.length && view.getUint32(offset, true) === 0x04034b50) {
+    const flags = view.getUint16(offset + 6, true);
+    const compression = view.getUint16(offset + 8, true);
+    const compressedSize = view.getUint32(offset + 18, true);
+    const uncompressedSize = view.getUint32(offset + 22, true);
+    const nameLength = view.getUint16(offset + 26, true);
+    const extraLength = view.getUint16(offset + 28, true);
+    const nameStart = offset + 30;
+    const dataStart = nameStart + nameLength + extraLength;
+    const dataEnd = dataStart + compressedSize;
+    const name = new TextDecoder().decode(data.slice(nameStart, nameStart + nameLength));
+
+    if ((flags & 0x08) !== 0) {
+      throw new Error("PPTX ZIP entries using data descriptors are not supported by the MVP reader.");
+    }
+    if (dataEnd > data.length) {
+      throw new Error(`Invalid PPTX ZIP entry size for ${name}.`);
+    }
+
+    const compressed = data.slice(dataStart, dataEnd);
+    let content: Uint8Array;
+    if (compression === 0) {
+      content = compressed;
+    } else if (compression === 8) {
+      content = inflateRawSync(compressed);
+    } else {
+      throw new Error(`Unsupported ZIP compression method ${compression} for ${name}.`);
+    }
+
+    if (uncompressedSize !== 0 && content.length !== uncompressedSize) {
+      throw new Error(`Invalid uncompressed size for ${name}.`);
+    }
+
+    entries.set(normalizePartPath(name), content);
+    offset = dataEnd;
+  }
+
+  return entries;
+}
+
+function normalizePartPath(path: string): string {
+  const parts: string[] = [];
+  for (const part of path.replace(/^\/+/, "").split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") parts.pop();
+    else parts.push(part);
+  }
+  return parts.join("/");
 }
 
 function concat(chunks: Uint8Array[]): Uint8Array {
