@@ -188,6 +188,50 @@ describe("Keynote bridge", () => {
     assert.equal(deck.conversion?.metadata?.unrecoveredAssetCount, 1);
   });
 
+  test("uses a full-slide preview image instead of low-confidence raw native text", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-preview-fallback-"));
+    const keyPath = path.join(dir, "preview.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await mkdir(path.join(keyPath, "QuickLook"), { recursive: true });
+    await writeFile(path.join(keyPath, "QuickLook", "Preview.jpg"), jpegBytes(1280, 720));
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), new TextEncoder().encode("Low confidence raw caption"));
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.assets?.some((asset) => asset.name === "Preview.jpg" && asset.metadata?.nativePreviewAsset === true), true);
+    const object = deck.deck.slides[0]?.objects[0];
+    assert.equal(object?.type, "image");
+    assert.equal(object?.metadata?.nativeFallback, "full-slide-preview");
+    assert.deepEqual(object?.bounds, { x: 0, y: 0, width: 1280, height: 720 });
+    assert.equal(object?.type === "image" ? object.source.assetId : undefined, deck.deck.assets?.find((asset) => asset.name === "Preview.jpg")?.id);
+    assert.equal(deck.deck.slides[0]?.objects.some((slideObject) => slideObject.type === "text"), false);
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-preview-fallback-used"), true);
+    assert.equal(deck.conversion?.degradedFeatures?.some((feature) => feature.code === "keynote-native-preview-fallback"), true);
+    assert.equal(deck.conversion?.metadata?.recoveredTextObjectCount, 0);
+    assert.equal(deck.conversion?.metadata?.previewFallbackObjectCount, 1);
+    assert.equal(deck.conversion?.metadata?.previewAssetCount, 1);
+  });
+
+  test("uses package snapshot assets as visual-first native fallback", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-snapshot-assets-"));
+    const keyPath = path.join(dir, "snapshot.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "st-12345678-1234-1234-1234-123456789abc.png"), pngBytes(1280, 720));
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("Confident recovered title"));
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const snapshot = deck.deck.assets?.find((asset) => asset.name === "st-12345678-1234-1234-1234-123456789abc.png");
+    assert.equal(snapshot?.metadata?.nativePreviewAsset, true);
+    assert.equal(snapshot?.metadata?.nativePreviewRole, "snapshot");
+    assert.equal(deck.deck.slides[0]?.objects[0]?.type, "image");
+    assert.equal(deck.deck.slides[0]?.objects[0]?.metadata?.nativeFallback, "full-slide-preview");
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-preview-fallback-used"), true);
+    assert.equal(deck.conversion?.metadata?.previewAssetCount, 1);
+    assert.equal(deck.conversion?.metadata?.previewFallbackObjectCount, 1);
+  });
+
   test("extracts numeric geometry, grouping, image dimensions, QuickLook metadata, and animation uncertainty", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-geometry-"));
     const keyPath = path.join(dir, "geometry.key");
@@ -269,6 +313,24 @@ describe("Keynote bridge", () => {
     const text = deck.deck.slides[0]?.objects.filter((object) => object.type === "text").map((object) => object.text.plainText);
 
     assert.deepEqual(text, ["AI Agent 社会模拟游戏"]);
+  });
+
+  test("uses native snapshot images instead of low-confidence text fallback", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-snapshot-fallback-"));
+    const keyPath = path.join(dir, "snapshot.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "st-97F332C4-B975-4E29-AE94-C56E183A29CC-16103.png"), pngBytes(356, 200));
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("1B/ Transition"));
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects[0];
+    assert.equal(object?.type, "image");
+    assert.equal(object?.metadata?.nativeFallback, "full-slide-preview");
+    assert.equal(object?.type === "image" ? object.source.assetId : undefined, deck.deck.assets?.[0]?.id);
+    assert.match(deck.deck.assets?.[0]?.uri ?? "", /^data:image\/png;base64,/);
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-preview-fallback-used"), true);
   });
 
   test("parses a ZIP-backed .key package with loose Index IWA entries", async () => {

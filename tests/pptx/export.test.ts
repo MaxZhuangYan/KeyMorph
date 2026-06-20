@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -30,6 +31,25 @@ describe("PPTX export", () => {
     assert.equal(parsed.conversion?.status, "partial");
     assert.ok(parsed.deck.slides[0].objects.some((object) => object.type === "text"));
     assert.match(JSON.stringify(parsed), /KeyMorph/);
+  });
+
+  test("exports image objects as embedded PPTX media", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-image-test-"));
+    const out = path.join(dir, "image.pptx");
+    const deck = createImageDeck();
+
+    await exportIrToPptx(deck, out);
+    const entries = readZipEntries(await readFile(out));
+    const slideXml = new TextDecoder().decode(entries.get("ppt/slides/slide1.xml"));
+    const relsXml = new TextDecoder().decode(entries.get("ppt/slides/_rels/slide1.xml.rels"));
+
+    assert.ok(entries.has("ppt/media/image1.png"));
+    assert.match(slideXml, /<p:pic>/);
+    assert.match(slideXml, /<a:blip r:embed="rId2"/);
+    assert.match(relsXml, /Target="\.\.\/media\/image1\.png"/);
+
+    const parsed = await parsePptxToIr(out);
+    assert.equal(parsed.deck.slides[0].objects.some((object) => object.type === "image"), true);
   });
 
   test("strips XML-invalid control characters from exported text", async () => {
@@ -413,6 +433,50 @@ function createAnimatedDeck(): DeckIR {
   };
 }
 
+function createImageDeck(): DeckIR {
+  const imageDataUri = `data:image/png;base64,${Buffer.from(pngBytes(4, 3)).toString("base64")}`;
+  return {
+    irVersion: IR_VERSION,
+    metadata: { title: "Image PPTX fixture", sourceApplication: "KeyMorph tests" },
+    deck: {
+      id: "image-fixture",
+      title: "Image PPTX fixture",
+      size: { width: 1280, height: 720, unit: "px" },
+      assets: [
+        {
+          id: "asset-image",
+          kind: "image",
+          uri: imageDataUri,
+          mimeType: "image/png",
+          name: "fixture.png",
+          width: 4,
+          height: 3
+        }
+      ],
+      slides: [
+        {
+          id: "slide-1",
+          index: 0,
+          name: "Image",
+          background: { type: "solid", color: "#ffffff" },
+          objects: [
+            {
+              id: "picture",
+              type: "image",
+              name: "Picture",
+              bounds: { x: 100, y: 80, width: 640, height: 360 },
+              opacity: 1,
+              source: { assetId: "asset-image" }
+            }
+          ],
+          timeline: { durationMs: 1000, events: [], dependencyGraph: { edges: [] } }
+        }
+      ]
+    },
+    conversion: { status: "success", messages: [] }
+  };
+}
+
 function createSequencedDeck(): DeckIR {
   const deck = createAnimatedDeck();
   const slide = deck.deck.slides[0];
@@ -592,6 +656,19 @@ async function patchPptxXml(filePath: string, entryPath: string, patch: (source:
   if (!entry) throw new Error(`Missing PPTX entry ${entryPath}`);
   entries.set(entryPath, new TextEncoder().encode(patch(new TextDecoder().decode(entry))));
   await writeFile(filePath, createZip(entries));
+}
+
+function pngBytes(width = 1, height = 1): Uint8Array {
+  const bytes = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82
+  ]);
+  new DataView(bytes.buffer).setUint32(16, width, false);
+  new DataView(bytes.buffer).setUint32(20, height, false);
+  return bytes;
 }
 
 function readZipEntries(data: Uint8Array): Map<string, Uint8Array> {

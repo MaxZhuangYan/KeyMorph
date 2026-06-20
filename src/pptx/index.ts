@@ -1,4 +1,6 @@
+import { Buffer } from "node:buffer";
 import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
 import {
@@ -25,7 +27,7 @@ export async function parsePptxToIr(filePath: string): Promise<DeckIR> {
   const presentationXml = getTextEntry(entries, "ppt/presentation.xml");
   const slidePaths = presentationXml ? readSlidePaths(entries, presentationXml) : [];
   const size = presentationXml ? readSlideSize(presentationXml) : { width: 1280, height: 720 };
-  const slideResults = slidePaths.map((slidePath, index) => parseSlideXml(getTextEntry(entries, slidePath) ?? "", index, size));
+  const slideResults = slidePaths.map((slidePath, index) => parseSlideXml(getTextEntry(entries, slidePath) ?? "", index, size, entries, slidePath));
   const slides = slideResults.map((result) => result.slide);
   const parsedSlides = slides.length
     ? slides
@@ -110,8 +112,9 @@ export async function exportIrToPptx(deck: DeckIR, outputPath: string): Promise<
 function createPptxFiles(deck: DeckIR): Map<string, string | Uint8Array> {
   const files = new Map<string, string | Uint8Array>();
   const slideCount = deck.deck.slides.length;
+  const slideMedia = collectPptxMedia(deck);
 
-  files.set("[Content_Types].xml", contentTypes(slideCount));
+  files.set("[Content_Types].xml", contentTypes(slideCount, slideMedia.contentTypes));
   files.set("_rels/.rels", rootRels());
   files.set("docProps/core.xml", coreProps(deck));
   files.set("docProps/app.xml", appProps(slideCount));
@@ -125,9 +128,13 @@ function createPptxFiles(deck: DeckIR): Map<string, string | Uint8Array> {
 
   deck.deck.slides.forEach((slide, index) => {
     const slideNumber = index + 1;
-    files.set(`ppt/slides/slide${slideNumber}.xml`, slideXml(deck, slide));
-    files.set(`ppt/slides/_rels/slide${slideNumber}.xml.rels`, slideRels());
+    const media = slideMedia.bySlide.get(slide.id) ?? [];
+    files.set(`ppt/slides/slide${slideNumber}.xml`, slideXml(deck, slide, media));
+    files.set(`ppt/slides/_rels/slide${slideNumber}.xml.rels`, slideRels(media));
   });
+  for (const part of slideMedia.parts) {
+    files.set(part.partPath, part.data);
+  }
 
   return files;
 }
@@ -138,10 +145,33 @@ interface ParsedSlide {
   degradedFeatures: DegradedFeature[];
 }
 
-function parseSlideXml(source: string, index: number, slideSize: { width: number; height: number }): ParsedSlide {
+interface PptxMediaPart {
+  objectId: string;
+  relId: string;
+  partPath: string;
+  target: string;
+  data: Uint8Array;
+  extension: string;
+  contentType: string;
+}
+
+interface PptxMediaCollection {
+  bySlide: Map<string, PptxMediaPart[]>;
+  parts: PptxMediaPart[];
+  contentTypes: Map<string, string>;
+}
+
+function parseSlideXml(
+  source: string,
+  index: number,
+  slideSize: { width: number; height: number },
+  entries: Map<string, Uint8Array> = new Map(),
+  slidePath = `ppt/slides/slide${index + 1}.xml`
+): ParsedSlide {
   const objects: IRObject[] = [];
   const shapeIdToObjectId = new Map<string, string>();
   const shapeSources = source.match(/<p:sp\b[\s\S]*?<\/p:sp>/g) ?? [];
+  const rels = parseRelationships(getTextEntry(entries, relationshipsPathForPart(slidePath)) ?? "");
 
   shapeSources.forEach((shapeXml, objectIndex) => {
     const id = `slide-${index + 1}-object-${objectIndex + 1}`;
@@ -179,6 +209,30 @@ function parseSlideXml(source: string, index: number, slideSize: { width: number
     if (sourceShapeId && objects.some((object) => object.id === id)) {
       shapeIdToObjectId.set(sourceShapeId, id);
     }
+  });
+
+  const pictureSources = source.match(/<p:pic\b[\s\S]*?<\/p:pic>/g) ?? [];
+  pictureSources.forEach((pictureXml, pictureIndex) => {
+    const id = `slide-${index + 1}-picture-${pictureIndex + 1}`;
+    const relId = pictureXml.match(/<a:blip\b[^>]*r:embed="([^"]+)"/)?.[1];
+    const target = relId ? rels.get(relId) : undefined;
+    const imagePath = target ? normalizePartPath(pathJoinPart(path.posix.dirname(slidePath), target)) : undefined;
+    const imageData = imagePath ? entries.get(imagePath) : undefined;
+    const contentType = imagePath ? contentTypeFromPartPath(imagePath) : undefined;
+    const dataUriValue = imageData && contentType ? `data:${contentType};base64,${Buffer.from(imageData).toString("base64")}` : undefined;
+    objects.push({
+      id,
+      type: "image",
+      name: readShapeName(pictureXml) ?? "Picture",
+      bounds: readShapeBounds(pictureXml, { x: 96 + (shapeSources.length + pictureIndex) * 28, y: 96 + (shapeSources.length + pictureIndex) * 28, width: 400, height: 240 }),
+      opacity: 1,
+      source: {
+        ...(dataUriValue ? { dataUri: dataUriValue } : {}),
+        ...(!dataUriValue && imagePath ? { uri: `pptx://${imagePath}` } : {}),
+        metadata: imagePath ? { pptxImagePath: imagePath, mimeType: contentType ?? "" } : undefined
+      },
+      metadata: relId ? { pptxRelationshipId: relId, ...(imagePath ? { pptxImagePath: imagePath } : {}) } : undefined
+    });
   });
 
   const timing = parseSlideTiming(source, index, slideSize, shapeIdToObjectId);
@@ -229,6 +283,25 @@ function parseRelationships(source: string): Map<string, string> {
   return relationships;
 }
 
+function relationshipsPathForPart(partPath: string): string {
+  const normalized = normalizePartPath(partPath);
+  return normalizePartPath(`${path.posix.dirname(normalized)}/_rels/${path.posix.basename(normalized)}.rels`);
+}
+
+function pathJoinPart(basePath: string, target: string): string {
+  if (target.startsWith("/")) return normalizePartPath(target);
+  return normalizePartPath(`${basePath}/${target}`);
+}
+
+function contentTypeFromPartPath(partPath: string): string | undefined {
+  const extension = path.posix.extname(partPath).toLowerCase();
+  if (extension === ".png") return "image/png";
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  if (extension === ".gif") return "image/gif";
+  if (extension === ".webp") return "image/webp";
+  return undefined;
+}
+
 function readShapeText(source: string): string {
   return Array.from(source.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g))
     .map((match) => unescapeXml(match[1]))
@@ -273,6 +346,82 @@ function readShapeFill(source: string): string | undefined {
 function readSlideBackground(source: string): string | undefined {
   const match = source.match(/<p:bg>[\s\S]*?<a:srgbClr\b[^>]*val="([0-9A-Fa-f]{6})"/);
   return match ? `#${match[1]}` : undefined;
+}
+
+function collectPptxMedia(deck: DeckIR): PptxMediaCollection {
+  const bySlide = new Map<string, PptxMediaPart[]>();
+  const parts: PptxMediaPart[] = [];
+  const contentTypes = new Map<string, string>();
+  let nextMediaIndex = 1;
+
+  for (const slide of deck.deck.slides) {
+    const media: PptxMediaPart[] = [];
+    const objects = flattenObjects(slide.objects);
+    for (const object of objects) {
+      if (object.type !== "image") continue;
+      const source = resolveObjectSource(object.source, deck);
+      const decoded = decodeDataUri(source);
+      if (!decoded) continue;
+      const extension = imageExtensionForContentType(decoded.contentType);
+      if (!extension) continue;
+      const relId = `rId${media.length + 2}`;
+      const partPath = `ppt/media/image${nextMediaIndex}.${extension}`;
+      media.push({
+        objectId: object.id,
+        relId,
+        partPath,
+        target: `../media/image${nextMediaIndex}.${extension}`,
+        data: decoded.data,
+        extension,
+        contentType: decoded.contentType
+      });
+      contentTypes.set(extension, decoded.contentType);
+      parts.push(media[media.length - 1]!);
+      nextMediaIndex += 1;
+    }
+    if (media.length > 0) bySlide.set(slide.id, media);
+  }
+
+  return { bySlide, parts, contentTypes };
+}
+
+function flattenObjects(objects: IRObject[]): IRObject[] {
+  const flattened: IRObject[] = [];
+  const visit = (object: IRObject) => {
+    if (object.type === "group") {
+      for (const child of object.children) visit(child);
+      return;
+    }
+    flattened.push(object);
+  };
+  for (const object of objects) visit(object);
+  return flattened;
+}
+
+function resolveObjectSource(source: { assetId?: string; uri?: string; dataUri?: string } | undefined, deck: DeckIR): string | undefined {
+  if (!source) return undefined;
+  if (source.dataUri ?? source.uri) return source.dataUri ?? source.uri;
+  const asset = source.assetId ? deck.deck.assets?.find((candidate) => candidate.id === source.assetId) : undefined;
+  return asset?.uri;
+}
+
+function decodeDataUri(source: string | undefined): { contentType: string; data: Uint8Array } | undefined {
+  if (!source?.startsWith("data:")) return undefined;
+  const match = /^data:([^;,]+)(?:;charset=[^;,]+)?;base64,(.*)$/is.exec(source);
+  if (!match) return undefined;
+  try {
+    return { contentType: match[1].toLowerCase(), data: new Uint8Array(Buffer.from(match[2], "base64")) };
+  } catch {
+    return undefined;
+  }
+}
+
+function imageExtensionForContentType(contentType: string): string | undefined {
+  if (contentType === "image/png") return "png";
+  if (contentType === "image/jpeg" || contentType === "image/jpg") return "jpg";
+  if (contentType === "image/gif") return "gif";
+  if (contentType === "image/webp") return "webp";
+  return undefined;
 }
 
 interface TimingParseResult {
@@ -1583,10 +1732,11 @@ function presentationRels(slideCount: number): string {
 </Relationships>`);
 }
 
-function slideXml(deck: DeckIR, slide: Slide): string {
+function slideXml(deck: DeckIR, slide: Slide, media: PptxMediaPart[] = []): string {
   const bg = solidFill(slide.background) ?? "#ffffff";
   const shapeIds = assignShapeIds(slide.objects);
-  const shapes = slide.objects.map((object) => objectToShape(deck, object, shapeIds)).join("");
+  const mediaByObjectId = new Map(media.map((part) => [part.objectId, part]));
+  const shapes = slide.objects.map((object) => objectToShape(deck, object, shapeIds, mediaByObjectId)).join("");
   const timing = timingXml(deck, slide);
   return xml(`\
 <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
@@ -1958,9 +2108,9 @@ function assignShapeIds(objects: IRObject[]): Map<string, string> {
   return ids;
 }
 
-function objectToShape(deck: DeckIR, object: IRObject, shapeIds: Map<string, string>): string {
+function objectToShape(deck: DeckIR, object: IRObject, shapeIds: Map<string, string>, mediaByObjectId: Map<string, PptxMediaPart>): string {
   if (object.type === "group") {
-    return object.children.map((child) => objectToShape(deck, child, shapeIds)).join("");
+    return object.children.map((child) => objectToShape(deck, child, shapeIds, mediaByObjectId)).join("");
   }
 
   const id = Number(shapeIds.get(object.id) ?? 2);
@@ -1970,6 +2120,24 @@ function objectToShape(deck: DeckIR, object: IRObject, shapeIds: Map<string, str
   const cx = pxToEmu(bounds.width, deck.deck.size.width, WIDE_LAYOUT.width);
   const cy = pxToEmu(bounds.height, deck.deck.size.height, WIDE_LAYOUT.height);
   const name = escapeXml(object.name ?? object.id);
+
+  if (object.type === "image") {
+    const media = mediaByObjectId.get(object.id);
+    if (media) {
+      return `\
+<p:pic>
+  <p:nvPicPr><p:cNvPr id="${id}" name="${name}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>
+  <p:blipFill>
+    <a:blip r:embed="${media.relId}"/>
+    <a:stretch><a:fillRect/></a:stretch>
+  </p:blipFill>
+  <p:spPr>
+    <a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+  </p:spPr>
+</p:pic>`;
+    }
+  }
 
   if (object.type === "text") {
     const text = escapeXml(object.text.plainText ?? object.text.runs?.map((run) => run.text).join("") ?? "");
@@ -2004,14 +2172,18 @@ function objectToShape(deck: DeckIR, object: IRObject, shapeIds: Map<string, str
 </p:sp>`;
 }
 
-function contentTypes(slideCount: number): string {
+function contentTypes(slideCount: number, mediaContentTypes: Map<string, string> = new Map()): string {
   const slideOverrides = Array.from({ length: slideCount }, (_, index) => {
     return `<Override PartName="/ppt/slides/slide${index + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`;
   }).join("");
+  const mediaDefaults = Array.from(mediaContentTypes.entries())
+    .map(([extension, contentType]) => `<Default Extension="${escapeXml(extension)}" ContentType="${escapeXml(contentType)}"/>`)
+    .join("");
   return xml(`\
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
+  ${mediaDefaults}
   <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
   <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
   <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
@@ -2031,10 +2203,17 @@ function rootRels(): string {
 </Relationships>`);
 }
 
-function slideRels(): string {
+function slideRels(media: PptxMediaPart[] = []): string {
+  const mediaRels = media
+    .map(
+      (part) =>
+        `<Relationship Id="${part.relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${escapeXml(part.target)}"/>`
+    )
+    .join("");
   return xml(`\
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>
+  ${mediaRels}
 </Relationships>`);
 }
 

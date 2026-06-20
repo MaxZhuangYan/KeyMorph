@@ -8,6 +8,7 @@ import type {
   KeyframeAnimationEvent,
   KeyframeTrack,
   MorphProperty,
+  ObjectSource,
   MorphTransitionOptions,
   ObjectStateProperties,
   ShapeObject,
@@ -202,8 +203,8 @@ export function renderHtmlDocument(deck: DeckIR, options: HtmlRuntimeOptions = {
 </html>`;
 }
 
-export function renderSlideMarkup(slide: Slide): string {
-  return slide.objects.map((object) => renderObjectMarkup(object)).join("");
+export function renderSlideMarkup(slide: Slide, deck?: DeckIR): string {
+  return slide.objects.map((object) => renderObjectMarkup(object, deck)).join("");
 }
 
 export function getSlideDurationMs(slide: Slide | undefined): number {
@@ -546,11 +547,18 @@ function runtimeScript(): string {
     renderedKey: ""
   };
   const runtimeEvents = [];
+  const assetsById = new Map((deck.deck.assets || []).map((asset) => [asset.id, asset]));
 
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
   const isNumber = (value) => typeof value === "number" && Number.isFinite(value);
   const clone = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  const sourceUrl = (source) => {
+    if (!source) return "";
+    if (source.dataUri || source.uri) return source.dataUri || source.uri;
+    const asset = source.assetId ? assetsById.get(source.assetId) : undefined;
+    return asset?.uri || asset?.dataUri || "";
+  };
   const emitRuntimeEvent = (type, detail = {}) => {
     const entry = { type, detail: clone(detail), globalTimeMs: state.globalTimeMs, atMs: performance.now() };
     runtimeEvents.push(entry);
@@ -674,7 +682,7 @@ function runtimeScript(): string {
       return "linear-gradient(" + angle + "deg, " + stops + ")";
     }
     if (input.type === "image") {
-      const source = input.source?.dataUri || input.source?.uri || "";
+      const source = sourceUrl(input.source);
       return source ? "url('" + String(source).replace(/'/g, "%27") + "')" : undefined;
     }
     if (typeof input === "string") return input;
@@ -845,11 +853,11 @@ function runtimeScript(): string {
   const objectHtml = (object) => {
     const common = 'class="km-object km-' + esc(object.type) + '" data-object-id="' + esc(object.id) + '" style="' + boxStyle(object) + ';';
     if (object.type === "text") return '<div ' + common + textStyleCss(object) + '">' + esc(textOf(object)) + '</div>';
-    if (object.type === "image") return '<img ' + common + '" src="' + esc(object.source?.dataUri || object.source?.uri || "") + '" alt="' + esc(object.altText || object.name || "") + '">';
+    if (object.type === "image") return '<img ' + common + '" src="' + esc(sourceUrl(object.source)) + '" alt="' + esc(object.altText || object.name || "") + '">';
     if (object.type === "media") {
       const tag = object.mediaType === "audio" ? "audio" : "video";
-      const poster = tag === "video" && object.posterSource ? ' poster="' + esc(object.posterSource.dataUri || object.posterSource.uri || "") + '"' : "";
-      return '<' + tag + ' ' + common + '" src="' + esc(object.source?.dataUri || object.source?.uri || "") + '"' + poster + ' muted playsinline></' + tag + '>';
+      const poster = tag === "video" && object.posterSource ? ' poster="' + esc(sourceUrl(object.posterSource)) + '"' : "";
+      return '<' + tag + ' ' + common + '" src="' + esc(sourceUrl(object.source)) + '"' + poster + ' muted playsinline></' + tag + '>';
     }
     if (object.type === "group") return '<div ' + common + 'overflow:visible">' + (object.children || []).map(objectHtml).join("") + '</div>';
     if (object.type === "shape" && object.text) return '<div ' + common + textStyleCss(object) + '">' + esc(textOf(object)) + '</div>';
@@ -1831,7 +1839,7 @@ function runtimeScript(): string {
 })();`;
 }
 
-function renderObjectMarkup(object: IRObject): string {
+function renderObjectMarkup(object: IRObject, deck?: DeckIR): string {
   const style = objectStyle(object);
   const common = `class="km-object km-${object.type}" data-object-id="${escapeHtml(object.id)}" style="${style}"`;
 
@@ -1839,19 +1847,26 @@ function renderObjectMarkup(object: IRObject): string {
     return `<div ${common}>${escapeHtml(textContent(object))}</div>`;
   }
   if (object.type === "image") {
-    return `<img ${common} src="${escapeHtml(object.source.dataUri ?? object.source.uri ?? "")}" alt="${escapeHtml(object.altText ?? object.name ?? "")}">`;
+    return `<img ${common} src="${escapeHtml(resolveObjectSourceUrl(object.source, deck))}" alt="${escapeHtml(object.altText ?? object.name ?? "")}">`;
   }
   if (object.type === "media") {
     const tag = object.mediaType === "audio" ? "audio" : "video";
-    return `<${tag} ${common} src="${escapeHtml(object.source.dataUri ?? object.source.uri ?? "")}" muted playsinline></${tag}>`;
+    return `<${tag} ${common} src="${escapeHtml(resolveObjectSourceUrl(object.source, deck))}" muted playsinline></${tag}>`;
   }
   if (object.type === "group") {
-    return `<div ${common}>${object.children.map(renderObjectMarkup).join("")}</div>`;
+    return `<div ${common}>${object.children.map((child) => renderObjectMarkup(child, deck)).join("")}</div>`;
   }
   if (object.type === "shape" && object.text) {
     return `<div ${common}>${escapeHtml(textContent(object as ShapeObject & TextObject))}</div>`;
   }
   return `<div ${common}></div>`;
+}
+
+function resolveObjectSourceUrl(source: ObjectSource | undefined, deck: DeckIR | undefined): string {
+  if (!source) return "";
+  if (source.dataUri ?? source.uri) return source.dataUri ?? source.uri ?? "";
+  const asset = source.assetId ? deck?.deck.assets?.find((candidate) => candidate.id === source.assetId) : undefined;
+  return asset?.uri ?? "";
 }
 
 function objectStyle(object: IRObject): string {

@@ -19,6 +19,8 @@ const MAX_NESTED_PROTOBUF_BYTES = 256 * 1024;
 const MAX_FIELD_SUMMARIES_PER_STREAM = 48;
 const MAX_SNAPPY_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MAX_VISUAL_NUMERIC_VALUE = 100000;
+const MAX_EMBEDDED_ASSET_BYTES = 2 * 1024 * 1024;
+const LOW_CONFIDENCE_TEXT_FALLBACK_THRESHOLD = 0.45;
 
 export interface NativeKeynoteDetection {
   isNative: boolean;
@@ -175,9 +177,12 @@ interface NativeAssetReference {
 
 interface NativeAssetCatalog {
   assets: Asset[];
+  previewAssets: Asset[];
+  allAssets: Asset[];
   byPath: Map<string, NativeAssetReference>;
   byName: Map<string, NativeAssetReference[]>;
   byStem: Map<string, NativeAssetReference[]>;
+  previewReferences: NativePreviewAssetReference[];
 }
 
 interface NativeAssetMatch {
@@ -186,6 +191,11 @@ interface NativeAssetMatch {
   confidence: number;
   fieldPath?: string;
   source: "protobuf" | "raw";
+}
+
+interface NativePreviewAssetReference extends NativeAssetReference {
+  previewSource: "quicklook" | "package-asset";
+  previewRole: NativeQuickLookPreviewMetadata["role"] | "snapshot";
 }
 
 interface ExpandedIwaPayload {
@@ -243,7 +253,7 @@ interface IwaScanResult {
 export async function detectNativeKeynotePackage(keynotePath: string): Promise<NativeKeynoteDetection> {
   const keynotePackage = await readKeynotePackage(keynotePath);
   const parts = readNativeKeynoteParts(keynotePackage.entries);
-  const assets = createNativeAssetCatalog(parts.assetPaths, parts.entries);
+  const assets = createNativeAssetCatalog(parts.assetPaths, parts.entries, parts.quickLookPreviews);
   return {
     isNative: parts.hasIndexZip || parts.iwaEntries.length > 0,
     container: keynotePackage.container,
@@ -272,7 +282,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
 
   const metadata = readNativeMetadata(keynotePackage.entries);
   const deckSize = metadata.size ?? DEFAULT_DECK_SIZE;
-  const assets = createNativeAssetCatalog(parts.assetPaths, parts.entries);
+  const assets = createNativeAssetCatalog(parts.assetPaths, parts.entries, parts.quickLookPreviews);
   const iwaStreams = classifyIwaStreams(parts.iwaEntries, assets);
   const slideEntries = chooseSlideIwaEntries(parts.iwaEntries);
   const slides = buildNativeSlides(slideEntries, parts.iwaEntries, deckSize, assets);
@@ -282,7 +292,17 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
     0
   );
   const recoveredAssetObjectCount = slides.reduce(
-    (total, slide) => total + slide.objects.filter((object) => object.type === "image" || object.type === "media").length,
+    (total, slide) =>
+      total +
+      slide.objects.filter(
+        (object) =>
+          (object.type === "image" || object.type === "media") &&
+          object.metadata?.nativeFallback !== "full-slide-preview"
+      ).length,
+    0
+  );
+  const previewFallbackObjectCount = slides.reduce(
+    (total, slide) => total + slide.objects.filter((object) => object.metadata?.nativeFallback === "full-slide-preview").length,
     0
   );
   const unrecoveredAssetCount = Math.max(0, assets.assets.length - countUniqueReferencedAssets(slides));
@@ -301,6 +321,8 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
   const quickLookPreviewWithDimensionsCount = parts.quickLookPreviews.filter((preview) => preview.width !== undefined && preview.height !== undefined).length;
   const imageAssetCount = assets.assets.filter((asset) => asset.kind === "image").length;
   const imageAssetWithDimensionsCount = assets.assets.filter((asset) => asset.kind === "image" && asset.width !== undefined && asset.height !== undefined).length;
+  const previewAssetCount = assets.previewReferences.length;
+  const previewImageAssetCount = assets.previewReferences.filter((asset) => asset.kind === "image").length;
   const lossReportMetadata = {
     schema: "keymorph.keynote.native.loss.v1",
     nativeContainer: keynotePackage.container,
@@ -325,7 +347,10 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       quickLookPreviewCount,
       quickLookPreviewWithDimensionsCount,
       imageAssetCount,
-      imageAssetWithDimensionsCount
+      imageAssetWithDimensionsCount,
+      previewAssetCount,
+      previewImageAssetCount,
+      previewFallbackObjectCount
     },
     recommendedFallback: "Use the Keynote PPTX bridge with explicit automation opt-in for visual layout and animation downgrade."
   };
@@ -391,6 +416,18 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
             description:
               "Some package asset references were matched from slide IWA string payloads and inserted as approximate image/media objects.",
             fallback: "Inspect the source Keynote deck or bridge through PPTX for exact placement."
+          }
+        ]
+      : []),
+    ...(previewFallbackObjectCount > 0
+      ? [
+          {
+            code: "keynote-native-preview-fallback",
+            severity: "warning" as const,
+            area: "layout" as const,
+            description:
+              "Low-confidence native text recovery was suppressed in favor of a full-slide preview or snapshot image from the Keynote package.",
+            fallback: "Preserve the preview image as the slide visual and expose the source asset for downstream inspection."
           }
         ]
       : [])
@@ -460,6 +497,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       : [])
   ];
   const deckTitle = metadata.title ?? (path.basename(keynotePath, path.extname(keynotePath)) || "Imported Keynote");
+  const deckAssets = assets.allAssets;
 
   return {
     irVersion: IR_VERSION,
@@ -478,6 +516,8 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         nativeAssetCount: assets.assets.length,
         nativeImageAssetCount: imageAssetCount,
         nativeImageAssetWithDimensionsCount: imageAssetWithDimensionsCount,
+        nativePreviewAssetCount: previewAssetCount,
+        nativePreviewImageAssetCount: previewImageAssetCount,
         nativeQuickLookPreviews: parts.quickLookPreviews,
         nativeMetadataPaths: metadata.paths,
         ...(metadata.documentIdentifier ? { nativeDocumentIdentifier: metadata.documentIdentifier } : {})
@@ -487,7 +527,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       id: "keynote-native-import",
       title: deckTitle,
       size: { width: deckSize.width, height: deckSize.height, unit: "px" },
-      ...(assets.assets.length > 0 ? { assets: assets.assets } : {}),
+      ...(deckAssets.length > 0 ? { assets: deckAssets } : {}),
       slides
     },
     conversion: {
@@ -532,6 +572,21 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
             : "No package image or media assets were detected under Data/."
         },
         {
+          severity: previewAssetCount > 0 ? "info" : "info",
+          code:
+            previewAssetCount > 0
+              ? previewFallbackObjectCount > 0
+                ? "keynote-native-preview-fallback-used"
+                : "keynote-native-preview-assets-exposed"
+              : "keynote-native-no-preview-assets",
+          message:
+            previewAssetCount > 0
+              ? previewFallbackObjectCount > 0
+                ? `Exposed ${previewAssetCount} preview/snapshot asset(s) and used ${previewFallbackObjectCount} as full-slide fallback object(s).`
+                : `Exposed ${previewAssetCount} preview/snapshot asset(s) for downstream inspection.`
+              : "No QuickLook preview or snapshot image assets were detected."
+        },
+        {
           severity: totalGeometryCandidateCount > 0 ? "info" : "warning",
           code: totalGeometryCandidateCount > 0 ? "keynote-native-geometry-candidates-detected" : "keynote-native-geometry-candidates-not-detected",
           message:
@@ -555,7 +610,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         slideCount: slides.length,
         objectCount,
         animationCount: 0,
-        assetCount: assets.assets.length,
+        assetCount: deckAssets.length,
         unsupportedFeatureCount: unsupportedFeatures.length,
         degradedFeatureCount: degradedFeatures.length,
         uncertainMappingCount: uncertainMappings.length
@@ -585,9 +640,12 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         totalMorphHintCount,
         recoveredTextObjectCount,
         recoveredAssetObjectCount,
+        previewFallbackObjectCount,
         unrecoveredAssetCount,
         imageAssetCount,
         imageAssetWithDimensionsCount,
+        previewAssetCount,
+        previewImageAssetCount,
         quickLookPreviewWithDimensionsCount,
         lossReport: lossReportMetadata,
         iwaStreams: iwaStreams.map((stream) => ({
@@ -687,7 +745,7 @@ function readNativeKeynoteParts(entries: Map<string, Uint8Array>): NativeKeynote
   }
 
   const allPaths = Array.from(combinedEntries.keys()).sort(comparePartPaths);
-  const quickLookPaths = allPaths.filter((entryPath) => /^QuickLook\//i.test(entryPath));
+  const quickLookPaths = allPaths.filter((entryPath) => isPreviewPath(entryPath));
   const quickLookPreviews = quickLookPaths.map((entryPath) =>
     createQuickLookPreviewMetadata(entryPath, combinedEntries.get(entryPath) ?? new Uint8Array())
   );
@@ -708,6 +766,10 @@ function readNativeKeynoteParts(entries: Map<string, Uint8Array>): NativeKeynote
   };
 }
 
+function isPreviewPath(entryPath: string): boolean {
+  return /^QuickLook\//i.test(entryPath) || /^preview(?:[-_][a-z0-9]+)?\.(?:jpe?g|png|gif|webp)$/i.test(entryPath);
+}
+
 function classifyPackageFormat(container: KeynotePackage["container"], parts: NativeKeynoteParts): NativeKeynotePackageFormat {
   const prefix = container === "directory" ? "directory" : "zip";
   if (parts.hasIndexZip && parts.hasLooseIndexDirectory) {
@@ -722,11 +784,17 @@ function classifyPackageFormat(container: KeynotePackage["container"], parts: Na
   return "unknown";
 }
 
-function createNativeAssetCatalog(assetPaths: string[], entries: Map<string, Uint8Array>): NativeAssetCatalog {
+function createNativeAssetCatalog(
+  assetPaths: string[],
+  entries: Map<string, Uint8Array>,
+  quickLookPreviews: NativeQuickLookPreviewMetadata[]
+): NativeAssetCatalog {
   const assets: Asset[] = [];
+  const previewAssets: Asset[] = [];
   const byPath = new Map<string, NativeAssetReference>();
   const byName = new Map<string, NativeAssetReference[]>();
   const byStem = new Map<string, NativeAssetReference[]>();
+  const previewReferences: NativePreviewAssetReference[] = [];
 
   for (const assetPath of assetPaths) {
     const data = entries.get(assetPath);
@@ -738,9 +806,11 @@ function createNativeAssetCatalog(assetPaths: string[], entries: Map<string, Uin
     const classification = classifyAssetPath(assetPath);
     const imageDimensions = classification.kind === "image" ? readImageDimensions(data, classification.mimeType) : undefined;
     const assetId = stableAssetId(assetPath);
+    const embedded = shouldEmbedNativeAsset(data, classification.mimeType);
     const asset: Asset = {
       id: assetId,
       kind: classification.kind,
+      uri: embedded ? dataUri(classification.mimeType, data) : undefined,
       name,
       mimeType: classification.mimeType,
       ...(imageDimensions ? { width: imageDimensions.width, height: imageDimensions.height } : {}),
@@ -748,6 +818,14 @@ function createNativeAssetCatalog(assetPaths: string[], entries: Map<string, Uin
       metadata: {
         nativeSourcePath: assetPath,
         byteLength: data.byteLength,
+        nativeDataEmbedded: embedded,
+        ...(isSnapshotAssetPath(assetPath)
+          ? {
+              nativePreviewAsset: true,
+              nativePreviewRole: "snapshot",
+              nativePreviewSource: "package-asset"
+            }
+          : {}),
         ...(imageDimensions
           ? {
               nativeImageWidth: imageDimensions.width,
@@ -771,10 +849,100 @@ function createNativeAssetCatalog(assetPaths: string[], entries: Map<string, Uin
     byPath.set(assetPath.toLowerCase(), reference);
     addMultiMapValue(byName, name.toLowerCase(), reference);
     addMultiMapValue(byStem, normalizeAssetStem(path.posix.basename(name, path.posix.extname(name))), reference);
+    if (isSnapshotAssetPath(assetPath) && asset.kind === "image") {
+      previewReferences.push({
+        ...reference,
+        previewSource: "package-asset",
+        previewRole: "snapshot"
+      });
+    }
+  }
+
+  for (const preview of quickLookPreviews) {
+    const data = entries.get(preview.path);
+    const classification = classifyAssetPath(preview.path);
+    if (!data || classification.kind !== "image") {
+      continue;
+    }
+
+    const imageDimensions = readImageDimensions(data, classification.mimeType);
+    const assetId = stableAssetId(preview.path);
+    const name = path.posix.basename(preview.path);
+    const asset: Asset = {
+      id: assetId,
+      kind: "image",
+      uri: dataUri(classification.mimeType, data),
+      name,
+      mimeType: classification.mimeType,
+      ...(imageDimensions ? { width: imageDimensions.width, height: imageDimensions.height } : {}),
+      checksum: `sha256:${sha256Hex(data)}`,
+      metadata: {
+        nativeSourcePath: preview.path,
+        byteLength: data.byteLength,
+        nativePreviewAsset: true,
+        nativeDataEmbedded: true,
+        nativePreviewRole: preview.role,
+        nativePreviewSource: "quicklook",
+        ...(imageDimensions
+          ? {
+              nativeImageWidth: imageDimensions.width,
+              nativeImageHeight: imageDimensions.height,
+              nativeImageDimensionSource: imageDimensions.source
+            }
+          : {})
+      }
+    };
+    const reference: NativePreviewAssetReference = {
+      assetId,
+      path: preview.path,
+      name,
+      kind: "image",
+      mimeType: asset.mimeType,
+      width: asset.width,
+      height: asset.height,
+      previewSource: "quicklook",
+      previewRole: preview.role
+    };
+
+    previewAssets.push(asset);
+    previewReferences.push(reference);
   }
 
   assets.sort((left, right) => comparePartPaths(String(left.metadata?.nativeSourcePath ?? left.name ?? left.id), String(right.metadata?.nativeSourcePath ?? right.name ?? right.id)));
-  return { assets, byPath, byName, byStem };
+  previewAssets.sort((left, right) => comparePartPaths(String(left.metadata?.nativeSourcePath ?? left.name ?? left.id), String(right.metadata?.nativeSourcePath ?? right.name ?? right.id)));
+  previewReferences.sort(comparePreviewAssetReferences);
+  return { assets, previewAssets, allAssets: [...assets, ...previewAssets], byPath, byName, byStem, previewReferences };
+}
+
+function shouldEmbedNativeAsset(data: Uint8Array, mimeType: string | undefined): boolean {
+  return Boolean(mimeType?.startsWith("image/")) && mimeType !== "image/tiff" && data.byteLength <= MAX_EMBEDDED_ASSET_BYTES;
+}
+
+function dataUri(mimeType: string | undefined, data: Uint8Array): string {
+  return `data:${mimeType ?? "application/octet-stream"};base64,${Buffer.from(data).toString("base64")}`;
+}
+
+function isSnapshotAssetPath(assetPath: string): boolean {
+  const name = path.posix.basename(assetPath).toLowerCase();
+  return /^st-[a-f0-9-]+\.(?:png|jpe?g|webp)$/i.test(name) || /^preview(?:[-_][a-z0-9]+)?\.(?:png|jpe?g|webp)$/i.test(name);
+}
+
+function comparePreviewAssetReferences(left: NativePreviewAssetReference, right: NativePreviewAssetReference): number {
+  const role = previewRoleRank(right.previewRole) - previewRoleRank(left.previewRole);
+  if (role !== 0) return role;
+  if (left.previewRole === "snapshot" && right.previewRole === "snapshot") {
+    return comparePartPaths(left.path, right.path);
+  }
+  const pixels = (right.width ?? 0) * (right.height ?? 0) - (left.width ?? 0) * (left.height ?? 0);
+  if (pixels !== 0) return pixels;
+  return comparePartPaths(left.path, right.path);
+}
+
+function previewRoleRank(role: NativePreviewAssetReference["previewRole"]): number {
+  if (role === "snapshot") return 3;
+  if (role === "preview") return 2;
+  if (role === "thumbnail") return 1;
+  return 0;
 }
 
 function classifyIwaStreams(
@@ -883,6 +1051,10 @@ function buildNativeSlides(
     const scan = scanIwaEntry(entry.data);
     const textCandidates = scan.textCandidates.slice(0, MAX_TEXT_OBJECTS_PER_SLIDE);
     const assetMatches = findIwaAssetMatchesFromScan(scan, assets);
+    const previewFallback = selectPreviewFallbackAsset(assets.previewReferences, index, entries.length);
+    const usePreviewFallback = previewFallback
+      ? shouldUsePreviewFallback(textCandidates, assetMatches, previewFallback)
+      : false;
     const textObjects = textCandidates.map((candidate, objectIndex) =>
       createTextObject(slideId, candidate, objectIndex, entry.path, deckSize, scan.geometryCandidates[objectIndex])
     );
@@ -890,7 +1062,9 @@ function buildNativeSlides(
       createAssetObject(slideId, match, textObjects.length + assetIndex, entry.path, deckSize, scan.geometryCandidates[textObjects.length + assetIndex])
     );
     const objects =
-      textObjects.length > 0 || assetObjects.length > 0
+      usePreviewFallback && previewFallback
+        ? [createPreviewImageObject(slideId, previewFallback, entry.path, deckSize, textCandidates)]
+        : textObjects.length > 0 || assetObjects.length > 0
         ? [...textObjects, ...assetObjects]
         : [createPlaceholderObject(slideId, entry.path, deckSize)];
 
@@ -912,6 +1086,13 @@ function buildNativeSlides(
         nativeMagicMoveHintCount: scan.animationHints.filter((hint) => hint.kind === "magicMove").length,
         nativeMorphHintCount: scan.animationHints.filter((hint) => hint.kind === "morph").length,
         nativeAssetReferenceCount: assetMatches.length,
+        ...(previewFallback
+          ? {
+              nativePreviewFallbackAvailable: true,
+              nativePreviewFallbackPath: previewFallback.path,
+              nativePreviewFallbackUsed: usePreviewFallback
+            }
+          : {}),
         nativeProtobufFieldCount: scan.protobufFieldCount,
         nativeNestedMessageCount: scan.nestedMessageCount,
         nativeNumericCandidates: scan.numericCandidates.slice(0, 24).map(stripNumericCandidateInternalFields),
@@ -1039,6 +1220,104 @@ function createPlaceholderObject(
       reason: "No decodable slide text was found in this IWA stream."
     }
   };
+}
+
+function createPreviewImageObject(
+  slideId: string,
+  preview: NativePreviewAssetReference,
+  sourcePath: string,
+  deckSize: { width: number; height: number },
+  suppressedTextCandidates: IwaTextCandidate[]
+): IRObject {
+  return {
+    id: `${slideId}-preview-fallback`,
+    type: "image",
+    name: preview.name,
+    bounds: {
+      x: 0,
+      y: 0,
+      width: deckSize.width,
+      height: deckSize.height
+    },
+    opacity: 1,
+    source: {
+      assetId: preview.assetId,
+      metadata: {
+        nativeAssetPath: preview.path,
+        mimeType: preview.mimeType,
+        ...(preview.width !== undefined && preview.height !== undefined
+          ? {
+              width: preview.width,
+              height: preview.height
+            }
+          : {})
+      }
+    },
+    metadata: {
+      nativeSourcePath: sourcePath,
+      nativeAssetPath: preview.path,
+      nativeFallback: "full-slide-preview",
+      nativePreviewSource: preview.previewSource,
+      nativePreviewRole: preview.previewRole,
+      nativeSuppressedTextCandidateCount: suppressedTextCandidates.length,
+      nativeSuppressedTextCandidates: suppressedTextCandidates.slice(0, 8).map((candidate) => ({
+        text: candidate.text,
+        confidence: candidate.confidence,
+        source: candidate.source,
+        ...(candidate.fieldPath ? { fieldPath: candidate.fieldPath } : {})
+      }))
+    }
+  };
+}
+
+function shouldUsePreviewFallback(
+  textCandidates: IwaTextCandidate[],
+  assetMatches: NativeAssetMatch[],
+  preview: NativePreviewAssetReference
+): boolean {
+  if (preview.kind !== "image") {
+    return false;
+  }
+  if (assetMatches.length > 0) {
+    return false;
+  }
+  if (preview.previewRole === "snapshot") {
+    return true;
+  }
+  if (textCandidates.length === 0) {
+    return true;
+  }
+  return textCandidates.every((candidate) => candidate.confidence <= LOW_CONFIDENCE_TEXT_FALLBACK_THRESHOLD);
+}
+
+function selectPreviewFallbackAsset(
+  previews: NativePreviewAssetReference[],
+  slideIndex: number,
+  slideCount: number
+): NativePreviewAssetReference | undefined {
+  if (previews.length === 0) {
+    return undefined;
+  }
+
+  const slideNumber = slideIndex + 1;
+  const numbered = previews.find((preview) => pathLooksLikeSlidePreview(preview.path, slideNumber));
+  if (numbered) {
+    return numbered;
+  }
+  if (slideCount === 1) {
+    return previews.find((preview) => preview.previewRole === "preview") ?? previews[0];
+  }
+  const snapshots = previews.filter((preview) => preview.previewRole === "snapshot");
+  if (slideIndex < snapshots.length) {
+    return snapshots[slideIndex];
+  }
+  return undefined;
+}
+
+function pathLooksLikeSlidePreview(entryPath: string, slideNumber: number): boolean {
+  const baseName = path.posix.basename(entryPath, path.posix.extname(entryPath)).toLowerCase();
+  const escaped = String(slideNumber).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[-_\\s])(?:slide|page|preview|snapshot|st)?[-_\\s]*0*${escaped}(?:$|[-_\\s])`, "i").test(baseName);
 }
 
 function createAssetObject(
@@ -2515,9 +2794,11 @@ function cleanHumanTextResidue(value: string): string {
   let text = value.trim();
   text = text.replace(/[\s$*\\]+$/g, "").trim();
   if (/[\p{Script=Han}]/u.test(text)) {
-    text = text.replace(/\s*["'“”‘’][A-Za-z0-9]{1,4}$/u, "").trim();
+    text = text.replace(/\s+["'“”‘’][A-Za-z0-9+&()]{1,4}$/u, "").trim();
+    text = text.replace(/[$*\\]+[A-Za-z0-9+&()]{1,4}$/u, "").trim();
     text = text.replace(/[\s$*\\]+$/g, "").trim();
   }
+  text = cleanDuplicatedAsciiTail(text);
   return text;
 }
 
@@ -2544,6 +2825,9 @@ function looksLikePresentationText(text: string): boolean {
   if (/^(path|transition|build|animation|effect)$/i.test(text) && text.length < 14) {
     return false;
   }
+  if (/^(?:[A-Za-z0-9]{1,3}[\\/\s-]+)?transition$/i.test(text)) {
+    return false;
+  }
   if (/^(xbo\s+transition|image\s+\d+\p{L}?|picture\s+\d+\p{L}?|图片\s*\d+\p{L}?|圖像\s*\d+\p{L}?|影像\s*\d+\p{L}?)$/iu.test(text)) {
     return false;
   }
@@ -2566,6 +2850,9 @@ function looksLikePresentationText(text: string): boolean {
     return false;
   }
   if (text.length <= 10 && hasMixedLowSignalScripts(text)) {
+    return false;
+  }
+  if (hasSuspiciousShortAsciiTail(text)) {
     return false;
   }
   if (!hasHumanTextSignal(text)) {
@@ -2592,6 +2879,9 @@ function isLikelyNativeNoiseText(text: string): boolean {
     return true;
   }
   if (/[\p{Script=Han}]/u.test(text) && /[A-Za-z0-9][*\\]$/.test(text)) {
+    return true;
+  }
+  if (/[\p{Script=Han}]/u.test(text) && /["'“”‘’]?[A-Za-z0-9+&()]{1,4}$/.test(text)) {
     return true;
   }
   return false;
@@ -2633,6 +2923,27 @@ function hasMixedLowSignalScripts(text: string): boolean {
   const hasDigit = /\d/.test(text);
   const hasHan = /[\p{Script=Han}]/u.test(text);
   return !hasHan && hasCyrillic && (hasLatin || hasDigit);
+}
+
+function cleanDuplicatedAsciiTail(text: string): string {
+  const match = text.match(/^([A-Za-z][A-Za-z0-9]*(?: [A-Za-z][A-Za-z0-9]*){1,5})([A-Za-z]{2,3})$/);
+  if (!match) return text;
+  const base = match[1] ?? text;
+  const tail = match[2] ?? "";
+  const lastWord = base.split(/\s+/).at(-1) ?? "";
+  return lastWord.toLowerCase().startsWith(tail.toLowerCase()) ? base : text;
+}
+
+function hasSuspiciousShortAsciiTail(text: string): boolean {
+  if (!/\s/.test(text)) return false;
+  if (!/^[A-Za-z0-9 ?!.,:;'"/&()+_-]+$/.test(text)) return false;
+  const words = text.trim().split(/\s+/);
+  const last = words.at(-1) ?? "";
+  const previous = words.at(-2) ?? "";
+  if (/^[A-Za-z]{1,3}$/.test(last) && previous.length >= 4 && previous.toLowerCase().startsWith(last.toLowerCase())) {
+    return true;
+  }
+  return false;
 }
 
 function hasHumanTextSignal(text: string): boolean {
