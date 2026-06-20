@@ -272,6 +272,7 @@ interface NativeAssetReference {
   width?: number;
   height?: number;
   dataId?: string;
+  embedded?: boolean;
 }
 
 interface NativeAssetCatalog {
@@ -293,6 +294,7 @@ interface NativeAssetMatch {
   source: "protobuf" | "raw" | "archive";
   geometryCandidate?: NativeIwaGeometryCandidate;
   archiveMessage?: NativeIwaArchiveMessageEvidence;
+  suppressedAssets?: NativeAssetReference[];
 }
 
 interface NativeSlideOrderEvidence {
@@ -1087,6 +1089,7 @@ function createNativeAssetCatalog(
       mimeType: asset.mimeType,
       width: asset.width,
       height: asset.height,
+      embedded,
       ...(dataId ? { dataId } : {})
     };
 
@@ -1934,6 +1937,17 @@ function createAssetObject(
     nativeAssetEvidence: match.evidence,
     nativeAssetMatchConfidence: match.confidence,
     nativeAssetFieldPath: match.fieldPath,
+    ...(match.suppressedAssets && match.suppressedAssets.length > 0
+      ? {
+          nativeSuppressedAssetVariantCount: match.suppressedAssets.length,
+          nativeSuppressedAssetVariants: match.suppressedAssets.map((asset) => ({
+            path: asset.path,
+            mimeType: asset.mimeType,
+            ...(asset.width !== undefined && asset.height !== undefined ? { width: asset.width, height: asset.height } : {}),
+            embedded: asset.embedded === true
+          }))
+        }
+      : {}),
     ...(match.archiveMessage
       ? {
           nativeArchiveMessageType: match.archiveMessage.type,
@@ -2801,7 +2815,82 @@ function findIwaAssetMatchesFromScan(scan: IwaScanResult, assets: NativeAssetCat
     }
   }
 
-  return Array.from(matches.values()).sort((left, right) => comparePartPaths(left.asset.path, right.asset.path));
+  return coalesceNativeAssetVariantMatches(Array.from(matches.values())).sort((left, right) => comparePartPaths(left.asset.path, right.asset.path));
+}
+
+function coalesceNativeAssetVariantMatches(matches: NativeAssetMatch[]): NativeAssetMatch[] {
+  const grouped = new Map<string, NativeAssetMatch[]>();
+  const passthrough: NativeAssetMatch[] = [];
+  for (const match of matches) {
+    const key = nativeAssetVariantGroupKey(match);
+    if (!key) {
+      passthrough.push(match);
+      continue;
+    }
+    const list = grouped.get(key) ?? [];
+    list.push(match);
+    grouped.set(key, list);
+  }
+
+  const coalesced: NativeAssetMatch[] = [];
+  for (const list of grouped.values()) {
+    if (list.length <= 1) {
+      coalesced.push(...list);
+      continue;
+    }
+    const sorted = [...list].sort(compareNativeAssetVariantMatches);
+    const best = sorted[0]!;
+    coalesced.push({
+      ...best,
+      suppressedAssets: sorted.slice(1).map((match) => match.asset)
+    });
+  }
+  return [...passthrough, ...coalesced];
+}
+
+function nativeAssetVariantGroupKey(match: NativeAssetMatch): string | undefined {
+  const message = match.archiveMessage;
+  if (!message?.archiveIdentifier || !isTypedVisualGeometryMessage(message.type)) {
+    return undefined;
+  }
+  return [
+    "archive",
+    message.archiveIdentifier,
+    message.type ?? "unknown",
+    message.messageIndex,
+    message.payloadOffset,
+    match.geometryCandidate?.fieldPaths.join(",") ?? ""
+  ].join(":");
+}
+
+function compareNativeAssetVariantMatches(left: NativeAssetMatch, right: NativeAssetMatch): number {
+  const displayable = nativeAssetDisplayRank(right.asset) - nativeAssetDisplayRank(left.asset);
+  if (displayable !== 0) return displayable;
+  const pixels = nativeAssetPixelArea(right.asset) - nativeAssetPixelArea(left.asset);
+  if (pixels !== 0) return pixels;
+  const role = nativeAssetVariantPenalty(left.asset) - nativeAssetVariantPenalty(right.asset);
+  if (role !== 0) return role;
+  return comparePartPaths(left.asset.path, right.asset.path);
+}
+
+function nativeAssetDisplayRank(asset: NativeAssetReference): number {
+  if (asset.kind !== "image") return 3;
+  if (asset.embedded) return 3;
+  if (asset.mimeType === "image/tiff" || asset.mimeType === "image/heic") return 1;
+  return 2;
+}
+
+function nativeAssetPixelArea(asset: NativeAssetReference): number {
+  return Math.max(0, asset.width ?? 0) * Math.max(0, asset.height ?? 0);
+}
+
+function nativeAssetVariantPenalty(asset: NativeAssetReference): number {
+  const name = asset.name.toLowerCase();
+  let penalty = 0;
+  if (/(?:^|[-_])small(?:[-_.]|$)/.test(name)) penalty += 20;
+  if (/(?:^|[-_])filtered(?:[-_.]|$)/.test(name)) penalty += 8;
+  if (asset.mimeType === "image/tiff" || asset.mimeType === "image/heic") penalty += 4;
+  return penalty;
 }
 
 function archiveAssetMatchKey(assetId: string, message: NativeIwaArchiveMessageEvidence): string {

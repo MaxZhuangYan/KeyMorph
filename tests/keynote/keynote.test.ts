@@ -468,6 +468,48 @@ describe("Keynote bridge", () => {
     ]);
   });
 
+  test("coalesces native asset variants for the same archive object", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-asset-variants-"));
+    const keyPath = path.join(dir, "variants.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(640, 360));
+    await writeFile(path.join(keyPath, "Data", "hero-small-43.png"), pngBytes(160, 90));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(777, [
+          {
+            type: 3005,
+            payload: nativeImagePlacementPayload(42, { x: 100, y: 120, width: 320, height: 180 }),
+            dataReferences: [42, 43],
+            objectReferences: [777]
+          }
+        ]),
+        iwaArchiveRecord(9001, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 777, direction: "In", effect: "com.apple.iWork.Keynote.Blur", durationSeconds: 0.5 }) }
+        ]),
+        iwaArchiveRecord(9002, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 0.5 }) }])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const imageObjects = deck.deck.slides[0]?.objects.filter((object) => object.type === "image") ?? [];
+    assert.equal(imageObjects.length, 1);
+    assert.equal(imageObjects[0]?.metadata?.nativeArchiveIdentifier, "777");
+    assert.equal(imageObjects[0]?.metadata?.nativeAssetPath, "Data/hero-42.png");
+    assert.equal(imageObjects[0]?.metadata?.nativeSuppressedAssetVariantCount, 1);
+    assert.deepEqual(imageObjects[0]?.metadata?.nativeSuppressedAssetVariants, [
+      { path: "Data/hero-small-43.png", mimeType: "image/png", width: 160, height: 90, embedded: true }
+    ]);
+    const event = deck.deck.slides[0]?.timeline?.events[0];
+    assert.equal(event?.kind, "keyframes");
+    assert.equal(event?.targetId, imageObjects[0]?.id);
+    assert.equal(event?.metadata?.nativeBuildFallback, "blur-in");
+  });
+
   test("creates a conservative media object for a unique movie-start 3007 target", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-movie-start-"));
     const keyPath = path.join(dir, "movie.key");
