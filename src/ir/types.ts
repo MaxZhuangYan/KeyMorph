@@ -106,6 +106,7 @@ export interface IRObjectBase {
   bounds?: Rect;
   transform?: Transform2D;
   opacity?: number;
+  filter?: FilterState;
   style?: ObjectStyle;
   effects?: VisualEffect[];
   altText?: string;
@@ -343,11 +344,19 @@ export interface ObjectStateProperties {
   opacity?: number;
   bounds?: Rect;
   transform?: Transform2D;
+  filter?: FilterState;
   style?: ObjectStyle;
   text?: TextContent;
   crop?: Crop;
   media?: MediaPlayback;
   custom?: JSONRecord;
+}
+
+export interface FilterState {
+  blurPx?: number;
+  brightness?: number;
+  contrast?: number;
+  saturate?: number;
 }
 
 export interface Timeline {
@@ -442,6 +451,7 @@ export type AnimatableProperty =
   | "transform.rotateDeg"
   | "opacity"
   | "visible"
+  | "filter.blurPx"
   | "style.fill"
   | "style.stroke"
   | "text"
@@ -486,6 +496,7 @@ export type MorphProperty =
   | "bounds"
   | "transform"
   | "opacity"
+  | "filter"
   | "fill"
   | "stroke"
   | "text"

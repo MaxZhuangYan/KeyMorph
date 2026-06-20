@@ -85,6 +85,28 @@ describe("HTML runtime rendering", () => {
     assert.match(String(frames[1]?.transform), /rotate\(45deg\)/);
   });
 
+  test("converts blur keyframes to CSS filters", () => {
+    const frames = keyframeEventToCssFrames({
+      id: "blur",
+      kind: "keyframes",
+      targetId: "box",
+      durationMs: 1000,
+      tracks: [
+        {
+          property: "filter.blurPx",
+          interpolation: "number",
+          keyframes: [
+            { offset: 0, value: 16 },
+            { offset: 1, value: 0 }
+          ]
+        }
+      ]
+    });
+
+    assert.equal(frames[0]?.filter, "blur(16px)");
+    assert.equal(frames[1]?.filter, "none");
+  });
+
   test("evaluates property and keyframe events for rotation and scale aliases", () => {
     const deck = createRuntimeEvalDeck();
     const states = resolveSlideObjectStates(deck, deck.deck.slides[0], 500);
@@ -93,6 +115,13 @@ describe("HTML runtime rendering", () => {
     assert.equal(transform?.rotateDeg, 45);
     assert.equal(transform?.scaleX, 1.25);
     assert.equal(transform?.scaleY, 1.25);
+  });
+
+  test("evaluates blur filter aliases in runtime state", () => {
+    const deck = createFilterDeck();
+    const state = resolveSlideObjectStates(deck, deck.deck.slides[0], 500).get("box");
+
+    assert.equal(state?.filter?.blurPx, 8);
   });
 
   test("interpolates structured bounds, fills, strokes, crops, and alpha colors", () => {
@@ -124,6 +153,7 @@ describe("HTML runtime rendering", () => {
     assert.equal(effective.get("child")?.visible, true);
     assert.equal(effective.get("child")?.transform?.translateX, 10);
     assert.equal(effective.get("child")?.transform?.scaleX, 2);
+    assert.equal(effective.get("child")?.filter?.blurPx, 6);
   });
 
   test("resolves timing dependency graph by graph nodes and reports cycles", () => {
@@ -293,6 +323,51 @@ function createRuntimeEvalDeck(): DeckIR {
   };
 }
 
+function createFilterDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "filter-eval",
+      size: { width: 100, height: 100, unit: "px" },
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "box",
+              type: "shape",
+              shape: "rect",
+              bounds: { x: 0, y: 0, width: 20, height: 20 }
+            }
+          ],
+          timeline: {
+            durationMs: 1000,
+            events: [
+              {
+                id: "blur",
+                kind: "keyframes",
+                targetId: "box",
+                durationMs: 1000,
+                fill: "both",
+                tracks: [
+                  {
+                    property: "custom.keynote.filters.gaussianBlur",
+                    interpolation: "number",
+                    keyframes: [
+                      { offset: 0, value: 16 },
+                      { offset: 1, value: 0 }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  };
+}
+
 function createInterpolationDeck(): DeckIR {
   return {
     irVersion: "keymorph.ir.v1",
@@ -378,6 +453,7 @@ function createGroupDeck(): DeckIR {
               bounds: { x: 20, y: 20, width: 120, height: 120 },
               opacity: 0.5,
               transform: { translateX: 0, scaleX: 1, scaleY: 1 },
+              filter: { blurPx: 6 },
               children: [
                 {
                   id: "child",

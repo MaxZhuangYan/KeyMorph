@@ -145,6 +145,7 @@ type NormalizedRuntimeProperty =
   | "transform.skewYDeg"
   | "opacity"
   | "visible"
+  | "filter.blurPx"
   | "style.fill"
   | "style.stroke"
   | "text"
@@ -767,6 +768,12 @@ function runtimeScript(): string {
       stroke: "style.stroke",
       "stroke.width": "style.stroke.width",
       "stroke.color": "style.stroke.color",
+      blur: "filter.blurPx",
+      blurpx: "filter.blurPx",
+      "filter.blur": "filter.blurPx",
+      "filter.blurpx": "filter.blurPx",
+      "filters.gaussianblur": "filter.blurPx",
+      "custom.keynote.filters.gaussianblur": "filter.blurPx",
       tx: "transform.translateX",
       ty: "transform.translateY",
       translatex: "transform.translateX",
@@ -807,6 +814,7 @@ function runtimeScript(): string {
     const next = { ...(base || {}), ...patch };
     if (base?.bounds || patch.bounds) next.bounds = { ...(base?.bounds || {}), ...(patch.bounds || {}) };
     if (base?.transform || patch.transform) next.transform = { ...(base?.transform || {}), ...normalizeTransform(patch.transform || {}) };
+    if (base?.filter || patch.filter) next.filter = { ...(base?.filter || {}), ...(patch.filter || {}) };
     if (base?.style || patch.style) {
       next.style = { ...(base?.style || {}), ...(patch.style || {}) };
       if (base?.style?.stroke || patch.style?.stroke) next.style.stroke = { ...(base?.style?.stroke || {}), ...(patch.style?.stroke || {}) };
@@ -819,6 +827,7 @@ function runtimeScript(): string {
     opacity: object.opacity ?? 1,
     bounds: object.bounds || { x: 0, y: 0, width: 100, height: 100 },
     transform: normalizeTransform(object.transform || {}),
+    filter: object.filter || {},
     style: object.style || {},
     text: object.text,
     crop: object.crop,
@@ -827,6 +836,10 @@ function runtimeScript(): string {
   const transformCss = (transform) => {
     const t = normalizeTransform(transform || {});
     return "translate(" + Number(t.translateX || 0) + "px," + Number(t.translateY || 0) + "px) scale(" + Number(t.scaleX ?? 1) + "," + Number(t.scaleY ?? 1) + ") rotate(" + Number(t.rotateDeg || 0) + "deg) skew(" + Number(t.skewXDeg || 0) + "deg," + Number(t.skewYDeg || 0) + "deg)";
+  };
+  const filterCss = (filter) => {
+    const blur = Number(filter?.blurPx || 0);
+    return Number.isFinite(blur) && blur > 0 ? "blur(" + blur + "px)" : "none";
   };
   const boxStyle = (object, statePatch) => {
     const current = merge(baseState(object), statePatch);
@@ -840,7 +853,8 @@ function runtimeScript(): string {
       "height:" + Number(b.height || 0) + "px",
       "opacity:" + Number(current.opacity ?? 1),
       "visibility:" + (current.visible === false ? "hidden" : "visible"),
-      "transform:" + transformCss(current.transform)
+      "transform:" + transformCss(current.transform),
+      "filter:" + filterCss(current.filter)
     ];
     if (object.type === "shape" || object.type === "placeholder") {
       parts.push("background:" + (fillCss(style.fill) || "#e2e8f0"));
@@ -889,6 +903,7 @@ function runtimeScript(): string {
     if (normalized === "visible") return stateValue.visible;
     if (normalized === "text") return stateValue.text;
     if (normalized === "crop") return stateValue.crop;
+    if (normalized === "filter.blurPx") return stateValue.filter?.blurPx;
     if (normalized.startsWith("bounds.")) return stateValue.bounds?.[normalized.slice(7)];
     if (normalized === "transform.scale") return stateValue.transform?.scaleX ?? stateValue.transform?.scaleY ?? 1;
     if (normalized.startsWith("transform.")) return stateValue.transform?.[normalized.slice(10)];
@@ -928,6 +943,10 @@ function runtimeScript(): string {
     } else if (normalized === "visible") stateValue.visible = Boolean(value);
     else if (normalized === "text") stateValue.text = typeof value === "string" ? { plainText: value } : value;
     else if (normalized === "crop") stateValue.crop = value;
+    else if (normalized === "filter.blurPx") {
+      stateValue.filter = { ...(stateValue.filter || {}) };
+      setNumber(stateValue.filter, "blurPx", value);
+    }
     else if (normalized === "bounds" && value && typeof value === "object") {
       stateValue.bounds = { ...(stateValue.bounds || {}) };
       setNumber(stateValue.bounds, "x", value.x);
@@ -1067,7 +1086,7 @@ function runtimeScript(): string {
   const interpolateState = (from, to, progress, properties) => {
     const p = clamp(progress, 0, 1);
     const result = merge({}, to || {});
-    const allowed = new Set(properties && properties.length ? properties : ["bounds", "transform", "opacity", "fill", "stroke"]);
+    const allowed = new Set(properties && properties.length ? properties : ["bounds", "transform", "opacity", "filter", "fill", "stroke"]);
     if (allowed.has("all") || allowed.has("bounds")) {
       result.bounds = { ...(to?.bounds || {}) };
       for (const key of ["x", "y", "width", "height"]) result.bounds[key] = interpolate(from?.bounds?.[key], to?.bounds?.[key], p, "number");
@@ -1080,6 +1099,13 @@ function runtimeScript(): string {
       }
     }
     if (allowed.has("all") || allowed.has("opacity")) result.opacity = interpolate(from?.opacity ?? 1, to?.opacity ?? 1, p, "number");
+    if (allowed.has("all") || allowed.has("filter")) {
+      result.filter = { ...(to?.filter || {}) };
+      result.filter.blurPx = interpolate(from?.filter?.blurPx ?? 0, to?.filter?.blurPx ?? 0, p, "number");
+      result.filter.brightness = interpolate(from?.filter?.brightness ?? 1, to?.filter?.brightness ?? 1, p, "number");
+      result.filter.contrast = interpolate(from?.filter?.contrast ?? 1, to?.filter?.contrast ?? 1, p, "number");
+      result.filter.saturate = interpolate(from?.filter?.saturate ?? 1, to?.filter?.saturate ?? 1, p, "number");
+    }
     if (allowed.has("all") || allowed.has("fill")) {
       result.style = { ...(result.style || {}) };
       result.style.fill = interpolateFill(from?.style?.fill, to?.style?.fill, p);
@@ -1374,6 +1400,7 @@ function runtimeScript(): string {
     el.style.opacity = String(statePatch.opacity ?? 1);
     el.style.visibility = statePatch.visible === false ? "hidden" : "visible";
     el.style.transform = transformCss(statePatch.transform);
+    el.style.filter = filterCss(statePatch.filter);
     if (object.type === "text" || (object.type === "shape" && object.text)) {
       el.textContent = textOf(object, statePatch);
       applyTextStyle(el, object, statePatch);
@@ -1880,7 +1907,8 @@ function objectStyle(object: IRObject): string {
     `height:${bounds.height}px`,
     `opacity:${state.opacity ?? 1}`,
     `visibility:${state.visible === false ? "hidden" : "visible"}`,
-    `transform:${transformToCss(transform)}`
+    `transform:${transformToCss(transform)}`,
+    `filter:${filterToCss(state.filter)}`
   ];
 
   if (object.type === "text") {
@@ -1913,6 +1941,7 @@ function initialObjectState(object: IRObject): ObjectStateProperties {
       opacity: object.opacity ?? 1,
       bounds: object.bounds ?? { x: 0, y: 0, width: 100, height: 100 },
       transform: normalizeTransformPatch(object.transform),
+      filter: "filter" in object ? object.filter : {},
       style: object.style ?? {},
       text: "text" in object ? object.text : undefined,
       crop: "crop" in object ? object.crop : undefined,
@@ -1933,6 +1962,7 @@ function mergeObjectStateProperties(
     ...patch,
     bounds: patch.bounds ? { ...base.bounds, ...patch.bounds } : base.bounds,
     transform: transformPatch ? { ...base.transform, ...transformPatch } : base.transform,
+    filter: patch.filter ? { ...base.filter, ...patch.filter } : base.filter,
     style: patch.style
       ? {
           ...base.style,
@@ -1979,7 +2009,21 @@ function composeChildState(parent: ObjectStateProperties, child: ObjectStateProp
   result.opacity = (parent.opacity ?? 1) * (child.opacity ?? 1);
   result.visible = (parent.visible ?? true) && (child.visible ?? true);
   result.transform = composeTransforms(parent.transform, child.transform);
+  result.filter = composeFilters(parent.filter, child.filter);
   return result;
+}
+
+function composeFilters(
+  parent: ObjectStateProperties["filter"] | undefined,
+  child: ObjectStateProperties["filter"] | undefined
+): ObjectStateProperties["filter"] {
+  return {
+    ...child,
+    blurPx: (parent?.blurPx ?? 0) + (child?.blurPx ?? 0),
+    brightness: (parent?.brightness ?? 1) * (child?.brightness ?? 1),
+    contrast: (parent?.contrast ?? 1) * (child?.contrast ?? 1),
+    saturate: (parent?.saturate ?? 1) * (child?.saturate ?? 1)
+  };
 }
 
 function composeTransforms(parent: Transform2D | undefined, child: Transform2D | undefined): Transform2D {
@@ -2276,6 +2320,7 @@ function getRuntimeProperty(stateValue: ObjectStateProperties, property: string)
   if (normalized === "visible") return stateValue.visible;
   if (normalized === "text") return stateValue.text;
   if (normalized === "crop") return stateValue.crop;
+  if (normalized === "filter.blurPx") return stateValue.filter?.blurPx;
   if (normalized.startsWith("bounds.")) return stateValue.bounds?.[normalized.slice(7) as keyof NonNullable<ObjectStateProperties["bounds"]>];
   if (normalized === "transform.scale") return stateValue.transform?.scaleX ?? stateValue.transform?.scaleY ?? 1;
   if (normalized.startsWith("transform.")) return stateValue.transform?.[normalized.slice(10) as keyof Transform2D];
@@ -2302,6 +2347,9 @@ function setRuntimeProperty(stateValue: ObjectStateProperties, property: string,
     stateValue.text = normalizeTextValue(value);
   } else if (normalized === "crop") {
     stateValue.crop = value as ObjectStateProperties["crop"];
+  } else if (normalized === "filter.blurPx") {
+    stateValue.filter = { ...(stateValue.filter || {}) };
+    setNumericField(stateValue.filter, "blurPx", value);
   } else if (normalized === "bounds" && isRecord(value)) {
     stateValue.bounds = { ...(stateValue.bounds || { x: 0, y: 0, width: 0, height: 0 }) };
     setNumericField(stateValue.bounds, "x", value.x);
@@ -2354,6 +2402,12 @@ function normalizeRuntimeProperty(property: string): NormalizedRuntimeProperty {
     stroke: "style.stroke",
     "stroke.width": "style.stroke.width",
     "stroke.color": "style.stroke.color",
+    blur: "filter.blurPx",
+    blurpx: "filter.blurPx",
+    "filter.blur": "filter.blurPx",
+    "filter.blurpx": "filter.blurPx",
+    "filters.gaussianblur": "filter.blurPx",
+    "custom.keynote.filters.gaussianblur": "filter.blurPx",
     tx: "transform.translateX",
     ty: "transform.translateY",
     translatex: "transform.translateX",
@@ -2442,7 +2496,7 @@ function interpolateObjectState(
 ): ObjectStateProperties {
   const p = clamp(progress, 0, 1);
   const result = mergeObjectStateProperties({}, to || {});
-  const allowed = new Set<string>(properties && properties.length ? properties : ["bounds", "transform", "opacity", "fill", "stroke"]);
+  const allowed = new Set<string>(properties && properties.length ? properties : ["bounds", "transform", "opacity", "filter", "fill", "stroke"]);
   if (allowed.has("all") || allowed.has("bounds")) {
     result.bounds = { ...(to?.bounds || { x: 0, y: 0, width: 0, height: 0 }) };
     for (const key of ["x", "y", "width", "height"] as const) {
@@ -2457,6 +2511,13 @@ function interpolateObjectState(
     }
   }
   if (allowed.has("all") || allowed.has("opacity")) result.opacity = interpolateValue(from?.opacity ?? 1, to?.opacity ?? 1, p, "number") as number;
+  if (allowed.has("all") || allowed.has("filter")) {
+    result.filter = { ...(to?.filter || {}) };
+    result.filter.blurPx = interpolateValue(from?.filter?.blurPx ?? 0, to?.filter?.blurPx ?? 0, p, "number") as number;
+    result.filter.brightness = interpolateValue(from?.filter?.brightness ?? 1, to?.filter?.brightness ?? 1, p, "number") as number;
+    result.filter.contrast = interpolateValue(from?.filter?.contrast ?? 1, to?.filter?.contrast ?? 1, p, "number") as number;
+    result.filter.saturate = interpolateValue(from?.filter?.saturate ?? 1, to?.filter?.saturate ?? 1, p, "number") as number;
+  }
   if (allowed.has("all") || allowed.has("fill")) {
     result.style = { ...(result.style || {}) };
     result.style.fill = interpolateFillValue(from?.style?.fill, to?.style?.fill, p);
@@ -2733,6 +2794,19 @@ function transformToCss(transform: Transform2D | undefined): string {
   return `translate(${normalized.translateX ?? 0}px,${normalized.translateY ?? 0}px) scale(${normalized.scaleX ?? 1},${normalized.scaleY ?? 1}) rotate(${normalized.rotateDeg ?? 0}deg) skew(${normalized.skewXDeg ?? 0}deg,${normalized.skewYDeg ?? 0}deg)`;
 }
 
+function filterToCss(filter: ObjectStateProperties["filter"] | undefined): string {
+  const parts: string[] = [];
+  const blurPx = finiteNumber(filter?.blurPx) ?? 0;
+  const brightness = finiteNumber(filter?.brightness);
+  const contrast = finiteNumber(filter?.contrast);
+  const saturate = finiteNumber(filter?.saturate);
+  if (blurPx > 0) parts.push(`blur(${blurPx}px)`);
+  if (brightness !== undefined && brightness !== 1) parts.push(`brightness(${brightness})`);
+  if (contrast !== undefined && contrast !== 1) parts.push(`contrast(${contrast})`);
+  if (saturate !== undefined && saturate !== 1) parts.push(`saturate(${saturate})`);
+  return parts.length > 0 ? parts.join(" ") : "none";
+}
+
 function firstTextStyle(object: TextObject | ShapeObject, state?: ObjectStateProperties) {
   const text = "text" in object ? object.text : undefined;
   return text?.runs?.[0]?.style ?? state?.style?.textStyle ?? object.style?.textStyle ?? {};
@@ -2843,6 +2917,7 @@ function propertyValueToCss(property: string, value: unknown): Record<string, st
   if (normalized === "bounds.y") return { top: `${value}px` };
   if (normalized === "bounds.width") return { width: `${value}px` };
   if (normalized === "bounds.height") return { height: `${value}px` };
+  if (normalized === "filter.blurPx") return { filter: filterToCss({ blurPx: finiteNumber(value) ?? 0 }) };
   if (normalized === "style.fill") return { background: fillToCss(value as Fill) ?? String(value) };
   return {};
 }
