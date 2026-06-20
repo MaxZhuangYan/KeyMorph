@@ -620,6 +620,39 @@ describe("Keynote bridge", () => {
     assert.equal(deck.deck.slides[0]?.timeline?.durationMs, 2500);
   });
 
+  test("approximates native Keynote wipe as a bounds reveal", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-wipe-"));
+    const keyPath = path.join(dir, "wipe.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(111, [
+          { type: 3005, payload: nativeImagePlacementPayload(42, { x: 10, y: 20, width: 100, height: 80 }), dataReferences: [42] }
+        ]),
+        iwaArchiveRecord(9001, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "In", effect: "apple:wipe", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9002, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 1 }) }])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const event = deck.deck.slides[0]?.timeline?.events[0];
+    assert.equal(event?.kind, "keyframes");
+    if (event?.kind !== "keyframes") throw new Error("Expected wipe keyframes.");
+    assert.equal(event.metadata?.nativeBuildFallback, "wipe-in");
+    assert.equal(typeof event.metadata?.nativeBuildDegradation, "string");
+    assert.deepEqual(event.tracks.find((track) => track.property === "bounds")?.keyframes, [
+      { offset: 0, value: { x: 10, y: 20, width: 1, height: 80 } },
+      { offset: 1, value: { x: 10, y: 20, width: 100, height: 80 } }
+    ]);
+  });
+
   test("parses a ZIP-backed .key package with loose Index IWA entries", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-zip-"));
     const keyPath = path.join(dir, "sample.key");

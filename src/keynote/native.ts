@@ -2267,6 +2267,9 @@ function nativeBuildEventFromEvidence(
   if (build.effect && /motion-path|movie-start/i.test(build.effect)) {
     return undefined;
   }
+  if (build.effect && /wipe/i.test(build.effect) && resolution.object.bounds) {
+    return nativeWipeBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs, direction);
+  }
   const from = direction === "out" ? 1 : 0;
   const to = direction === "out" ? 0 : 1;
   return {
@@ -2289,6 +2292,66 @@ function nativeBuildEventFromEvidence(
       }
     ],
     metadata: nativeBuildEventMetadata(build, timing, resolution, `opacity-${direction}`)
+  };
+}
+
+function nativeWipeBuildEventFromEvidence(
+  slideId: string,
+  index: number,
+  targetIndex: number,
+  build: NativeIwaBuildEvidence,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  resolution: { object: IRObject; method: string; nativeTargetId?: string },
+  startMs: number,
+  durationMs: number,
+  direction: "in" | "out"
+): AnimationEvent {
+  const bounds = resolution.object.bounds!;
+  const collapsed = { ...bounds, width: Math.max(1, Math.min(bounds.width, 1)) };
+  return {
+    id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, `wipe-${direction}`),
+    kind: "keyframes",
+    label: `Keynote wipe ${direction}`,
+    targetId: resolution.object.id,
+    start: { type: "absolute", atMs: startMs },
+    durationMs,
+    fill: "both",
+    easing: "easeInOut",
+    tracks: [
+      {
+        property: "bounds",
+        interpolation: "matrix",
+        keyframes:
+          direction === "out"
+            ? [
+                { offset: 0, value: bounds },
+                { offset: 1, value: collapsed }
+              ]
+            : [
+                { offset: 0, value: collapsed },
+                { offset: 1, value: bounds }
+              ]
+      },
+      {
+        property: "opacity",
+        interpolation: "number",
+        keyframes:
+          direction === "out"
+            ? [
+                { offset: 0, value: 1 },
+                { offset: 1, value: 0 }
+              ]
+            : [
+                { offset: 0, value: 0 },
+                { offset: 0.05, value: 1 },
+                { offset: 1, value: 1 }
+              ]
+      }
+    ],
+    metadata: {
+      ...nativeBuildEventMetadata(build, timing, resolution, `wipe-${direction}`),
+      nativeBuildDegradation: "wipe approximated as left-to-right bounds reveal; Keynote mask direction/easing is not fully decoded"
+    }
   };
 }
 
