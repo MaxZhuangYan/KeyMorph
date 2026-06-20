@@ -1,4 +1,5 @@
 import type { ConversionReport } from "../ir/index.ts";
+export * from "./fidelity.ts";
 
 export interface ConversionScore {
   animationLostCount: number;

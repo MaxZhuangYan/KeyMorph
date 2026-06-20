@@ -1,10 +1,12 @@
 import type {
+  AnimationEvent,
   DeckIR,
   Easing,
   Fill,
   IRObject,
   KeyframeAnimationEvent,
   KeyframeTrack,
+  MorphProperty,
   ObjectStateProperties,
   ShapeObject,
   Slide,
@@ -47,6 +49,27 @@ export interface DeckTimeResolution {
   transitionDurationMs: number;
   previousSlideIndex?: number;
 }
+
+type NormalizedRuntimeProperty =
+  | "bounds.x"
+  | "bounds.y"
+  | "bounds.width"
+  | "bounds.height"
+  | "transform.translateX"
+  | "transform.translateY"
+  | "transform.scale"
+  | "transform.scaleX"
+  | "transform.scaleY"
+  | "transform.rotateDeg"
+  | "transform.skewXDeg"
+  | "transform.skewYDeg"
+  | "opacity"
+  | "visible"
+  | "style.fill"
+  | "style.stroke"
+  | "text"
+  | "crop"
+  | string;
 
 const DEFAULT_SLIDE_DURATION_MS = 2500;
 const DEFAULT_TRANSITION_DURATION_MS = 600;
@@ -180,6 +203,76 @@ export function resolveDeckTime(deck: DeckIR, timeMs: number): DeckTimeResolutio
   };
 }
 
+export function resolveSlideObjectStates(deck: DeckIR, slide: Slide, timeMs: number): Map<string, ObjectStateProperties> {
+  const states = new Map<string, ObjectStateProperties>();
+  const objects = flattenObjects(slide.objects);
+  for (const object of objects) states.set(object.id, initialObjectState(object));
+
+  const starts = computeEventStarts(slide);
+  const events = [...(slide.timeline?.events ?? [])].sort((a, b) => (starts.get(a.id) ?? 0) - (starts.get(b.id) ?? 0));
+  for (const event of events) {
+    if (event.kind === "setState") {
+      const progress = eventProgress(event, starts.get(event.id) ?? 0, timeMs);
+      if (progress === undefined) continue;
+      const stateRecord = slide.states?.find((item) => item.id === event.stateId);
+      if (stateRecord) states.set(event.targetId, mergeObjectStateProperties(states.get(event.targetId) ?? {}, stateRecord.properties));
+    } else if (event.kind === "visibility") {
+      const progress = eventProgress(event, starts.get(event.id) ?? 0, timeMs);
+      if (progress === undefined) continue;
+      const current = mergeObjectStateProperties(states.get(event.targetId) ?? {}, {});
+      current.visible = progress < 1 && event.fill === "backwards" ? !event.visible : event.visible;
+      states.set(event.targetId, current);
+    } else if (event.kind === "property") {
+      const progress = eventProgress(event, starts.get(event.id) ?? 0, timeMs);
+      if (progress === undefined) continue;
+      const current = mergeObjectStateProperties(states.get(event.targetId) ?? {}, {});
+      const from = event.from ?? getRuntimeProperty(current, event.property);
+      setRuntimeProperty(current, event.property, interpolateValue(from, event.to, progress, event.interpolation));
+      states.set(event.targetId, current);
+    } else if (event.kind === "keyframes") {
+      const progress = eventProgress(event, starts.get(event.id) ?? 0, timeMs);
+      if (progress === undefined) continue;
+      const current = mergeObjectStateProperties(states.get(event.targetId) ?? {}, {});
+      for (const track of event.tracks) {
+        setRuntimeProperty(current, track.property, keyframeTrackValue(track, progress));
+      }
+      states.set(event.targetId, current);
+    } else if (event.kind === "morph") {
+      const progress = eventProgress(event, starts.get(event.id) ?? 0, timeMs);
+      if (progress === undefined) continue;
+      const pairs = event.pairs?.length
+        ? event.pairs
+        : event.from?.objectId && event.to?.objectId
+          ? [{ fromObjectId: event.from.objectId, toObjectId: event.to.objectId }]
+          : [];
+      for (const pair of pairs) {
+        const targetId = pair.toObjectId || event.to?.objectId || pair.fromObjectId;
+        const targetObject = objectById(slide, targetId);
+        if (!targetObject) continue;
+        const fromSlide = event.from?.slideId ? slideById(deck, event.from.slideId) : slide;
+        const toSlide = event.to?.slideId ? slideById(deck, event.to.slideId) : slide;
+        const fromState = stateForEndpoint(deck, { ...(event.from || {}), objectId: event.from?.objectId || pair.fromObjectId }, fromSlide, pair.fromObjectId);
+        const toState =
+          stateForEndpoint(deck, { ...(event.to || {}), objectId: event.to?.objectId || pair.toObjectId }, toSlide, pair.toObjectId) ||
+          states.get(targetId) ||
+          initialObjectState(targetObject);
+        states.set(targetId, interpolateObjectState(fromState, toState, progress, event.properties));
+      }
+    } else if (event.kind === "media") {
+      const progress = eventProgress(event, starts.get(event.id) ?? 0, timeMs);
+      if (progress === undefined) continue;
+      const current = mergeObjectStateProperties(states.get(event.targetId) ?? {}, {});
+      current.media = { ...(current.media || {}) };
+      if (event.action === "seek") current.media.startMs = event.seekMs || 0;
+      if (event.action === "mute") current.media.muted = true;
+      if (event.action === "unmute") current.media.muted = false;
+      states.set(event.targetId, current);
+    }
+  }
+
+  return states;
+}
+
 function runtimeScript(): string {
   return `
 (() => {
@@ -276,11 +369,99 @@ function runtimeScript(): string {
     el.style.lineHeight = String(style.lineHeight || 1.15);
     el.style.letterSpacing = Number(style.letterSpacing || 0) + "px";
   };
+  const normalizeTransform = (value) => {
+    const input = value && typeof value === "object" ? value : {};
+    const output = {};
+    const setNumber = (key, raw) => {
+      const numeric = Number(raw);
+      if (Number.isFinite(numeric)) output[key] = numeric;
+    };
+    const applyScale = (raw) => {
+      if (raw && typeof raw === "object") {
+        setNumber("scaleX", raw.scaleX ?? raw.x);
+        setNumber("scaleY", raw.scaleY ?? raw.y);
+        const uniform = Number(raw.scale ?? raw.value);
+        if (Number.isFinite(uniform)) {
+          output.scaleX = uniform;
+          output.scaleY = uniform;
+        }
+        return;
+      }
+      const numeric = Number(raw);
+      if (Number.isFinite(numeric)) {
+        output.scaleX = numeric;
+        output.scaleY = numeric;
+      }
+    };
+    setNumber("translateX", input.translateX ?? input.x ?? input.tx);
+    setNumber("translateY", input.translateY ?? input.y ?? input.ty);
+    setNumber("scaleX", input.scaleX);
+    setNumber("scaleY", input.scaleY);
+    applyScale(input.scale);
+    setNumber("rotateDeg", input.rotateDeg ?? input.rotationDeg ?? input.rotate ?? input.rotation);
+    setNumber("skewXDeg", input.skewXDeg ?? input.skewX);
+    setNumber("skewYDeg", input.skewYDeg ?? input.skewY);
+    if (input.origin && typeof input.origin === "object") {
+      const x = Number(input.origin.x);
+      const y = Number(input.origin.y);
+      if (Number.isFinite(x) && Number.isFinite(y)) output.origin = { x, y };
+    }
+    return output;
+  };
+  const normalizeProperty = (property) => {
+    const raw = String(property || "");
+    const lower = raw.toLowerCase();
+    const direct = {
+      x: "bounds.x",
+      y: "bounds.y",
+      left: "bounds.x",
+      top: "bounds.y",
+      width: "bounds.width",
+      height: "bounds.height",
+      fill: "style.fill",
+      stroke: "style.stroke",
+      "stroke.width": "style.stroke.width",
+      "stroke.color": "style.stroke.color",
+      tx: "transform.translateX",
+      ty: "transform.translateY",
+      translatex: "transform.translateX",
+      translatey: "transform.translateY",
+      scalex: "transform.scaleX",
+      scaley: "transform.scaleY",
+      scale: "transform.scale",
+      rotate: "transform.rotateDeg",
+      rotation: "transform.rotateDeg",
+      rotatedeg: "transform.rotateDeg",
+      rotationdeg: "transform.rotateDeg",
+      skewx: "transform.skewXDeg",
+      skewy: "transform.skewYDeg"
+    };
+    if (direct[lower]) return direct[lower];
+    if (!lower.startsWith("transform.")) return raw;
+    const suffix = lower.slice("transform.".length);
+    return ({
+      tx: "transform.translateX",
+      ty: "transform.translateY",
+      x: "transform.translateX",
+      y: "transform.translateY",
+      translatex: "transform.translateX",
+      translatey: "transform.translateY",
+      scalex: "transform.scaleX",
+      scaley: "transform.scaleY",
+      scale: "transform.scale",
+      rotate: "transform.rotateDeg",
+      rotation: "transform.rotateDeg",
+      rotatedeg: "transform.rotateDeg",
+      rotationdeg: "transform.rotateDeg",
+      skewx: "transform.skewXDeg",
+      skewy: "transform.skewYDeg"
+    })[suffix] || raw;
+  };
   const merge = (base, patch) => {
     if (!patch) return { ...(base || {}) };
     const next = { ...(base || {}), ...patch };
     if (base?.bounds || patch.bounds) next.bounds = { ...(base?.bounds || {}), ...(patch.bounds || {}) };
-    if (base?.transform || patch.transform) next.transform = { ...(base?.transform || {}), ...(patch.transform || {}) };
+    if (base?.transform || patch.transform) next.transform = { ...(base?.transform || {}), ...normalizeTransform(patch.transform || {}) };
     if (base?.style || patch.style) {
       next.style = { ...(base?.style || {}), ...(patch.style || {}) };
       if (base?.style?.stroke || patch.style?.stroke) next.style.stroke = { ...(base?.style?.stroke || {}), ...(patch.style?.stroke || {}) };
@@ -292,14 +473,14 @@ function runtimeScript(): string {
     visible: object.visible !== false,
     opacity: object.opacity ?? 1,
     bounds: object.bounds || { x: 0, y: 0, width: 100, height: 100 },
-    transform: object.transform || {},
+    transform: normalizeTransform(object.transform || {}),
     style: object.style || {},
     text: object.text,
     crop: object.crop,
     media: object.playback
   }, object.initialState);
   const transformCss = (transform) => {
-    const t = transform || {};
+    const t = normalizeTransform(transform || {});
     return "translate(" + Number(t.translateX || 0) + "px," + Number(t.translateY || 0) + "px) scale(" + Number(t.scaleX ?? 1) + "," + Number(t.scaleY ?? 1) + ") rotate(" + Number(t.rotateDeg || 0) + "deg) skew(" + Number(t.skewXDeg || 0) + "deg," + Number(t.skewYDeg || 0) + "deg)";
   };
   const boxStyle = (object, statePatch) => {
@@ -358,31 +539,71 @@ function runtimeScript(): string {
     return undefined;
   };
   const getProperty = (stateValue, property) => {
-    if (property === "opacity") return stateValue.opacity;
-    if (property === "visible") return stateValue.visible;
-    if (property === "text") return stateValue.text;
-    if (property === "crop") return stateValue.crop;
-    if (property.startsWith("bounds.")) return stateValue.bounds?.[property.slice(7)];
-    if (property.startsWith("transform.")) return stateValue.transform?.[property.slice(10)];
-    if (property === "style.fill") return stateValue.style?.fill;
-    if (property === "style.stroke") return stateValue.style?.stroke;
+    const normalized = normalizeProperty(property);
+    if (normalized === "opacity") return stateValue.opacity;
+    if (normalized === "visible") return stateValue.visible;
+    if (normalized === "text") return stateValue.text;
+    if (normalized === "crop") return stateValue.crop;
+    if (normalized.startsWith("bounds.")) return stateValue.bounds?.[normalized.slice(7)];
+    if (normalized === "transform.scale") return stateValue.transform?.scaleX ?? stateValue.transform?.scaleY ?? 1;
+    if (normalized.startsWith("transform.")) return stateValue.transform?.[normalized.slice(10)];
+    if (normalized === "style.fill") return stateValue.style?.fill;
+    if (normalized === "style.stroke") return stateValue.style?.stroke;
+    if (normalized.startsWith("style.stroke.")) return stateValue.style?.stroke?.[normalized.slice(13)];
+    if (normalized.startsWith("style.textStyle.")) return stateValue.style?.textStyle?.[normalized.slice(16)];
     return undefined;
   };
   const setProperty = (stateValue, property, value) => {
-    if (property === "opacity") stateValue.opacity = Number(value);
-    else if (property === "visible") stateValue.visible = Boolean(value);
-    else if (property === "text") stateValue.text = value;
-    else if (property === "crop") stateValue.crop = value;
-    else if (property.startsWith("bounds.")) {
+    if (value === undefined) return;
+    const normalized = normalizeProperty(property);
+    const setNumber = (target, key, raw) => {
+      const numeric = Number(raw);
+      if (Number.isFinite(numeric)) target[key] = numeric;
+    };
+    const applyScale = (target, raw) => {
+      if (raw && typeof raw === "object") {
+        setNumber(target, "scaleX", raw.scaleX ?? raw.x);
+        setNumber(target, "scaleY", raw.scaleY ?? raw.y);
+        const uniform = Number(raw.scale ?? raw.value);
+        if (Number.isFinite(uniform)) {
+          target.scaleX = uniform;
+          target.scaleY = uniform;
+        }
+        return;
+      }
+      const numeric = Number(raw);
+      if (Number.isFinite(numeric)) {
+        target.scaleX = numeric;
+        target.scaleY = numeric;
+      }
+    };
+    if (normalized === "opacity") {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) stateValue.opacity = numeric;
+    } else if (normalized === "visible") stateValue.visible = Boolean(value);
+    else if (normalized === "text") stateValue.text = typeof value === "string" ? { plainText: value } : value;
+    else if (normalized === "crop") stateValue.crop = value;
+    else if (normalized.startsWith("bounds.")) {
       stateValue.bounds = { ...(stateValue.bounds || {}) };
-      stateValue.bounds[property.slice(7)] = Number(value);
-    } else if (property.startsWith("transform.")) {
+      setNumber(stateValue.bounds, normalized.slice(7), value);
+    } else if (normalized === "transform") {
+      stateValue.transform = { ...(stateValue.transform || {}), ...normalizeTransform(value) };
+    } else if (normalized === "transform.scale") {
       stateValue.transform = { ...(stateValue.transform || {}) };
-      stateValue.transform[property.slice(10)] = Number(value);
-    } else if (property === "style.fill") {
+      applyScale(stateValue.transform, value);
+    } else if (normalized.startsWith("transform.")) {
+      stateValue.transform = { ...(stateValue.transform || {}) };
+      setNumber(stateValue.transform, normalized.slice(10), value);
+    } else if (normalized === "style.fill") {
       stateValue.style = { ...(stateValue.style || {}), fill: value };
-    } else if (property === "style.stroke") {
+    } else if (normalized === "style.stroke") {
       stateValue.style = { ...(stateValue.style || {}), stroke: value };
+    } else if (normalized.startsWith("style.stroke.")) {
+      stateValue.style = { ...(stateValue.style || {}), stroke: { ...(stateValue.style?.stroke || {}) } };
+      stateValue.style.stroke[normalized.slice(13)] = value;
+    } else if (normalized.startsWith("style.textStyle.")) {
+      stateValue.style = { ...(stateValue.style || {}), textStyle: { ...(stateValue.style?.textStyle || {}) } };
+      stateValue.style.textStyle[normalized.slice(16)] = value;
     }
   };
   const interpolateColor = (from, to, progress) => {
@@ -928,7 +1149,7 @@ function initialObjectState(object: IRObject): ObjectStateProperties {
       visible: object.visible !== false,
       opacity: object.opacity ?? 1,
       bounds: object.bounds ?? { x: 0, y: 0, width: 100, height: 100 },
-      transform: object.transform ?? {},
+      transform: normalizeTransformPatch(object.transform),
       style: object.style ?? {},
       text: "text" in object ? object.text : undefined,
       crop: "crop" in object ? object.crop : undefined,
@@ -943,11 +1164,12 @@ function mergeObjectStateProperties(
   patch: ObjectStateProperties | undefined
 ): ObjectStateProperties {
   if (!patch) return { ...base };
+  const transformPatch = patch.transform ? normalizeTransformPatch(patch.transform) : undefined;
   return {
     ...base,
     ...patch,
     bounds: patch.bounds ? { ...base.bounds, ...patch.bounds } : base.bounds,
-    transform: patch.transform ? { ...base.transform, ...patch.transform } : base.transform,
+    transform: transformPatch ? { ...base.transform, ...transformPatch } : base.transform,
     style: patch.style
       ? {
           ...base.style,
@@ -961,8 +1183,388 @@ function mergeObjectStateProperties(
   };
 }
 
+function flattenObjects(objects: IRObject[] | undefined, out: IRObject[] = []): IRObject[] {
+  for (const object of objects ?? []) {
+    out.push(object);
+    if (object.type === "group") flattenObjects(object.children, out);
+  }
+  return out;
+}
+
+function objectById(slide: Slide | undefined, objectId: string | undefined): IRObject | undefined {
+  if (!objectId) return undefined;
+  return flattenObjects(slide?.objects).find((object) => object.id === objectId);
+}
+
+function slideById(deck: DeckIR, slideId: string | undefined): Slide | undefined {
+  if (!slideId) return undefined;
+  return deck.deck.slides.find((slide) => slide.id === slideId);
+}
+
+function findObjectAnywhere(deck: DeckIR, objectId: string | undefined): IRObject | undefined {
+  if (!objectId) return undefined;
+  for (const slide of deck.deck.slides) {
+    const object = objectById(slide, objectId);
+    if (object) return object;
+  }
+  return undefined;
+}
+
+function stateForEndpoint(
+  deck: DeckIR,
+  endpoint: { slideId?: string; stateId?: string; objectId?: string; snapshot?: ObjectStateProperties } | undefined,
+  fallbackSlide: Slide | undefined,
+  fallbackObjectId: string | undefined
+): ObjectStateProperties | undefined {
+  if (!endpoint) return undefined;
+  if (endpoint.snapshot) return endpoint.snapshot;
+  const slide = endpoint.slideId ? slideById(deck, endpoint.slideId) : fallbackSlide;
+  const state = endpoint.stateId ? slide?.states?.find((item) => item.id === endpoint.stateId) : undefined;
+  if (state) return state.properties;
+  const objectId = endpoint.objectId || fallbackObjectId;
+  const object = objectById(slide, objectId) || findObjectAnywhere(deck, objectId);
+  return object ? initialObjectState(object) : undefined;
+}
+
+function computeEventStarts(slide: Slide | undefined): Map<string, number> {
+  const events = slide?.timeline?.events ?? [];
+  const starts = new Map<string, number>();
+  const eventMap = new Map(events.map((event) => [event.id, event]));
+  const graphEdges = slide?.timeline?.dependencyGraph?.edges ?? [];
+
+  for (let pass = 0; pass < Math.max(2, events.length + 1); pass += 1) {
+    events.forEach((event, index) => {
+      const previous = events[index - 1];
+      let start = Number(event.delayMs || 0);
+      const timing = event.start;
+      if (timing?.type === "absolute") start += Number(timing.atMs || 0);
+      else if (timing?.type === "with" || timing?.type === "withPrevious") {
+        const ref = timing.type === "with" ? eventMap.get(timing.eventId) : previous;
+        start += startForEvent(starts, ref) + Number(timing.offsetMs || 0);
+      } else if (timing?.type === "after" || timing?.type === "afterPrevious") {
+        const ref = timing.type === "after" ? eventMap.get(timing.eventId) : previous;
+        start += startForEvent(starts, ref) + eventDuration(ref) + Number(timing.offsetMs || 0);
+      } else if (timing?.type === "before") {
+        const ref = eventMap.get(timing.eventId);
+        start += startForEvent(starts, ref) - eventDuration(event) - Number(timing.offsetMs || 0);
+      } else if (timing?.type === "trigger" || timing?.type === "onClick") {
+        start += Number(timing.offsetMs || 0);
+      }
+
+      for (const dep of event.dependencies ?? []) {
+        const ref = eventMap.get(dep.eventId);
+        if (!ref) continue;
+        const refStart = startForEvent(starts, ref);
+        if (dep.relation === "with") start = Math.max(start, refStart + Number(dep.offsetMs || 0));
+        else if (dep.relation === "before") start = Math.max(start, refStart - eventDuration(event) - Number(dep.offsetMs || 0));
+        else start = Math.max(start, refStart + eventDuration(ref) + Number(dep.offsetMs || 0));
+      }
+
+      for (const edge of graphEdges.filter((edge) => edge.to === event.id)) {
+        const ref = eventMap.get(edge.from);
+        if (!ref) continue;
+        const refStart = startForEvent(starts, ref);
+        if (edge.relation === "with") start = Math.max(start, refStart + Number(edge.offsetMs || 0));
+        else if (edge.relation === "before") start = Math.max(start, refStart - eventDuration(event) - Number(edge.offsetMs || 0));
+        else if (edge.relation === "after") start = Math.max(start, refStart + eventDuration(ref) + Number(edge.offsetMs || 0));
+      }
+
+      starts.set(event.id, Math.max(0, start));
+    });
+  }
+
+  return starts;
+}
+
+function startForEvent(starts: Map<string, number>, event: AnimationEvent | undefined): number {
+  return event ? starts.get(event.id) ?? 0 : 0;
+}
+
+function eventDuration(event: AnimationEvent | undefined): number {
+  return Math.max(0, Number(event?.durationMs || 0));
+}
+
+function eventProgress(event: AnimationEvent, start: number, timeMs: number): number | undefined {
+  const duration = eventDuration(event);
+  const end = start + duration;
+  if (duration === 0) return timeMs >= start ? 1 : undefined;
+  if (timeMs < start) return event.fill === "backwards" || event.fill === "both" ? 0 : undefined;
+  if (timeMs > end) return event.fill === "forwards" || event.fill === "both" ? 1 : undefined;
+  return easeProgressValue(event.easing, (timeMs - start) / duration);
+}
+
+function keyframeTrackValue(track: KeyframeTrack, progress: number): unknown {
+  const frames = [...track.keyframes].sort((a, b) => Number(a.offset) - Number(b.offset));
+  if (!frames.length) return undefined;
+  const first = frames[0];
+  if (first && progress <= Number(first.offset)) return first.value;
+  for (let index = 1; index < frames.length; index += 1) {
+    const previous = frames[index - 1];
+    const next = frames[index];
+    if (!previous || !next) continue;
+    if (progress <= Number(next.offset)) {
+      const local = (progress - Number(previous.offset)) / Math.max(0.0001, Number(next.offset) - Number(previous.offset));
+      return interpolateValue(previous.value, next.value, easeProgressValue(next.easing, local), track.interpolation);
+    }
+  }
+  return frames[frames.length - 1]?.value;
+}
+
+function getRuntimeProperty(stateValue: ObjectStateProperties, property: string): unknown {
+  const normalized = normalizeRuntimeProperty(property);
+  if (normalized === "bounds") return stateValue.bounds;
+  if (normalized === "transform") return stateValue.transform;
+  if (normalized === "opacity") return stateValue.opacity;
+  if (normalized === "visible") return stateValue.visible;
+  if (normalized === "text") return stateValue.text;
+  if (normalized === "crop") return stateValue.crop;
+  if (normalized.startsWith("bounds.")) return stateValue.bounds?.[normalized.slice(7) as keyof NonNullable<ObjectStateProperties["bounds"]>];
+  if (normalized === "transform.scale") return stateValue.transform?.scaleX ?? stateValue.transform?.scaleY ?? 1;
+  if (normalized.startsWith("transform.")) return stateValue.transform?.[normalized.slice(10) as keyof Transform2D];
+  if (normalized === "style.fill") return stateValue.style?.fill;
+  if (normalized === "style.stroke") return stateValue.style?.stroke;
+  if (normalized.startsWith("style.stroke.")) return stateValue.style?.stroke?.[normalized.slice(13) as keyof NonNullable<NonNullable<ObjectStateProperties["style"]>["stroke"]>];
+  if (normalized.startsWith("style.textStyle.")) {
+    return stateValue.style?.textStyle?.[
+      normalized.slice(16) as keyof NonNullable<NonNullable<ObjectStateProperties["style"]>["textStyle"]>
+    ];
+  }
+  return undefined;
+}
+
+function setRuntimeProperty(stateValue: ObjectStateProperties, property: string, value: unknown): void {
+  if (value === undefined) return;
+  const normalized = normalizeRuntimeProperty(property);
+  if (normalized === "opacity") {
+    const numeric = finiteNumber(value);
+    if (numeric !== undefined) stateValue.opacity = numeric;
+  } else if (normalized === "visible") {
+    stateValue.visible = Boolean(value);
+  } else if (normalized === "text") {
+    stateValue.text = normalizeTextValue(value);
+  } else if (normalized === "crop") {
+    stateValue.crop = value as ObjectStateProperties["crop"];
+  } else if (normalized === "bounds" && isRecord(value)) {
+    stateValue.bounds = { ...(stateValue.bounds || { x: 0, y: 0, width: 0, height: 0 }) };
+    setNumericField(stateValue.bounds, "x", value.x);
+    setNumericField(stateValue.bounds, "y", value.y);
+    setNumericField(stateValue.bounds, "width", value.width);
+    setNumericField(stateValue.bounds, "height", value.height);
+  } else if (normalized.startsWith("bounds.")) {
+    stateValue.bounds = { ...(stateValue.bounds || { x: 0, y: 0, width: 0, height: 0 }) };
+    setNumericField(stateValue.bounds, normalized.slice(7), value);
+  } else if (normalized === "transform") {
+    stateValue.transform = { ...(stateValue.transform || {}), ...normalizeTransformPatch(value) };
+  } else if (normalized === "transform.scale") {
+    stateValue.transform = { ...(stateValue.transform || {}) };
+    applyScaleValue(stateValue.transform, value);
+  } else if (normalized.startsWith("transform.")) {
+    stateValue.transform = { ...(stateValue.transform || {}) };
+    setNumericField(stateValue.transform, normalized.slice(10), value);
+  } else if (normalized === "style.fill") {
+    stateValue.style = { ...(stateValue.style || {}), fill: value as ObjectStateProperties["style"] extends { fill?: infer T } ? T : never };
+  } else if (normalized === "style.stroke") {
+    stateValue.style = { ...(stateValue.style || {}), stroke: value as ObjectStateProperties["style"] extends { stroke?: infer T } ? T : never };
+  } else if (normalized.startsWith("style.stroke.")) {
+    stateValue.style = { ...(stateValue.style || {}), stroke: { ...(stateValue.style?.stroke || {}) } };
+    setStyleField(stateValue.style.stroke, normalized.slice(13), value);
+  } else if (normalized.startsWith("style.textStyle.")) {
+    stateValue.style = { ...(stateValue.style || {}), textStyle: { ...(stateValue.style?.textStyle || {}) } };
+    setStyleField(stateValue.style.textStyle, normalized.slice(16), value);
+  }
+}
+
+function normalizeRuntimeProperty(property: string): NormalizedRuntimeProperty {
+  const raw = String(property || "");
+  const lower = raw.toLowerCase();
+  const direct: Record<string, NormalizedRuntimeProperty> = {
+    x: "bounds.x",
+    y: "bounds.y",
+    left: "bounds.x",
+    top: "bounds.y",
+    width: "bounds.width",
+    height: "bounds.height",
+    fill: "style.fill",
+    stroke: "style.stroke",
+    "stroke.width": "style.stroke.width",
+    "stroke.color": "style.stroke.color",
+    tx: "transform.translateX",
+    ty: "transform.translateY",
+    translatex: "transform.translateX",
+    translatey: "transform.translateY",
+    scalex: "transform.scaleX",
+    scaley: "transform.scaleY",
+    scale: "transform.scale",
+    rotate: "transform.rotateDeg",
+    rotation: "transform.rotateDeg",
+    rotatedeg: "transform.rotateDeg",
+    rotationdeg: "transform.rotateDeg",
+    skewx: "transform.skewXDeg",
+    skewy: "transform.skewYDeg"
+  };
+  if (direct[lower]) return direct[lower];
+  if (!lower.startsWith("transform.")) return raw;
+
+  const suffix = lower.slice("transform.".length);
+  const transformAliases: Record<string, NormalizedRuntimeProperty> = {
+    tx: "transform.translateX",
+    ty: "transform.translateY",
+    x: "transform.translateX",
+    y: "transform.translateY",
+    translatex: "transform.translateX",
+    translatey: "transform.translateY",
+    scalex: "transform.scaleX",
+    scaley: "transform.scaleY",
+    scale: "transform.scale",
+    rotate: "transform.rotateDeg",
+    rotation: "transform.rotateDeg",
+    rotatedeg: "transform.rotateDeg",
+    rotationdeg: "transform.rotateDeg",
+    skewx: "transform.skewXDeg",
+    skewy: "transform.skewYDeg"
+  };
+  return transformAliases[suffix] ?? raw;
+}
+
+function normalizeTransformPatch(value: unknown): Partial<Transform2D> {
+  if (!isRecord(value)) return {};
+  const transform: Partial<Transform2D> = {};
+  setNumericField(transform, "translateX", value.translateX ?? value.x ?? value.tx);
+  setNumericField(transform, "translateY", value.translateY ?? value.y ?? value.ty);
+  setNumericField(transform, "scaleX", value.scaleX);
+  setNumericField(transform, "scaleY", value.scaleY);
+  applyScaleValue(transform, value.scale);
+  setNumericField(transform, "rotateDeg", value.rotateDeg ?? value.rotationDeg ?? value.rotate ?? value.rotation);
+  setNumericField(transform, "skewXDeg", value.skewXDeg ?? value.skewX);
+  setNumericField(transform, "skewYDeg", value.skewYDeg ?? value.skewY);
+  if (isRecord(value.origin)) {
+    const x = finiteNumber(value.origin.x);
+    const y = finiteNumber(value.origin.y);
+    if (x !== undefined && y !== undefined) transform.origin = { x, y };
+  }
+  return transform;
+}
+
+function applyScaleValue(transform: Partial<Transform2D>, value: unknown): void {
+  if (isRecord(value)) {
+    setNumericField(transform, "scaleX", value.scaleX ?? value.x);
+    setNumericField(transform, "scaleY", value.scaleY ?? value.y);
+    const uniform = value.scale ?? value.value;
+    const numeric = finiteNumber(uniform);
+    if (numeric !== undefined) {
+      transform.scaleX = numeric;
+      transform.scaleY = numeric;
+    }
+    return;
+  }
+  const numeric = finiteNumber(value);
+  if (numeric !== undefined) {
+    transform.scaleX = numeric;
+    transform.scaleY = numeric;
+  }
+}
+
+function normalizeTextValue(value: unknown): NonNullable<ObjectStateProperties["text"]> {
+  return typeof value === "string" ? { plainText: value } : (value as NonNullable<ObjectStateProperties["text"]>);
+}
+
+function interpolateObjectState(
+  from: ObjectStateProperties | undefined,
+  to: ObjectStateProperties | undefined,
+  progress: number,
+  properties: MorphProperty[] | undefined
+): ObjectStateProperties {
+  const result = mergeObjectStateProperties({}, to || {});
+  const allowed = new Set<string>(properties && properties.length ? properties : ["bounds", "transform", "opacity", "fill", "stroke"]);
+  if (allowed.has("all") || allowed.has("bounds")) {
+    result.bounds = { ...(to?.bounds || { x: 0, y: 0, width: 0, height: 0 }) };
+    for (const key of ["x", "y", "width", "height"] as const) {
+      result.bounds[key] = interpolateValue(from?.bounds?.[key], to?.bounds?.[key], progress) as number;
+    }
+  }
+  if (allowed.has("all") || allowed.has("transform")) {
+    result.transform = { ...(to?.transform || {}) };
+    for (const key of ["translateX", "translateY", "scaleX", "scaleY", "rotateDeg", "skewXDeg", "skewYDeg"] as const) {
+      const fallback = key === "scaleX" || key === "scaleY" ? 1 : 0;
+      result.transform[key] = interpolateValue(from?.transform?.[key] ?? fallback, to?.transform?.[key] ?? fallback, progress) as number;
+    }
+  }
+  if (allowed.has("all") || allowed.has("opacity")) result.opacity = interpolateValue(from?.opacity ?? 1, to?.opacity ?? 1, progress) as number;
+  if (allowed.has("all") || allowed.has("fill")) {
+    result.style = { ...(result.style || {}) };
+    result.style.fill = progress < 1 ? from?.style?.fill || to?.style?.fill : to?.style?.fill;
+  }
+  if (allowed.has("all") || allowed.has("stroke")) {
+    result.style = { ...(result.style || {}) };
+    result.style.stroke = progress < 1 ? from?.style?.stroke || to?.style?.stroke : to?.style?.stroke;
+  }
+  result.visible = progress < 1 ? from?.visible ?? true : to?.visible ?? true;
+  return result;
+}
+
+function interpolateValue(from: unknown, to: unknown, progress: number, mode?: string): unknown {
+  const p = clamp(progress, 0, 1);
+  if (mode === "color") return interpolateColorValue(from, to, p);
+  if (mode === "discrete" || typeof from === "boolean" || typeof to === "boolean" || typeof from === "string" || typeof to === "string") {
+    return p < 1 ? from : to;
+  }
+  if (isFiniteNumber(from) && isFiniteNumber(to)) return from + (to - from) * p;
+  return p < 1 ? from : to;
+}
+
+function interpolateColorValue(from: unknown, to: unknown, progress: number): unknown {
+  const parse = (value: unknown) => {
+    const css = colorToCss(value);
+    const match = typeof css === "string" ? css.match(/^#([0-9a-f]{6})$/i) : null;
+    if (!match?.[1]) return undefined;
+    return [
+      parseInt(match[1].slice(0, 2), 16),
+      parseInt(match[1].slice(2, 4), 16),
+      parseInt(match[1].slice(4, 6), 16)
+    ] as const;
+  };
+  const a = parse(from);
+  const b = parse(to);
+  if (!a || !b) return progress < 1 ? from : to;
+  const channel = (index: 0 | 1 | 2) => Math.round(a[index] + (b[index] - a[index]) * progress).toString(16).padStart(2, "0");
+  return `#${channel(0)}${channel(1)}${channel(2)}`;
+}
+
+function easeProgressValue(easing: Easing | undefined, progress: number): number {
+  const p = clamp(progress, 0, 1);
+  if (easing === "easeIn" || easing === "easeInCubic") return p * p * p;
+  if (easing === "easeOut" || easing === "easeOutCubic") return 1 - Math.pow(1 - p, 3);
+  if (easing === "easeInOut" || easing === "easeInOutCubic") return p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+  return p;
+}
+
+function setNumericField(target: object, key: string, value: unknown): void {
+  const numeric = finiteNumber(value);
+  if (numeric !== undefined) (target as Record<string, unknown>)[key] = numeric;
+}
+
+function setStyleField(target: object, key: string, value: unknown): void {
+  const numericKeys = new Set(["width", "fontSize", "letterSpacing", "lineHeight"]);
+  const numeric = numericKeys.has(key) ? finiteNumber(value) : undefined;
+  (target as Record<string, unknown>)[key] = numeric ?? value;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
 function transformToCss(transform: Transform2D | undefined): string {
-  return `translate(${transform?.translateX ?? 0}px,${transform?.translateY ?? 0}px) scale(${transform?.scaleX ?? 1},${transform?.scaleY ?? 1}) rotate(${transform?.rotateDeg ?? 0}deg) skew(${transform?.skewXDeg ?? 0}deg,${transform?.skewYDeg ?? 0}deg)`;
+  const normalized = normalizeTransformPatch(transform);
+  return `translate(${normalized.translateX ?? 0}px,${normalized.translateY ?? 0}px) scale(${normalized.scaleX ?? 1},${normalized.scaleY ?? 1}) rotate(${normalized.rotateDeg ?? 0}deg) skew(${normalized.skewXDeg ?? 0}deg,${normalized.skewYDeg ?? 0}deg)`;
 }
 
 function firstTextStyle(object: TextObject | ShapeObject, state?: ObjectStateProperties) {
@@ -1047,19 +1649,26 @@ export function keyframeEventToCssFrames(event: KeyframeAnimationEvent): Record<
 }
 
 function transformTrackValue(track: KeyframeTrack, value: unknown): Partial<Record<keyof Transform2D, number>> | undefined {
-  if (!track.property.startsWith("transform.")) return undefined;
-  const key = track.property.slice("transform.".length) as keyof Transform2D;
-  return { [key]: Number(value) };
+  const property = normalizeRuntimeProperty(track.property);
+  if (property === "transform.scale") {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? { scaleX: numeric, scaleY: numeric } : undefined;
+  }
+  if (!property.startsWith("transform.")) return undefined;
+  const key = property.slice("transform.".length) as keyof Transform2D;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? { [key]: numeric } : undefined;
 }
 
 function propertyValueToCss(property: string, value: unknown): Record<string, string> {
-  if (property === "opacity") return { opacity: String(value) };
-  if (property === "visible") return { visibility: value ? "visible" : "hidden" };
-  if (property === "bounds.x") return { left: `${value}px` };
-  if (property === "bounds.y") return { top: `${value}px` };
-  if (property === "bounds.width") return { width: `${value}px` };
-  if (property === "bounds.height") return { height: `${value}px` };
-  if (property === "style.fill") return { background: fillToCss(value as Fill) ?? String(value) };
+  const normalized = normalizeRuntimeProperty(property);
+  if (normalized === "opacity") return { opacity: String(value) };
+  if (normalized === "visible") return { visibility: value ? "visible" : "hidden" };
+  if (normalized === "bounds.x") return { left: `${value}px` };
+  if (normalized === "bounds.y") return { top: `${value}px` };
+  if (normalized === "bounds.width") return { width: `${value}px` };
+  if (normalized === "bounds.height") return { height: `${value}px` };
+  if (normalized === "style.fill") return { background: fillToCss(value as Fill) ?? String(value) };
   return {};
 }
 

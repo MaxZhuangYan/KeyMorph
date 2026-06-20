@@ -15,7 +15,8 @@
     "ir:to-key": "node --experimental-transform-types src/cli.ts ir-to-key",
     "ir:to-html": "node --experimental-transform-types src/cli.ts ir-to-html",
     "ir:to-video": "node --experimental-transform-types src/cli.ts ir-to-video",
-    "ir:report": "node --experimental-transform-types src/cli.ts ir-report"
+    "ir:report": "node --experimental-transform-types src/cli.ts ir-report",
+    "png:fidelity": "node --experimental-transform-types src/cli.ts png-fidelity"
   },
   "engines": {
     "node": ">=24"

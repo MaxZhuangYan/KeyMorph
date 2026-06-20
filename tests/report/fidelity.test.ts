@@ -1,0 +1,66 @@
+import { describe, test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+import { compareRgbaImages, decodePng, encodePng, type RgbaImage } from "../../src/report/fidelity.ts";
+
+const execFileAsync = promisify(execFile);
+
+describe("pixel fidelity scoring", () => {
+  test("scores identical images as perfect fidelity", () => {
+    const reference = image(2, 2, [255, 255, 255, 255, 0, 0, 0, 255, 10, 20, 30, 255, 90, 80, 70, 255]);
+    const result = compareRgbaImages(reference, reference);
+
+    assert.equal(result.pixelFidelityScore, 1);
+    assert.equal(result.mismatchedPixels, 0);
+    assert.equal(result.dimensionsMatch, true);
+  });
+
+  test("reports mismatch ratio and error for changed pixels", () => {
+    const reference = image(2, 1, [255, 255, 255, 255, 0, 0, 0, 255]);
+    const actual = image(2, 1, [255, 255, 255, 255, 255, 0, 0, 255]);
+    const result = compareRgbaImages(reference, actual, { threshold: 0.01 });
+
+    assert.equal(result.totalPixels, 2);
+    assert.equal(result.mismatchedPixels, 1);
+    assert.equal(result.mismatchRatio, 0.5);
+    assert.ok(result.pixelFidelityScore < 1);
+    assert.ok(result.meanAbsoluteError > 0);
+  });
+
+  test("encodes and decodes RGBA PNG images for file-based comparisons", () => {
+    const source = image(2, 1, [12, 34, 56, 255, 200, 180, 160, 128]);
+    const decoded = decodePng(encodePng(source));
+
+    assert.equal(decoded.width, source.width);
+    assert.equal(decoded.height, source.height);
+    assert.deepEqual(Array.from(decoded.data), Array.from(source.data));
+    assert.equal(compareRgbaImages(source, decoded).pixelFidelityScore, 1);
+  });
+
+  test("writes a PNG fidelity report through the CLI", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-fidelity-cli-"));
+    const referencePath = path.join(dir, "reference.png");
+    const actualPath = path.join(dir, "actual.png");
+    const reportPath = path.join(dir, "fidelity.json");
+
+    await writeFile(referencePath, encodePng(image(1, 1, [255, 255, 255, 255])));
+    await writeFile(actualPath, encodePng(image(1, 1, [0, 0, 0, 255])));
+    await execFileAsync(process.execPath, ["--experimental-transform-types", "src/cli.ts", "png-fidelity", referencePath, actualPath, reportPath], {
+      cwd: path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..")
+    });
+
+    const report = JSON.parse(await readFile(reportPath, "utf8"));
+    assert.equal(report.totalPixels, 1);
+    assert.equal(report.mismatchedPixels, 1);
+    assert.ok(report.pixelFidelityScore < 1);
+  });
+});
+
+function image(width: number, height: number, data: number[]): RgbaImage {
+  return { width, height, data: new Uint8Array(data) };
+}

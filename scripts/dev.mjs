@@ -47,6 +47,12 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    const keynoteMatch = /^\/api\/jobs\/([a-f0-9-]+)\/keynote$/.exec(url.pathname);
+    if (request.method === "POST" && keynoteMatch) {
+      await handleKeynoteExport(keynoteMatch[1], response);
+      return;
+    }
+
     if (request.method === "GET" && url.pathname.startsWith("/demo/")) {
       await serveStatic(url.pathname, response);
       return;
@@ -75,13 +81,11 @@ async function handleConvert(request, response) {
   const importedIrPath = path.join(jobDir, "deck.ir.json");
   const htmlPath = path.join(jobDir, "runtime.html");
   const pptxPath = path.join(jobDir, "rebuilt.pptx");
-  const keynotePath = path.join(jobDir, "rebuilt.key");
   const reportPath = path.join(jobDir, "loss-report.json");
 
   await writeJson(importedIrPath, deck);
   await writeFile(htmlPath, renderHtmlDocument(deck), "utf8");
   await exportIrToPptx(deck, pptxPath);
-  const keyExport = await tryExportKeynote(deck, keynotePath, path.join(jobDir, "rebuilt.key-bridge.pptx"));
 
   const report = createLossReport(deck.conversion ?? { status: "success", messages: [] });
   const videoPlan = summarizeVideoPlan(createVideoExportPlan(deck));
@@ -102,16 +106,34 @@ async function handleConvert(request, response) {
       previewUrl: `/demo/out/jobs/${jobId}/runtime.html`,
       videoPlan,
       videoEndpoint: `/api/jobs/${jobId}/video`,
+      keynoteEndpoint: `/api/jobs/${jobId}/keynote`,
       downloads: {
         html: `/demo/out/jobs/${jobId}/runtime.html`,
         ir: `/demo/out/jobs/${jobId}/deck.ir.json`,
         pptx: `/demo/out/jobs/${jobId}/rebuilt.pptx`,
-        key: keyExport.available ? `/demo/out/jobs/${jobId}/rebuilt.key` : null,
+        key: null,
         report: `/demo/out/jobs/${jobId}/loss-report.json`,
         video: null
       },
-      keynoteAvailable: keyExport.available,
-      keynoteMessage: keyExport.message
+      keynoteAvailable: null,
+      keynoteMessage: "Keynote export is available on demand and may ask macOS for Keynote automation permission."
+    }),
+    "application/json; charset=utf-8"
+  );
+}
+
+async function handleKeynoteExport(jobId, response) {
+  const jobDir = safeJobDir(jobId);
+  const deck = await readJson(path.join(jobDir, "deck.ir.json"));
+  const keynotePath = path.join(jobDir, "rebuilt.key");
+  const result = await tryExportKeynote(deck, keynotePath, path.join(jobDir, "rebuilt.key-bridge.pptx"));
+  send(
+    response,
+    result.available ? 200 : 424,
+    JSON.stringify({
+      status: result.available ? "ready" : "dependency-missing",
+      keyUrl: result.available ? `/demo/out/jobs/${jobId}/rebuilt.key` : null,
+      message: result.message
     }),
     "application/json; charset=utf-8"
   );
@@ -192,7 +214,7 @@ async function inputToIr(sourcePath, fileName, data) {
   if (lowerName.endsWith(".key")) {
     return parseKeynoteToIr(sourcePath, { workDir: path.dirname(sourcePath) });
   }
-  throw new Error("Unsupported file type. Drop a .pptx or .ir.json file.");
+  throw new Error("Unsupported file type. Drop a .pptx, .key, or .ir.json file.");
 }
 
 async function tryExportKeynote(deck, keynotePath, intermediatePptxPath) {
@@ -400,22 +422,43 @@ function renderAppHtml() {
         recommendationsEl.hidden = true;
       }
       downloadsEl.hidden = false;
-      const keyLink = result.downloads.key ? '<a class="download" href="' + result.downloads.key + '">Download Keynote</a>' : '';
       downloadsEl.innerHTML =
         '<a class="download" href="' + result.downloads.html + '" target="_blank">Download HTML Runtime</a>' +
         '<a class="download" href="' + result.downloads.pptx + '">Download PPTX</a>' +
-        keyLink +
+        '<button id="exportKeynote" type="button">Export Keynote</button>' +
         '<a class="download" href="' + result.downloads.ir + '">Download IR</a>' +
         '<a class="download" href="' + result.downloads.report + '">Download report</a>' +
-        '<button id="renderVideo" class="primary" type="button">Render MP4</button><div id="videoStatus" class="status" hidden></div>';
-      if (!result.keynoteAvailable && result.keynoteMessage) {
-        downloadsEl.innerHTML += '<div class="status warn">' + escapeHtml(result.keynoteMessage) + '</div>';
-      }
+        '<button id="renderVideo" class="primary" type="button">Render MP4</button><div id="keynoteStatus" class="status warn">' + escapeHtml(result.keynoteMessage || '') + '</div><div id="videoStatus" class="status" hidden></div>';
+      document.getElementById('exportKeynote')?.addEventListener('click', () => exportKeynote(result));
       document.getElementById('renderVideo')?.addEventListener('click', () => renderVideo(result));
       previewPane.className = '';
       previewPane.innerHTML = '<iframe title="KeyMorph runtime preview" src="' + result.previewUrl + '"></iframe>';
       previewTitle.textContent = result.sourceName;
       openPreview.href = result.previewUrl;
+    }
+
+    async function exportKeynote(result) {
+      const button = document.getElementById('exportKeynote');
+      const keynoteStatus = document.getElementById('keynoteStatus');
+      button.disabled = true;
+      keynoteStatus.className = 'status';
+      keynoteStatus.textContent = 'Exporting Keynote via local Keynote automation...';
+      try {
+        const response = await fetch(result.keynoteEndpoint, { method: 'POST' });
+        const payload = await response.json();
+        if (!response.ok) {
+          keynoteStatus.className = 'status warn';
+          keynoteStatus.textContent = payload.message || 'Keynote export is unavailable.';
+          return;
+        }
+        keynoteStatus.className = 'status';
+        keynoteStatus.innerHTML = 'Keynote ready. <a class="download" href="' + payload.keyUrl + '">Download Keynote</a>';
+      } catch (error) {
+        keynoteStatus.className = 'status error';
+        keynoteStatus.textContent = error instanceof Error ? error.message : String(error);
+      } finally {
+        button.disabled = false;
+      }
     }
 
     async function renderVideo(result) {

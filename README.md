@@ -28,6 +28,7 @@ npm test
 npm run dev
 npm run demo
 npm run ir:report -- demo/out/imported.ir.json demo/out/conversion-report.json
+npm run png:fidelity -- reference.png actual.png fidelity-report.json
 ```
 
 `npm run demo` generates a local round-trip under `demo/out`: source IR, original PPTX, imported IR, HTML runtime, rebuilt PPTX, and conversion report.
@@ -39,6 +40,7 @@ On macOS with Keynote installed, `.key` input and `.key` export are handled thro
 - PPTX animation XML: imports and exports fade effects, visibility set events, and simple motion paths as IR timeline events. Unsupported timing nodes are recorded in the report.
 - HTML runtime: plays a deck-level timeline with global scrubbing, slide stepping, basic keyframes, visibility/property events, and best-effort transitions/morph-style numeric interpolation.
 - Video export: renders the HTML runtime through Playwright and encodes with `ffmpeg` when both are available. Missing local dependencies are reported in the UI instead of failing silently.
+- Pixel fidelity: compares rendered PNG frames against reference frames and reports mismatch ratio, error metrics, and a pixel fidelity score.
 
 This checkpoint intentionally has no external npm runtime dependencies. It uses Node 24's built-in TypeScript transform.
 

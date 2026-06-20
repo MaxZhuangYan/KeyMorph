@@ -1,8 +1,9 @@
+import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { inflateRawSync } from "node:zlib";
 
-import { IR_VERSION, type DeckIR, type IRObject, type JSONRecord, type Slide } from "../ir/index.ts";
+import { IR_VERSION, type Asset, type DeckIR, type IRObject, type JSONRecord, type Slide } from "../ir/index.ts";
 
 const DEFAULT_DECK_SIZE = { width: 1280, height: 720 };
 const MAX_TEXT_CANDIDATES_PER_STREAM = 80;
@@ -16,6 +17,7 @@ export interface NativeKeynoteDetection {
   iwaPaths: string[];
   metadataPaths: string[];
   assetPaths: string[];
+  iwaStreams?: NativeIwaStreamMetadata[];
 }
 
 interface KeynotePackage {
@@ -25,10 +27,50 @@ interface KeynotePackage {
 
 interface NativeKeynoteParts {
   hasIndexZip: boolean;
+  entries: Map<string, Uint8Array>;
   iwaEntries: Array<{ path: string; data: Uint8Array }>;
   metadataPaths: string[];
   assetPaths: string[];
   indexZipEntryCount: number;
+}
+
+export interface NativeIwaStreamMetadata {
+  path: string;
+  role: NativeIwaStreamRole;
+  compression: NativeIwaCompression[];
+  byteLength: number;
+  expandedByteLength: number;
+  textCandidateCount: number;
+  assetReferenceCount: number;
+}
+
+export type NativeIwaStreamRole = "slide" | "document" | "theme" | "master" | "layout" | "style" | "unknown";
+export type NativeIwaCompression = "none" | "snappy-framed" | "snappy-block" | "length-prefixed-snappy";
+
+interface NativeAssetReference {
+  assetId: string;
+  path: string;
+  name: string;
+  kind: Asset["kind"];
+  mimeType?: string;
+}
+
+interface NativeAssetCatalog {
+  assets: Asset[];
+  byPath: Map<string, NativeAssetReference>;
+  byName: Map<string, NativeAssetReference[]>;
+  byStem: Map<string, NativeAssetReference[]>;
+}
+
+interface NativeAssetMatch {
+  asset: NativeAssetReference;
+  evidence: string;
+  confidence: number;
+}
+
+interface ExpandedIwaPayload {
+  data: Uint8Array;
+  compression: NativeIwaCompression;
 }
 
 interface NativeMetadata {
@@ -43,13 +85,15 @@ interface NativeMetadata {
 export async function detectNativeKeynotePackage(keynotePath: string): Promise<NativeKeynoteDetection> {
   const keynotePackage = await readKeynotePackage(keynotePath);
   const parts = readNativeKeynoteParts(keynotePackage.entries);
+  const assets = createNativeAssetCatalog(parts.assetPaths, parts.entries);
   return {
     isNative: parts.hasIndexZip || parts.iwaEntries.length > 0,
     container: keynotePackage.container,
     hasIndexZip: parts.hasIndexZip,
     iwaPaths: parts.iwaEntries.map((entry) => entry.path),
     metadataPaths: parts.metadataPaths,
-    assetPaths: parts.assetPaths
+    assetPaths: parts.assetPaths,
+    iwaStreams: classifyIwaStreams(parts.iwaEntries, assets)
   };
 }
 
@@ -62,9 +106,94 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
 
   const metadata = readNativeMetadata(keynotePackage.entries);
   const deckSize = metadata.size ?? DEFAULT_DECK_SIZE;
+  const assets = createNativeAssetCatalog(parts.assetPaths, parts.entries);
+  const iwaStreams = classifyIwaStreams(parts.iwaEntries, assets);
   const slideEntries = chooseSlideIwaEntries(parts.iwaEntries);
-  const slides = buildNativeSlides(slideEntries, parts.iwaEntries, deckSize);
+  const slides = buildNativeSlides(slideEntries, parts.iwaEntries, deckSize, assets);
   const objectCount = slides.reduce((total, slide) => total + slide.objects.length, 0);
+  const recoveredTextObjectCount = slides.reduce(
+    (total, slide) => total + slide.objects.filter((object) => object.type === "text").length,
+    0
+  );
+  const recoveredAssetObjectCount = slides.reduce(
+    (total, slide) => total + slide.objects.filter((object) => object.type === "image" || object.type === "media").length,
+    0
+  );
+  const unrecoveredAssetCount = Math.max(0, assets.assets.length - countUniqueReferencedAssets(slides));
+  const hasDetectedAssets = assets.assets.length > 0;
+  const unsupportedFeatures = [
+    {
+      code: "keynote-native-layout-schema",
+      severity: "warning" as const,
+      area: "layout" as const,
+      description:
+        "Modern Keynote stores slide layout in private IWA protobuf schemas. The native parser only classifies streams and creates approximate text and asset objects from visible payload hints.",
+      fallback: "Create approximate text or asset placeholders and preserve source paths in metadata."
+    },
+    {
+      code: "keynote-native-animation-schema",
+      severity: "warning" as const,
+      area: "animation" as const,
+      description: "Keynote builds, transitions, Magic Move, and timing data are not mapped by the native fallback.",
+      fallback: "Use the Keynote PPTX bridge for the best available animation downgrade path."
+    },
+    ...(hasDetectedAssets
+      ? [
+          {
+            code: "keynote-native-asset-layout-loss",
+            severity: "warning" as const,
+            area: "layout" as const,
+            description:
+              "Image and media files were detected in the Keynote package, but their exact slide geometry, crop, stacking, and styling are not recoverable from the private IWA layout schema.",
+            fallback: "Create approximate asset objects only when slide streams contain matching asset references; preserve remaining assets in deck.assets."
+          }
+        ]
+      : [])
+  ];
+  const degradedFeatures = [
+    {
+      code: "keynote-native-text-recovery",
+      severity: "warning" as const,
+      area: "text" as const,
+      description:
+        recoveredTextObjectCount > 0
+          ? "Text-like strings were recovered from IWA payloads and placed in approximate reading-order boxes."
+          : "No slide text was recovered from the visible IWA payloads.",
+      fallback: "Use Keynote's PPTX export bridge when visual text placement is required."
+    },
+    ...(recoveredAssetObjectCount > 0
+      ? [
+          {
+            code: "keynote-native-asset-reference-recovery",
+            severity: "warning" as const,
+            area: "asset" as const,
+            description:
+              "Some package asset references were matched from slide IWA string payloads and inserted as approximate image/media objects.",
+            fallback: "Inspect the source Keynote deck or bridge through PPTX for exact placement."
+          }
+        ]
+      : [])
+  ];
+  const uncertainMappings = [
+    {
+      code: "keynote-iwa-protobuf-string-scan",
+      severity: "warning" as const,
+      description:
+        "Text and asset references are inferred from protobuf length-delimited UTF-8 strings and raw string scans, not from public Keynote object schemas.",
+      confidence: 0.38
+    },
+    ...(recoveredAssetObjectCount > 0
+      ? [
+          {
+            code: "keynote-native-asset-reference-scan",
+            severity: "warning" as const,
+            description:
+              "Asset-to-slide associations are based on matching Data/ asset filenames found in IWA payload strings; this does not prove exact placement or usage.",
+            confidence: 0.46
+          }
+        ]
+      : [])
+  ];
   const deckTitle = metadata.title ?? (path.basename(keynotePath, path.extname(keynotePath)) || "Imported Keynote");
 
   return {
@@ -79,13 +208,15 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         ...metadata.values,
         nativeContainer: keynotePackage.container,
         nativeIndexZip: parts.hasIndexZip,
-        nativeIwaStreamCount: parts.iwaEntries.length
+        nativeIwaStreamCount: parts.iwaEntries.length,
+        nativeAssetCount: assets.assets.length
       }
     },
     deck: {
       id: "keynote-native-import",
       title: deckTitle,
       size: { width: deckSize.width, height: deckSize.height, unit: "px" },
+      ...(assets.assets.length > 0 ? { assets: assets.assets } : {}),
       slides
     },
     conversion: {
@@ -99,58 +230,60 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
           code: "keynote-native-static-probe",
           message:
             "Parsed a native Keynote package directly by inspecting Index.zip/Index/*.iwa streams; layout and animation fidelity are not available without Keynote."
-        }
-      ],
-      unsupportedFeatures: [
-        {
-          code: "keynote-native-layout-schema",
-          severity: "warning",
-          area: "layout",
-          description:
-            "Modern Keynote stores slide layout in private IWA protobuf schemas. The native parser only infers slide streams and text-like payloads.",
-          fallback: "Create approximate text objects or placeholders and preserve source paths in metadata."
         },
         {
-          code: "keynote-native-animation-schema",
-          severity: "warning",
-          area: "animation",
-          description: "Keynote builds, transitions, Magic Move, and timing data are not mapped by the native fallback.",
-          fallback: "Use the Keynote PPTX bridge for the best available animation downgrade path."
-        }
-      ],
-      degradedFeatures: [
+          severity: recoveredTextObjectCount > 0 ? "info" : "warning",
+          code: recoveredTextObjectCount > 0 ? "keynote-native-text-recovered" : "keynote-native-text-not-recovered",
+          message:
+            recoveredTextObjectCount > 0
+              ? `Recovered ${recoveredTextObjectCount} text object(s) from visible IWA string payloads.`
+              : "No native text objects were recovered from visible IWA string payloads."
+        },
         {
-          code: "keynote-native-text-positioning",
-          severity: "warning",
-          area: "text",
-          description: "Text recovered from IWA payloads is placed in approximate reading-order boxes.",
-          fallback: "Use Keynote's PPTX export bridge when visual placement is required."
+          severity: hasDetectedAssets ? (recoveredAssetObjectCount > 0 ? "info" : "warning") : "info",
+          code: hasDetectedAssets
+            ? recoveredAssetObjectCount > 0
+              ? "keynote-native-assets-referenced"
+              : "keynote-native-assets-unplaced"
+            : "keynote-native-no-assets",
+          message: hasDetectedAssets
+            ? recoveredAssetObjectCount > 0
+              ? `Detected ${assets.assets.length} package asset(s) and matched ${recoveredAssetObjectCount} approximate slide object(s).`
+              : `Detected ${assets.assets.length} package asset(s), but no slide stream references were matched for placement.`
+            : "No package image or media assets were detected under Data/."
         }
       ],
-      uncertainMappings: [
-        {
-          code: "keynote-iwa-protobuf-string-scan",
-          severity: "warning",
-          description:
-            "Text objects are inferred from protobuf length-delimited UTF-8 strings and raw string scans, not from public Keynote object schemas.",
-          confidence: 0.38
-        }
-      ],
+      unsupportedFeatures,
+      degradedFeatures,
+      uncertainMappings,
       statistics: {
         slideCount: slides.length,
         objectCount,
         animationCount: 0,
-        assetCount: parts.assetPaths.length,
-        unsupportedFeatureCount: 2,
-        degradedFeatureCount: 1,
-        uncertainMappingCount: 1
+        assetCount: assets.assets.length,
+        unsupportedFeatureCount: unsupportedFeatures.length,
+        degradedFeatureCount: degradedFeatures.length,
+        uncertainMappingCount: uncertainMappings.length
       },
       metadata: {
         container: keynotePackage.container,
         hasIndexZip: parts.hasIndexZip,
         indexZipEntryCount: parts.indexZipEntryCount,
         iwaPathCount: parts.iwaEntries.length,
-        metadataPathCount: parts.metadataPaths.length
+        metadataPathCount: parts.metadataPaths.length,
+        assetPathCount: parts.assetPaths.length,
+        recoveredTextObjectCount,
+        recoveredAssetObjectCount,
+        unrecoveredAssetCount,
+        iwaStreams: iwaStreams.map((stream) => ({
+          path: stream.path,
+          role: stream.role,
+          compression: stream.compression,
+          byteLength: stream.byteLength,
+          expandedByteLength: stream.expandedByteLength,
+          textCandidateCount: stream.textCandidateCount,
+          assetReferenceCount: stream.assetReferenceCount
+        }))
       }
     }
   };
@@ -221,6 +354,7 @@ function readNativeKeynoteParts(entries: Map<string, Uint8Array>): NativeKeynote
   const allPaths = Array.from(combinedEntries.keys()).sort(comparePartPaths);
   return {
     hasIndexZip,
+    entries: combinedEntries,
     iwaEntries: allPaths
       .filter((entryPath) => entryPath.toLowerCase().endsWith(".iwa"))
       .map((entryPath) => ({ path: entryPath, data: combinedEntries.get(entryPath)! })),
@@ -228,6 +362,80 @@ function readNativeKeynoteParts(entries: Map<string, Uint8Array>): NativeKeynote
     assetPaths: allPaths.filter((entryPath) => entryPath.startsWith("Data/")),
     indexZipEntryCount
   };
+}
+
+function createNativeAssetCatalog(assetPaths: string[], entries: Map<string, Uint8Array>): NativeAssetCatalog {
+  const assets: Asset[] = [];
+  const byPath = new Map<string, NativeAssetReference>();
+  const byName = new Map<string, NativeAssetReference[]>();
+  const byStem = new Map<string, NativeAssetReference[]>();
+
+  for (const assetPath of assetPaths) {
+    const data = entries.get(assetPath);
+    const name = path.posix.basename(assetPath);
+    if (!name || !data) {
+      continue;
+    }
+
+    const classification = classifyAssetPath(assetPath);
+    const assetId = stableAssetId(assetPath);
+    const asset: Asset = {
+      id: assetId,
+      kind: classification.kind,
+      name,
+      mimeType: classification.mimeType,
+      checksum: `sha256:${sha256Hex(data)}`,
+      metadata: {
+        nativeSourcePath: assetPath,
+        byteLength: data.byteLength
+      }
+    };
+    const reference: NativeAssetReference = {
+      assetId,
+      path: assetPath,
+      name,
+      kind: asset.kind,
+      mimeType: asset.mimeType
+    };
+
+    assets.push(asset);
+    byPath.set(assetPath.toLowerCase(), reference);
+    addMultiMapValue(byName, name.toLowerCase(), reference);
+    addMultiMapValue(byStem, path.posix.basename(name, path.posix.extname(name)).toLowerCase(), reference);
+  }
+
+  assets.sort((left, right) => comparePartPaths(String(left.metadata?.nativeSourcePath ?? left.name ?? left.id), String(right.metadata?.nativeSourcePath ?? right.name ?? right.id)));
+  return { assets, byPath, byName, byStem };
+}
+
+function classifyIwaStreams(
+  iwaEntries: Array<{ path: string; data: Uint8Array }>,
+  assets: NativeAssetCatalog
+): NativeIwaStreamMetadata[] {
+  return iwaEntries.map((entry) => {
+    const payloads = expandIwaPayloads(entry.data);
+    const compression = Array.from(new Set(payloads.map((payload) => payload.compression)));
+    return {
+      path: entry.path,
+      role: classifyIwaRole(entry.path),
+      compression,
+      byteLength: entry.data.byteLength,
+      expandedByteLength: payloads.reduce((max, payload) => Math.max(max, payload.data.byteLength), entry.data.byteLength),
+      textCandidateCount: extractIwaTextCandidates(entry.data).length,
+      assetReferenceCount: findIwaAssetMatches(entry.data, assets).length
+    };
+  });
+}
+
+function classifyIwaRole(entryPath: string): NativeIwaStreamRole {
+  const baseName = path.posix.basename(entryPath).toLowerCase();
+  if (isSlideIwaPath(entryPath)) return "slide";
+  if (/(^|[-_.])document[-_.]?/.test(baseName) || baseName === "document.iwa") return "document";
+  if (/master/.test(baseName)) return "master";
+  if (/layout/.test(baseName)) return "layout";
+  if (/theme/.test(baseName)) return "theme";
+  if (/style/.test(baseName)) return "style";
+  return "unknown";
 }
 
 function readNativeMetadata(entries: Map<string, Uint8Array>): NativeMetadata {
@@ -259,7 +467,8 @@ function readNativeMetadata(entries: Map<string, Uint8Array>): NativeMetadata {
 function buildNativeSlides(
   slideEntries: Array<{ path: string; data: Uint8Array }>,
   allIwaEntries: Array<{ path: string; data: Uint8Array }>,
-  deckSize: { width: number; height: number }
+  deckSize: { width: number; height: number },
+  assets: NativeAssetCatalog
 ): Slide[] {
   const entries = slideEntries.length > 0 ? slideEntries : chooseFallbackIwaEntries(allIwaEntries);
   if (entries.length === 0) {
@@ -269,9 +478,14 @@ function buildNativeSlides(
   const slides = entries.map((entry, index) => {
     const slideId = `slide-${index + 1}`;
     const textCandidates = extractIwaTextCandidates(entry.data).slice(0, MAX_TEXT_OBJECTS_PER_SLIDE);
+    const assetMatches = findIwaAssetMatches(entry.data, assets);
+    const textObjects = textCandidates.map((text, objectIndex) => createTextObject(slideId, text, objectIndex, entry.path, deckSize));
+    const assetObjects = assetMatches.map((match, assetIndex) =>
+      createAssetObject(slideId, match, textObjects.length + assetIndex, entry.path, deckSize)
+    );
     const objects =
-      textCandidates.length > 0
-        ? textCandidates.map((text, objectIndex) => createTextObject(slideId, text, objectIndex, entry.path, deckSize))
+      textObjects.length > 0 || assetObjects.length > 0
+        ? [...textObjects, ...assetObjects]
         : [createPlaceholderObject(slideId, entry.path, deckSize)];
 
     return {
@@ -284,6 +498,7 @@ function buildNativeSlides(
       metadata: {
         nativeSourcePath: entry.path,
         nativeTextCandidateCount: textCandidates.length,
+        nativeAssetReferenceCount: assetMatches.length,
         nativeParser: "iwa-protobuf-string-scan"
       }
     };
@@ -393,18 +608,96 @@ function createPlaceholderObject(
   };
 }
 
+function createAssetObject(
+  slideId: string,
+  match: NativeAssetMatch,
+  objectIndex: number,
+  sourcePath: string,
+  deckSize: { width: number; height: number }
+): IRObject {
+  const asset = match.asset;
+  const marginX = Math.round(deckSize.width * 0.075);
+  const width = Math.round(deckSize.width * 0.38);
+  const height = Math.round(deckSize.height * 0.38);
+  const column = objectIndex % 2;
+  const row = Math.floor(objectIndex / 2);
+  const bounds = {
+    x: marginX + column * Math.round(deckSize.width * 0.42),
+    y: Math.round(deckSize.height * 0.48) + row * Math.round(deckSize.height * 0.12),
+    width,
+    height
+  };
+  const metadata = {
+    nativeSourcePath: sourcePath,
+    nativeAssetPath: asset.path,
+    nativeAssetEvidence: match.evidence,
+    nativeAssetMatchConfidence: match.confidence,
+    nativeExtraction: "asset-filename-string-scan"
+  };
+
+  if (asset.kind === "image") {
+    return {
+      id: `${slideId}-asset-${objectIndex + 1}`,
+      type: "image",
+      name: asset.name,
+      bounds,
+      opacity: 1,
+      source: {
+        assetId: asset.assetId,
+        metadata: {
+          nativeAssetPath: asset.path,
+          mimeType: asset.mimeType
+        }
+      },
+      metadata
+    };
+  }
+
+  if (asset.kind === "video" || asset.kind === "audio") {
+    return {
+      id: `${slideId}-asset-${objectIndex + 1}`,
+      type: "media",
+      name: asset.name,
+      bounds,
+      opacity: 1,
+      mediaType: asset.kind,
+      source: {
+        assetId: asset.assetId,
+        metadata: {
+          nativeAssetPath: asset.path,
+          mimeType: asset.mimeType
+        }
+      },
+      metadata
+    };
+  }
+
+  return {
+    id: `${slideId}-asset-${objectIndex + 1}`,
+    type: "placeholder",
+    name: asset.name,
+    placeholderType: "custom",
+    bounds,
+    opacity: 1,
+    metadata: {
+      ...metadata,
+      reason: `Native package asset kind "${asset.kind}" cannot be represented as a direct IR image/media object.`
+    }
+  };
+}
+
 function extractIwaTextCandidates(data: Uint8Array): string[] {
   const candidates = new Set<string>();
   const payloads = expandIwaPayloads(data);
 
   for (const payload of payloads) {
-    for (const text of extractProtobufStrings(payload)) {
+    for (const text of extractProtobufStrings(payload.data)) {
       addTextCandidate(candidates, text);
       if (candidates.size >= MAX_TEXT_CANDIDATES_PER_STREAM) {
         return Array.from(candidates);
       }
     }
-    for (const text of extractRawStrings(payload)) {
+    for (const text of extractRawStrings(payload.data)) {
       addTextCandidate(candidates, text);
       if (candidates.size >= MAX_TEXT_CANDIDATES_PER_STREAM) {
         return Array.from(candidates);
@@ -415,6 +708,118 @@ function extractIwaTextCandidates(data: Uint8Array): string[] {
   return Array.from(candidates);
 }
 
+function findIwaAssetMatches(data: Uint8Array, assets: NativeAssetCatalog): NativeAssetMatch[] {
+  if (assets.assets.length === 0) {
+    return [];
+  }
+
+  const strings = new Set<string>();
+  for (const payload of expandIwaPayloads(data)) {
+    for (const value of extractReferenceStrings(payload.data)) strings.add(value);
+  }
+
+  const matches = new Map<string, NativeAssetMatch>();
+  for (const value of strings) {
+    for (const match of matchAssetReference(value, assets)) {
+      const existing = matches.get(match.asset.assetId);
+      if (!existing || match.confidence > existing.confidence) {
+        matches.set(match.asset.assetId, match);
+      }
+    }
+  }
+
+  return Array.from(matches.values()).sort((left, right) => comparePartPaths(left.asset.path, right.asset.path));
+}
+
+function extractReferenceStrings(data: Uint8Array): string[] {
+  const strings = new Set<string>();
+  for (let offset = 0; offset < data.length; offset += 1) {
+    const key = readVarint(data, offset);
+    if (!key) {
+      continue;
+    }
+    const wireType = key.value & 0x07;
+    const fieldNumber = key.value >>> 3;
+    if (wireType !== 2 || fieldNumber <= 0 || fieldNumber > 8191) {
+      continue;
+    }
+    const lengthInfo = readVarint(data, key.nextOffset);
+    if (!lengthInfo || lengthInfo.value <= 0 || lengthInfo.value > 4096) {
+      continue;
+    }
+    const valueStart = lengthInfo.nextOffset;
+    const valueEnd = valueStart + lengthInfo.value;
+    if (valueEnd > data.length) {
+      continue;
+    }
+    addReferenceString(strings, data.subarray(valueStart, valueEnd));
+  }
+
+  let start = -1;
+  for (let index = 0; index <= data.length; index += 1) {
+    const byte = data[index];
+    const printable = byte !== undefined && byte >= 0x20 && byte <= 0x7e;
+    if (printable) {
+      if (start < 0) start = index;
+      continue;
+    }
+    if (start >= 0 && index - start >= 4) {
+      addReferenceString(strings, data.subarray(start, index));
+    }
+    start = -1;
+  }
+
+  return Array.from(strings);
+}
+
+function addReferenceString(strings: Set<string>, bytes: Uint8Array): void {
+  const decoded = decodeUtf8(bytes);
+  if (!decoded || decoded.includes("\ufffd")) {
+    return;
+  }
+  const text = decoded.replace(/\u0000/g, "").trim();
+  if (text.length >= 4 && text.length <= 1024 && /[\w.-]+\.[a-z0-9]{2,5}/i.test(text)) {
+    strings.add(text);
+  }
+}
+
+function matchAssetReference(value: string, assets: NativeAssetCatalog): NativeAssetMatch[] {
+  const normalizedValue = normalizePartPath(value).toLowerCase();
+  const exact = assets.byPath.get(normalizedValue);
+  if (exact) {
+    return [{ asset: exact, evidence: value, confidence: 0.82 }];
+  }
+
+  const baseName = path.posix.basename(normalizedValue);
+  const nameMatches = baseName ? assets.byName.get(baseName) ?? [] : [];
+  if (nameMatches.length === 1) {
+    return [{ asset: nameMatches[0]!, evidence: value, confidence: 0.64 }];
+  }
+  if (nameMatches.length > 1) {
+    return nameMatches.map((asset) => ({ asset, evidence: value, confidence: 0.5 }));
+  }
+
+  const stem = path.posix.basename(baseName, path.posix.extname(baseName));
+  const stemMatches = stem ? assets.byStem.get(stem) ?? [] : [];
+  if (stemMatches.length === 1 && stem.length >= 5) {
+    return [{ asset: stemMatches[0]!, evidence: value, confidence: 0.42 }];
+  }
+
+  return [];
+}
+
+function countUniqueReferencedAssets(slides: Slide[]): number {
+  const assetIds = new Set<string>();
+  for (const slide of slides) {
+    for (const object of slide.objects) {
+      if ((object.type === "image" || object.type === "media") && object.source.assetId) {
+        assetIds.add(object.source.assetId);
+      }
+    }
+  }
+  return assetIds.size;
+}
+
 function addTextCandidate(candidates: Set<string>, text: string): void {
   const cleaned = cleanTextCandidate(text);
   if (cleaned) {
@@ -422,23 +827,23 @@ function addTextCandidate(candidates: Set<string>, text: string): void {
   }
 }
 
-function expandIwaPayloads(data: Uint8Array): Uint8Array[] {
-  const payloads: Uint8Array[] = [data];
+function expandIwaPayloads(data: Uint8Array): ExpandedIwaPayload[] {
+  const payloads: ExpandedIwaPayload[] = [{ data, compression: "none" }];
   const framed = decodeSnappyFramedStream(data);
   if (framed) {
-    payloads.push(framed);
+    payloads.push({ data: framed, compression: "snappy-framed" });
   }
 
   const rawSnappy = decodeSnappyBlock(data);
   if (rawSnappy) {
-    payloads.push(rawSnappy);
+    payloads.push({ data: rawSnappy, compression: "snappy-block" });
   }
 
   for (const decoded of decodeLengthPrefixedSnappyBlocks(data)) {
-    payloads.push(decoded);
+    payloads.push({ data: decoded, compression: "length-prefixed-snappy" });
   }
 
-  return dedupeByteArrays(payloads);
+  return dedupeExpandedPayloads(payloads);
 }
 
 function decodeSnappyFramedStream(data: Uint8Array): Uint8Array | undefined {
@@ -878,16 +1283,72 @@ function unescapeXml(value: string): string {
     .replaceAll("&amp;", "&");
 }
 
-function dedupeByteArrays(arrays: Uint8Array[]): Uint8Array[] {
+function classifyAssetPath(assetPath: string): { kind: Asset["kind"]; mimeType?: string } {
+  const extension = path.posix.extname(assetPath).toLowerCase();
+  switch (extension) {
+    case ".png":
+      return { kind: "image", mimeType: "image/png" };
+    case ".jpg":
+    case ".jpeg":
+      return { kind: "image", mimeType: "image/jpeg" };
+    case ".gif":
+      return { kind: "image", mimeType: "image/gif" };
+    case ".tif":
+    case ".tiff":
+      return { kind: "image", mimeType: "image/tiff" };
+    case ".heic":
+      return { kind: "image", mimeType: "image/heic" };
+    case ".webp":
+      return { kind: "image", mimeType: "image/webp" };
+    case ".mp4":
+      return { kind: "video", mimeType: "video/mp4" };
+    case ".m4v":
+      return { kind: "video", mimeType: "video/x-m4v" };
+    case ".mov":
+      return { kind: "video", mimeType: "video/quicktime" };
+    case ".mp3":
+      return { kind: "audio", mimeType: "audio/mpeg" };
+    case ".m4a":
+      return { kind: "audio", mimeType: "audio/mp4" };
+    case ".wav":
+      return { kind: "audio", mimeType: "audio/wav" };
+    case ".aac":
+      return { kind: "audio", mimeType: "audio/aac" };
+    case ".pdf":
+      return { kind: "data", mimeType: "application/pdf" };
+    default:
+      return { kind: "other" };
+  }
+}
+
+function stableAssetId(assetPath: string): string {
+  return `asset-${sha256Hex(new TextEncoder().encode(assetPath)).slice(0, 16)}`;
+}
+
+function sha256Hex(data: Uint8Array): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+function addMultiMapValue<T>(map: Map<string, T[]>, key: string, value: T): void {
+  const values = map.get(key);
+  if (values) {
+    values.push(value);
+  } else {
+    map.set(key, [value]);
+  }
+}
+
+function dedupeExpandedPayloads(payloads: ExpandedIwaPayload[]): ExpandedIwaPayload[] {
   const seen = new Set<string>();
-  const deduped: Uint8Array[] = [];
-  for (const array of arrays) {
+  const deduped: ExpandedIwaPayload[] = [];
+  for (const payload of payloads) {
+    const array = payload.data;
     const key = `${array.byteLength}:${array[0] ?? 0}:${array[1] ?? 0}:${array[array.byteLength - 1] ?? 0}`;
     if (seen.has(key)) {
       continue;
     }
     seen.add(key);
-    deduped.push(array);
+    deduped.push(payload);
   }
   return deduped;
 }

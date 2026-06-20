@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { createDemoDeck } from "./demo/createDemoDeck.ts";
 import { renderHtmlDocument } from "./runtime/index.ts";
 import { createLossReport, scoreConversion } from "./report/index.ts";
+import { comparePngFiles } from "./report/fidelity.ts";
 import { exportIrToPptx, parsePptxToIr } from "./pptx/index.ts";
 import { exportIrToKeynote, parseKeynoteToIr } from "./keynote/index.ts";
 import { exportIrToVideo } from "./video/index.ts";
@@ -95,9 +96,20 @@ async function main(): Promise<void> {
       await writeJson(output, createLossReport(deck.conversion ?? { status: "success", messages: [] }));
       return;
     }
+    case "png-fidelity": {
+      if (!input || !output) throw new Error("Usage: png-fidelity <reference.png> <actual.png> [output.report.json]");
+      const report = await comparePngFiles(input, output);
+      const reportPath = process.argv[5];
+      if (reportPath) {
+        await writeJson(reportPath, report);
+      } else {
+        console.log(JSON.stringify(report, null, 2));
+      }
+      return;
+    }
     default:
       throw new Error(
-        "Usage: keymorph <demo|pptx-to-ir|key-to-ir|ir-to-html|ir-to-pptx|ir-to-key|ir-to-video|ir-report> [input] [output]"
+        "Usage: keymorph <demo|pptx-to-ir|key-to-ir|ir-to-html|ir-to-pptx|ir-to-key|ir-to-video|ir-report|png-fidelity> [input] [output]"
       );
   }
 }

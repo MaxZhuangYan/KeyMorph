@@ -9,11 +9,13 @@ import {
   type DegradedFeature,
   type IRObject,
   type Slide,
+  type TimingDependencyEdge,
   type UnsupportedFeature
 } from "../ir/index.ts";
 
 const EMU_PER_INCH = 914400;
 const WIDE_LAYOUT = { width: 13.333333, height: 7.5 };
+const OPENXML_ANGLE_UNITS_PER_DEGREE = 60000;
 
 export async function parsePptxToIr(filePath: string): Promise<DeckIR> {
   const data = await readFile(filePath);
@@ -190,7 +192,7 @@ function parseSlideXml(source: string, index: number, slideSize: { width: number
       timeline: {
         durationMs: Math.max(2500, Math.ceil(maxEventEnd)),
         events: timing.events,
-        dependencyGraph: { edges: [] }
+        dependencyGraph: { edges: timing.dependencyEdges }
       }
     },
     unsupportedFeatures: timing.unsupportedFeatures,
@@ -272,6 +274,7 @@ function readSlideBackground(source: string): string | undefined {
 
 interface TimingParseResult {
   events: AnimationEvent[];
+  dependencyEdges: TimingDependencyEdge[];
   unsupportedFeatures: UnsupportedFeature[];
   degradedFeatures: DegradedFeature[];
 }
@@ -283,7 +286,7 @@ function parseSlideTiming(
   shapeIdToObjectId: Map<string, string>
 ): TimingParseResult {
   const timingXml = extractXmlElements(source, "timing")[0];
-  const result: TimingParseResult = { events: [], unsupportedFeatures: [], degradedFeatures: [] };
+  const result: TimingParseResult = { events: [], dependencyEdges: [], unsupportedFeatures: [], degradedFeatures: [] };
   if (!timingXml) return result;
 
   for (const node of extractXmlElements(timingXml, "animEffect")) {
@@ -301,7 +304,17 @@ function parseSlideTiming(
     if (event) result.events.push(event);
   }
 
-  for (const tag of ["anim", "animClr", "animRot", "animScale", "cmd"]) {
+  for (const node of extractXmlElements(timingXml, "animScale")) {
+    const event = parseScaleEffect(node, slideIndex, result.events.length, shapeIdToObjectId, result.unsupportedFeatures);
+    if (event) result.events.push(event);
+  }
+
+  for (const node of extractXmlElements(timingXml, "animRot")) {
+    const event = parseRotationEffect(node, slideIndex, result.events.length, shapeIdToObjectId, result.unsupportedFeatures);
+    if (event) result.events.push(event);
+  }
+
+  for (const tag of ["anim", "animClr", "cmd"]) {
     for (const _node of extractXmlElements(timingXml, tag)) {
       result.unsupportedFeatures.push({
         code: `presentationml-${tag}`,
@@ -312,17 +325,6 @@ function parseSlideTiming(
         fallback: "Preserve the static object and omit this animation."
       });
     }
-  }
-
-  if (/<p:bldLst\b[\s\S]*?<p:bld[APDGr]/.test(timingXml)) {
-    result.degradedFeatures.push({
-      code: "presentationml-build-list",
-      severity: "warning",
-      area: "animation",
-      description: "PowerPoint text/object build-list sequencing is only partially represented by object-level timing events.",
-      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:bldLst`,
-      fallback: "Import supported object-level effects and preserve static slide content."
-    });
   }
 
   if (/<p:cond\b[^>]*delay="indefinite"/.test(timingXml)) {
@@ -337,6 +339,9 @@ function parseSlideTiming(
   }
 
   result.events.sort((a, b) => eventStartMs(a) - eventStartMs(b));
+  const buildList = parseBuildListSequencing(timingXml, slideIndex, shapeIdToObjectId, result.events);
+  result.degradedFeatures.push(...buildList.degradedFeatures);
+  result.dependencyEdges.push(...buildList.dependencyEdges);
   return result;
 }
 
@@ -500,6 +505,158 @@ function parseMotionEffect(
   };
 }
 
+function parseScaleEffect(
+  node: string,
+  slideIndex: number,
+  eventIndex: number,
+  shapeIdToObjectId: Map<string, string>,
+  unsupportedFeatures: UnsupportedFeature[]
+): AnimationEvent | undefined {
+  const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
+  if (!targetId) return undefined;
+
+  const attrs = readXmlAttributes(node, "animScale");
+  const scale =
+    parseScalePair(attrs.get("by")) ??
+    parseScaleFromTo(attrs.get("from"), attrs.get("to")) ??
+    parseScaleValuesFromChildNodes(node);
+  if (!scale) {
+    unsupportedFeatures.push({
+      code: "presentationml-scale-animation",
+      severity: "warning",
+      area: "animation",
+      description: "PowerPoint scale animation is not a simple by/from-to pair that can be mapped to IR scale keyframes.",
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:animScale`,
+      fallback: "Preserve the static object and omit this scale animation."
+    });
+    return undefined;
+  }
+
+  const tracks = [];
+  if (scale.fromX !== scale.toX) {
+    tracks.push({
+      property: "transform.scaleX",
+      keyframes: [
+        { offset: 0, value: scale.fromX },
+        { offset: 1, value: scale.toX }
+      ]
+    });
+  }
+  if (scale.fromY !== scale.toY) {
+    tracks.push({
+      property: "transform.scaleY",
+      keyframes: [
+        { offset: 0, value: scale.fromY },
+        { offset: 1, value: scale.toY }
+      ]
+    });
+  }
+  if (tracks.length === 0) return undefined;
+
+  return {
+    id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+    kind: "keyframes",
+    label: "Scale",
+    targetId,
+    start: { type: "absolute", atMs: readTimingDelay(node) },
+    durationMs: readTimingDuration(node, 500),
+    easing: "linear",
+    fill: "both",
+    tracks,
+    metadata: { pptxEffect: "scale" }
+  };
+}
+
+function parseRotationEffect(
+  node: string,
+  slideIndex: number,
+  eventIndex: number,
+  shapeIdToObjectId: Map<string, string>,
+  unsupportedFeatures: UnsupportedFeature[]
+): AnimationEvent | undefined {
+  const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
+  if (!targetId) return undefined;
+
+  const attrs = readXmlAttributes(node, "animRot");
+  const rotation = parseRotationValues(attrs.get("by"), attrs.get("from"), attrs.get("to")) ?? parseRotationValuesFromChildNodes(node);
+  if (!rotation || rotation.from === rotation.to) {
+    unsupportedFeatures.push({
+      code: "presentationml-rotation-animation",
+      severity: "warning",
+      area: "animation",
+      description: "PowerPoint rotation animation is not a simple by/from-to value that can be mapped to IR rotation keyframes.",
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:animRot`,
+      fallback: "Preserve the static object and omit this rotation animation."
+    });
+    return undefined;
+  }
+
+  return {
+    id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+    kind: "keyframes",
+    label: "Rotate",
+    targetId,
+    start: { type: "absolute", atMs: readTimingDelay(node) },
+    durationMs: readTimingDuration(node, 500),
+    easing: "linear",
+    fill: "both",
+    tracks: [
+      {
+        property: "transform.rotateDeg",
+        keyframes: [
+          { offset: 0, value: rotation.from },
+          { offset: 1, value: rotation.to }
+        ]
+      }
+    ],
+    metadata: { pptxEffect: "rotation" }
+  };
+}
+
+function parseBuildListSequencing(
+  timingXml: string,
+  slideIndex: number,
+  shapeIdToObjectId: Map<string, string>,
+  events: AnimationEvent[]
+): { dependencyEdges: TimingDependencyEdge[]; degradedFeatures: DegradedFeature[] } {
+  const buildListXml = extractXmlElements(timingXml, "bldLst")[0];
+  if (!buildListXml) return { dependencyEdges: [], degradedFeatures: [] };
+
+  const objectIds = Array.from(buildListXml.matchAll(/spid="([^"]+)"/g))
+    .map((match) => shapeIdToObjectId.get(match[1]))
+    .filter((targetId): targetId is string => Boolean(targetId));
+  const sequencedEvents = objectIds
+    .map((targetId) => events.find((event) => "targetId" in event && event.targetId === targetId))
+    .filter((event): event is AnimationEvent => Boolean(event));
+  const dependencyEdges: TimingDependencyEdge[] = [];
+
+  for (let index = 1; index < sequencedEvents.length; index += 1) {
+    dependencyEdges.push({
+      id: `slide-${slideIndex + 1}-build-edge-${index}`,
+      from: sequencedEvents[index - 1].id,
+      to: sequencedEvents[index].id,
+      relation: "after"
+    });
+  }
+
+  return {
+    dependencyEdges,
+    degradedFeatures: [
+      {
+        code: "presentationml-build-list",
+        severity: "warning",
+        area: "animation",
+        description:
+          dependencyEdges.length > 0
+            ? "PowerPoint build-list sequencing was reduced to simple after-dependencies between supported object timing events."
+            : "PowerPoint build-list sequencing was detected, but no supported object timing events could be associated with it.",
+        sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:bldLst`,
+        fallback: "Import supported object-level effects and preserve build order metadata where possible."
+      }
+    ]
+  };
+}
+
 function resolveTimingTarget(
   node: string,
   slideIndex: number,
@@ -603,9 +760,88 @@ function parseMotionPoint(value: string | undefined): { x: number; y: number } |
   return { x: parts[0], y: parts[1] };
 }
 
+function parseScalePair(value: string | undefined): { fromX: number; fromY: number; toX: number; toY: number } | undefined {
+  const point = parseMotionPoint(value);
+  if (!point) return undefined;
+  return {
+    fromX: 1,
+    fromY: 1,
+    toX: normalizeScaleValue(point.x),
+    toY: normalizeScaleValue(point.y)
+  };
+}
+
+function parseScaleFromTo(
+  from: string | undefined,
+  to: string | undefined
+): { fromX: number; fromY: number; toX: number; toY: number } | undefined {
+  const fromPoint = parseMotionPoint(from);
+  const toPoint = parseMotionPoint(to);
+  if (!fromPoint || !toPoint) return undefined;
+  return {
+    fromX: normalizeScaleValue(fromPoint.x),
+    fromY: normalizeScaleValue(fromPoint.y),
+    toX: normalizeScaleValue(toPoint.x),
+    toY: normalizeScaleValue(toPoint.y)
+  };
+}
+
+function parseScaleValuesFromChildNodes(node: string): { fromX: number; fromY: number; toX: number; toY: number } | undefined {
+  const from = node.match(/<p:from>[\s\S]*?<p:pt\b[^>]*x="([^"]+)"[^>]*y="([^"]+)"/);
+  const to = node.match(/<p:to>[\s\S]*?<p:pt\b[^>]*x="([^"]+)"[^>]*y="([^"]+)"/);
+  if (!from || !to) return undefined;
+  return {
+    fromX: normalizeScaleValue(Number(from[1])),
+    fromY: normalizeScaleValue(Number(from[2])),
+    toX: normalizeScaleValue(Number(to[1])),
+    toY: normalizeScaleValue(Number(to[2]))
+  };
+}
+
+function parseRotationValues(
+  by: string | undefined,
+  from: string | undefined,
+  to: string | undefined
+): { from: number; to: number } | undefined {
+  if (from !== undefined && to !== undefined) {
+    return { from: openXmlAngleToDeg(Number(from)), to: openXmlAngleToDeg(Number(to)) };
+  }
+  if (by !== undefined) {
+    return { from: 0, to: openXmlAngleToDeg(Number(by)) };
+  }
+  return undefined;
+}
+
+function parseRotationValuesFromChildNodes(node: string): { from: number; to: number } | undefined {
+  const from = node.match(/<p:from>[\s\S]*?<p:fltVal\b[^>]*val="([^"]+)"/)?.[1];
+  const to = node.match(/<p:to>[\s\S]*?<p:fltVal\b[^>]*val="([^"]+)"/)?.[1];
+  if (from === undefined || to === undefined) return undefined;
+  return { from: openXmlAngleToDeg(Number(from)), to: openXmlAngleToDeg(Number(to)) };
+}
+
 function motionCoordinateToPx(value: number, slidePixels: number): number {
   const px = Math.abs(value) <= 1.5 ? value * slidePixels : value;
   return Math.round(px * 1000) / 1000;
+}
+
+function normalizeScaleValue(value: number): number {
+  if (!Number.isFinite(value)) return 1;
+  const normalized = Math.abs(value) > 10 ? value / 100000 : value;
+  return Math.round(normalized * 10000) / 10000;
+}
+
+function formatScalePair(x: number, y: number): string {
+  return `${Math.round(x * 100000)} ${Math.round(y * 100000)}`;
+}
+
+function openXmlAngleToDeg(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  const deg = Math.abs(value) > 360 ? value / OPENXML_ANGLE_UNITS_PER_DEGREE : value;
+  return Math.round(deg * 1000) / 1000;
+}
+
+function degToOpenXmlAngle(value: number): number {
+  return Math.round(value * OPENXML_ANGLE_UNITS_PER_DEGREE);
 }
 
 function parseTimingMs(value: string | undefined, fallbackMs: number): number {
@@ -751,6 +987,18 @@ function eventToTimingNodes(
     timingNodes.push(timingWrapper(nodeIndex, motionPathXml(deck, nodeIndex, shapeId, motion, event.durationMs ?? 500, eventStartMs(event))));
   }
 
+  const scale = scaleValues(event);
+  if (scale && (scale.fromX !== scale.toX || scale.fromY !== scale.toY)) {
+    const nodeIndex = startIndex + timingNodes.length;
+    timingNodes.push(timingWrapper(nodeIndex, scaleXml(nodeIndex, shapeId, scale, event.durationMs ?? 500, eventStartMs(event))));
+  }
+
+  const rotation = rotationValues(event);
+  if (rotation && rotation.from !== rotation.to) {
+    const nodeIndex = startIndex + timingNodes.length;
+    timingNodes.push(timingWrapper(nodeIndex, rotationXml(nodeIndex, shapeId, rotation, event.durationMs ?? 500, eventStartMs(event))));
+  }
+
   return timingNodes;
 }
 
@@ -815,6 +1063,42 @@ function motionPathXml(
 </p:animMotion>`;
 }
 
+function scaleXml(
+  index: number,
+  shapeId: string,
+  scale: { fromX: number; fromY: number; toX: number; toY: number },
+  durationMs: number,
+  delayMs: number
+): string {
+  return `\
+<p:animScale from="${formatScalePair(scale.fromX, scale.fromY)}" to="${formatScalePair(scale.toX, scale.toY)}">
+  <p:cBhvr>
+    <p:cTn id="${4 + index * 3}" dur="${Math.max(1, Math.round(durationMs))}" fill="hold">
+      <p:stCondLst><p:cond delay="${Math.max(0, Math.round(delayMs))}"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="${shapeId}"/></p:tgtEl>
+  </p:cBhvr>
+</p:animScale>`;
+}
+
+function rotationXml(
+  index: number,
+  shapeId: string,
+  rotation: { from: number; to: number },
+  durationMs: number,
+  delayMs: number
+): string {
+  return `\
+<p:animRot from="${degToOpenXmlAngle(rotation.from)}" to="${degToOpenXmlAngle(rotation.to)}">
+  <p:cBhvr>
+    <p:cTn id="${4 + index * 3}" dur="${Math.max(1, Math.round(durationMs))}" fill="hold">
+      <p:stCondLst><p:cond delay="${Math.max(0, Math.round(delayMs))}"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="${shapeId}"/></p:tgtEl>
+  </p:cBhvr>
+</p:animRot>`;
+}
+
 function opacityFade(event: AnimationEvent): "in" | "out" | undefined {
   if (event.kind !== "keyframes") return undefined;
   const track = event.tracks.find((candidate) => candidate.property === "opacity");
@@ -842,6 +1126,25 @@ function motionOffsets(deck: DeckIR, slide: Slide, event: AnimationEvent): { fro
   const deltaY = toY - fromY;
   if (object?.bounds && Math.abs(deltaX) > deck.deck.size.width * 2 && Math.abs(deltaY) > deck.deck.size.height * 2) return undefined;
   return { fromX, fromY, toX, toY };
+}
+
+function scaleValues(event: AnimationEvent): { fromX: number; fromY: number; toX: number; toY: number } | undefined {
+  if (event.kind !== "keyframes") return undefined;
+  const uniform = twoPointNumericValues(event.tracks.find((track) => track.property === "transform.scale")?.keyframes);
+  const scaleX = twoPointNumericValues(event.tracks.find((track) => track.property === "transform.scaleX")?.keyframes);
+  const scaleY = twoPointNumericValues(event.tracks.find((track) => track.property === "transform.scaleY")?.keyframes);
+  if (!uniform && !scaleX && !scaleY) return undefined;
+  return {
+    fromX: scaleX?.from ?? uniform?.from ?? 1,
+    fromY: scaleY?.from ?? uniform?.from ?? 1,
+    toX: scaleX?.to ?? uniform?.to ?? 1,
+    toY: scaleY?.to ?? uniform?.to ?? 1
+  };
+}
+
+function rotationValues(event: AnimationEvent): { from: number; to: number } | undefined {
+  if (event.kind !== "keyframes") return undefined;
+  return twoPointNumericValues(event.tracks.find((track) => track.property === "transform.rotateDeg")?.keyframes);
 }
 
 function twoPointNumericValues(keyframes: { offset: number; value: unknown }[] | undefined): { from: number; to: number } | undefined {

@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -8,7 +8,7 @@ import { parsePptxToIr, exportIrToPptx } from "../pptx/index.ts";
 import { parseNativeKeynoteToIr } from "./native.ts";
 
 export { detectNativeKeynotePackage, parseNativeKeynoteToIr } from "./native.ts";
-export type { NativeKeynoteDetection } from "./native.ts";
+export type { NativeIwaCompression, NativeIwaStreamMetadata, NativeIwaStreamRole, NativeKeynoteDetection } from "./native.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -17,10 +17,13 @@ export interface KeynoteImportOptions {
   preferNative?: boolean;
   nativeFallback?: boolean;
   workDir?: string;
+  automationTimeoutMs?: number;
+  bridgeExport?: (keynotePath: string, pptxPath: string, options: KeynoteAutomationOptions) => Promise<void>;
 }
 
 export interface KeynoteExportOptions {
   intermediatePptxPath?: string;
+  automationTimeoutMs?: number;
 }
 
 export async function parseKeynoteToIr(
@@ -37,7 +40,7 @@ export async function parseKeynoteToIr(
 
   if (!options.exportedPptxPath) {
     try {
-      await exportKeynoteToPptx(keynotePath, pptxPath);
+      await (options.bridgeExport ?? exportKeynoteToPptx)(keynotePath, pptxPath, { automationTimeoutMs: options.automationTimeoutMs });
     } catch (error) {
       if (options.nativeFallback === false) {
         throw error;
@@ -87,7 +90,7 @@ export async function exportIrToKeynote(deck: DeckIR, keynotePath: string, optio
     path.join(path.dirname(keynotePath), `${path.basename(keynotePath, path.extname(keynotePath))}.pptx`);
   await mkdir(path.dirname(pptxPath), { recursive: true });
   await exportIrToPptx(deck, pptxPath);
-  await importPptxAndSaveKeynote(pptxPath, keynotePath);
+  await importPptxAndSaveKeynote(pptxPath, keynotePath, { automationTimeoutMs: options.automationTimeoutMs });
 }
 
 export interface KeynoteExportResult {
@@ -108,7 +111,12 @@ export async function exportIrToKeynoteBridge(
   };
 }
 
-export async function exportKeynoteToPptx(keynotePath: string, pptxPath: string): Promise<void> {
+export interface KeynoteAutomationOptions {
+  automationTimeoutMs?: number;
+}
+
+export async function exportKeynoteToPptx(keynotePath: string, pptxPath: string, options: KeynoteAutomationOptions = {}): Promise<void> {
+  await assertReadableFile(keynotePath, "Input Keynote file");
   await mkdir(path.dirname(pptxPath), { recursive: true });
   await runAppleScript(`
 set inputFile to POSIX file "${escapeAppleScriptString(path.resolve(keynotePath))}"
@@ -119,10 +127,11 @@ tell application "Keynote"
   export theDocument to outputFile as Microsoft PowerPoint
   close theDocument saving no
 end tell
-`);
+`, options);
 }
 
-export async function importPptxAndSaveKeynote(pptxPath: string, keynotePath: string): Promise<void> {
+export async function importPptxAndSaveKeynote(pptxPath: string, keynotePath: string, options: KeynoteAutomationOptions = {}): Promise<void> {
+  await assertReadableFile(pptxPath, "Input PPTX file");
   await mkdir(path.dirname(keynotePath), { recursive: true });
   await runAppleScript(`
 set inputFile to POSIX file "${escapeAppleScriptString(path.resolve(pptxPath))}"
@@ -133,18 +142,47 @@ tell application "Keynote"
   save theDocument in outputFile
   close theDocument saving no
 end tell
-`);
+`, options);
 }
 
-async function runAppleScript(script: string): Promise<void> {
+async function runAppleScript(script: string, options: KeynoteAutomationOptions = {}): Promise<void> {
   if (process.platform !== "darwin") {
     throw new Error("Keynote conversion requires macOS with Keynote installed.");
   }
+  const timeout = resolveAutomationTimeoutMs(options.automationTimeoutMs);
   try {
-    await execFileAsync("osascript", ["-e", script], { maxBuffer: 1024 * 1024 * 8 });
+    await execFileAsync("osascript", ["-e", script], { maxBuffer: 1024 * 1024 * 8, timeout });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Keynote automation failed. Confirm Keynote is installed and allow automation permission when macOS prompts. ${message}`);
+  }
+}
+
+function resolveAutomationTimeoutMs(optionTimeoutMs: number | undefined): number | undefined {
+  if (optionTimeoutMs !== undefined) {
+    return validateAutomationTimeout(optionTimeoutMs, "automationTimeoutMs");
+  }
+
+  const envTimeout = process.env.KEYMORPH_KEYNOTE_AUTOMATION_TIMEOUT_MS;
+  if (envTimeout === undefined || envTimeout.trim() === "") {
+    return 120000;
+  }
+
+  return validateAutomationTimeout(Number(envTimeout), "KEYMORPH_KEYNOTE_AUTOMATION_TIMEOUT_MS");
+}
+
+function validateAutomationTimeout(value: number, name: string): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a positive timeout in milliseconds.`);
+  }
+  return Math.floor(value);
+}
+
+async function assertReadableFile(filePath: string, label: string): Promise<void> {
+  try {
+    await access(filePath);
+  } catch {
+    throw new Error(`${label} does not exist: ${filePath}`);
   }
 }
 

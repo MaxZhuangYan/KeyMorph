@@ -39,7 +39,7 @@ describe("PPTX export", () => {
     const parsed = await parsePptxToIr(out);
     const events = parsed.deck.slides[0].timeline?.events ?? [];
 
-    assert.equal(parsed.conversion?.statistics?.animationCount, 3);
+    assert.equal(parsed.conversion?.statistics?.animationCount, 5);
     assert.equal(parsed.conversion?.statistics?.unsupportedFeatureCount, 0);
     assert.ok(events.some((event) => event.kind === "visibility" && event.visible === false && event.start?.type === "absolute" && event.start.atMs === 1100));
 
@@ -63,6 +63,30 @@ describe("PPTX export", () => {
       { offset: 1, value: 120 }
     ]);
     assert.deepEqual(motion.tracks.find((track) => track.property === "transform.translateY")?.keyframes, [
+      { offset: 0, value: 0 },
+      { offset: 1, value: 45 }
+    ]);
+
+    const scale = events.find(
+      (event) => event.kind === "keyframes" && event.tracks.some((track) => track.property === "transform.scaleX")
+    );
+    assert.equal(scale?.kind, "keyframes");
+    if (scale?.kind !== "keyframes") throw new Error("Expected imported scale keyframes.");
+    assert.deepEqual(scale.tracks.find((track) => track.property === "transform.scaleX")?.keyframes, [
+      { offset: 0, value: 1 },
+      { offset: 1, value: 1.25 }
+    ]);
+    assert.deepEqual(scale.tracks.find((track) => track.property === "transform.scaleY")?.keyframes, [
+      { offset: 0, value: 1 },
+      { offset: 1, value: 0.75 }
+    ]);
+
+    const rotation = events.find(
+      (event) => event.kind === "keyframes" && event.tracks.some((track) => track.property === "transform.rotateDeg")
+    );
+    assert.equal(rotation?.kind, "keyframes");
+    if (rotation?.kind !== "keyframes") throw new Error("Expected imported rotation keyframes.");
+    assert.deepEqual(rotation.tracks.find((track) => track.property === "transform.rotateDeg")?.keyframes, [
       { offset: 0, value: 0 },
       { offset: 1, value: 45 }
     ]);
@@ -154,6 +178,47 @@ function createAnimatedDeck(): DeckIR {
                   },
                   {
                     property: "transform.translateY",
+                    keyframes: [
+                      { offset: 0, value: 0 },
+                      { offset: 1, value: 45 }
+                    ]
+                  }
+                ]
+              },
+              {
+                id: "badge-scale",
+                kind: "keyframes",
+                targetId: "badge",
+                start: { type: "absolute", atMs: 950 },
+                durationMs: 400,
+                fill: "both",
+                tracks: [
+                  {
+                    property: "transform.scaleX",
+                    keyframes: [
+                      { offset: 0, value: 1 },
+                      { offset: 1, value: 1.25 }
+                    ]
+                  },
+                  {
+                    property: "transform.scaleY",
+                    keyframes: [
+                      { offset: 0, value: 1 },
+                      { offset: 1, value: 0.75 }
+                    ]
+                  }
+                ]
+              },
+              {
+                id: "badge-rotate",
+                kind: "keyframes",
+                targetId: "badge",
+                start: { type: "absolute", atMs: 1250 },
+                durationMs: 300,
+                fill: "both",
+                tracks: [
+                  {
+                    property: "transform.rotateDeg",
                     keyframes: [
                       { offset: 0, value: 0 },
                       { offset: 1, value: 45 }

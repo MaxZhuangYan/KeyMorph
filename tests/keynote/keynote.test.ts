@@ -10,9 +10,11 @@ import { validateIR } from "../../src/ir/index.ts";
 
 describe("Keynote bridge", () => {
   test("fails with a clear local automation error for missing input or unavailable Keynote", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-missing-"));
+    const missingKeyPath = path.join(dir, "missing.key");
     await assert.rejects(
-      () => exportKeynoteToPptx("/tmp/missing.key", "/tmp/missing.pptx"),
-      /Keynote automation failed|Keynote conversion requires macOS/
+      () => exportKeynoteToPptx(missingKeyPath, path.join(dir, "missing.pptx")),
+      /Input Keynote file does not exist/
     );
   });
 
@@ -37,6 +39,8 @@ describe("Keynote bridge", () => {
     assert.equal(detection.container, "directory");
     assert.equal(detection.hasIndexZip, true);
     assert.deepEqual(detection.iwaPaths, ["Index/Document.iwa", "Index/Slide-1.iwa", "Index/Slide-2.iwa"]);
+    assert.equal(detection.iwaStreams?.find((stream) => stream.path === "Index/Slide-1.iwa")?.role, "slide");
+    assert.ok(detection.iwaStreams?.find((stream) => stream.path === "Index/Slide-2.iwa")?.compression.includes("snappy-framed"));
 
     const deck = await parseNativeKeynoteToIr(keyPath);
     assert.equal(validateIR(deck).valid, true);
@@ -52,6 +56,55 @@ describe("Keynote bridge", () => {
     );
     assert.equal(deck.conversion?.status, "partial");
     assert.equal(deck.conversion?.tool, "keymorph-keynote-native-probe");
+  });
+
+  test("extracts package asset references into IR assets and approximate objects", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-assets-"));
+    const keyPath = path.join(dir, "assets.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero.png"), pngBytes());
+    await writeFile(path.join(keyPath, "Data", "clip.mov"), new Uint8Array([0, 0, 0, 20, 102, 116, 121, 112]));
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([protoString("Asset slide"), protoString("Data/hero.png"), protoString("clip.mov")])
+    );
+
+    const detection = await detectNativeKeynotePackage(keyPath);
+    assert.deepEqual(detection.assetPaths, ["Data/clip.mov", "Data/hero.png"]);
+    assert.equal(detection.iwaStreams?.[0]?.assetReferenceCount, 2);
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.assets?.length, 2);
+    assert.equal(deck.deck.assets?.find((asset) => asset.name === "hero.png")?.kind, "image");
+    assert.equal(deck.deck.assets?.find((asset) => asset.name === "clip.mov")?.kind, "video");
+    assert.equal(deck.deck.slides[0]?.objects.some((object) => object.type === "image"), true);
+    assert.equal(deck.deck.slides[0]?.objects.some((object) => object.type === "media" && object.mediaType === "video"), true);
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-assets-referenced"), true);
+    assert.equal(deck.conversion?.unsupportedFeatures?.some((feature) => feature.code === "keynote-native-asset-layout-loss"), true);
+    assert.equal(deck.conversion?.metadata?.recoveredAssetObjectCount, 2);
+    assert.equal(deck.conversion?.metadata?.unrecoveredAssetCount, 0);
+  });
+
+  test("reports detected but unplaced package assets separately from recovered text", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-unplaced-assets-"));
+    const keyPath = path.join(dir, "unplaced.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "unused.jpg"), new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("Only recovered text"));
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.assets?.length, 1);
+    assert.equal(deck.deck.slides[0]?.objects.some((object) => object.type === "text"), true);
+    assert.equal(deck.deck.slides[0]?.objects.some((object) => object.type === "image" || object.type === "media"), false);
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-text-recovered"), true);
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-assets-unplaced"), true);
+    assert.equal(deck.conversion?.metadata?.recoveredTextObjectCount, 1);
+    assert.equal(deck.conversion?.metadata?.recoveredAssetObjectCount, 0);
+    assert.equal(deck.conversion?.metadata?.unrecoveredAssetCount, 1);
   });
 
   test("parses a ZIP-backed .key package with loose Index IWA entries", async () => {
@@ -85,7 +138,11 @@ describe("Keynote bridge", () => {
     await mkdir(path.join(keyPath, "Index"), { recursive: true });
     await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("Fallback text"));
 
-    const deck = await parseKeynoteToIr(keyPath);
+    const deck = await parseKeynoteToIr(keyPath, {
+      bridgeExport: async () => {
+        throw new Error("Synthetic Keynote bridge failure");
+      }
+    });
     assert.equal(validateIR(deck).valid, true);
     assert.equal(deck.deck.slides[0]?.objects[0]?.type, "text");
     assert.equal(deck.conversion?.messages[0]?.code, "keynote-bridge-fallback-native");
@@ -158,6 +215,16 @@ function snappyLiteralBlock(payload: Uint8Array): Uint8Array {
   }
   chunks.push(payload);
   return concat(chunks);
+}
+
+function pngBytes(): Uint8Array {
+  return new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82
+  ]);
 }
 
 function varint(value: number): Uint8Array {
