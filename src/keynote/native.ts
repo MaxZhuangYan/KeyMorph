@@ -9,11 +9,16 @@ const DEFAULT_DECK_SIZE = { width: 1280, height: 720 };
 const MAX_TEXT_CANDIDATES_PER_STREAM = 80;
 const MAX_TEXT_OBJECTS_PER_SLIDE = 24;
 const MAX_REFERENCE_CANDIDATES_PER_STREAM = 160;
+const MAX_NUMERIC_CANDIDATES_PER_STREAM = 160;
+const MAX_GEOMETRY_CANDIDATES_PER_STREAM = 24;
+const MAX_GROUPING_HINTS_PER_STREAM = 24;
+const MAX_ANIMATION_HINTS_PER_STREAM = 24;
 const MAX_PROTOBUF_FIELDS_PER_PAYLOAD = 4000;
 const MAX_NESTED_PROTOBUF_DEPTH = 3;
 const MAX_NESTED_PROTOBUF_BYTES = 256 * 1024;
 const MAX_FIELD_SUMMARIES_PER_STREAM = 48;
 const MAX_SNAPPY_OUTPUT_BYTES = 64 * 1024 * 1024;
+const MAX_VISUAL_NUMERIC_VALUE = 100000;
 
 export interface NativeKeynoteDetection {
   isNative: boolean;
@@ -29,6 +34,7 @@ export interface NativeKeynoteDetection {
   metadataPaths: string[];
   assetPaths: string[];
   quickLookPaths: string[];
+  quickLookPreviews: NativeQuickLookPreviewMetadata[];
   iwaStreams?: NativeIwaStreamMetadata[];
 }
 
@@ -53,6 +59,7 @@ interface NativeKeynoteParts {
   metadataPaths: string[];
   assetPaths: string[];
   quickLookPaths: string[];
+  quickLookPreviews: NativeQuickLookPreviewMetadata[];
   indexZipEntryCount: number;
   hasLooseIndexDirectory: boolean;
   hasDataDirectory: boolean;
@@ -67,11 +74,21 @@ export interface NativeIwaStreamMetadata {
   expandedByteLength: number;
   textCandidateCount: number;
   referenceCandidateCount: number;
+  numericCandidateCount: number;
+  geometryCandidateCount: number;
+  groupingHintCount: number;
+  animationHintCount: number;
+  magicMoveHintCount: number;
+  morphHintCount: number;
   assetReferenceCount: number;
   protobufFieldCount: number;
   protobufFieldPathCount: number;
   nestedMessageCount: number;
   rawStringCount: number;
+  numericCandidates: NativeIwaNumericCandidate[];
+  geometryCandidates: NativeIwaGeometryCandidate[];
+  groupingHints: NativeIwaGroupingHint[];
+  animationHints: NativeIwaAnimationHint[];
   fieldSummaries: NativeIwaFieldSummary[];
 }
 
@@ -85,11 +102,65 @@ export interface NativeIwaFieldSummary {
   occurrences: number;
   textCandidateCount: number;
   referenceCandidateCount: number;
+  numericCandidateCount: number;
   nestedMessageCount: number;
   minLength?: number;
   maxLength?: number;
+  minNumericValue?: number;
+  maxNumericValue?: number;
+  sampleNumericValue?: number;
+  sampleNumericEncoding?: NativeIwaNumericEncoding;
   sampleText?: string;
   sampleReference?: string;
+}
+
+export type NativeIwaNumericEncoding = "varint" | "fixed32-float" | "fixed32-uint" | "fixed64-double";
+
+export interface NativeIwaNumericCandidate {
+  fieldPath: string;
+  fieldNumber: number;
+  wireType: number;
+  value: number;
+  encoding: NativeIwaNumericEncoding;
+  confidence: number;
+}
+
+export interface NativeIwaGeometryCandidate {
+  bounds: { x: number; y: number; width: number; height: number };
+  fieldPaths: string[];
+  values: number[];
+  source: "protobuf";
+  confidence: number;
+  groupPath?: string;
+  reason: string;
+}
+
+export interface NativeIwaGroupingHint {
+  groupPath: string;
+  titleCandidate?: string;
+  textCandidateCount: number;
+  referenceCandidateCount: number;
+  geometryCandidateCount: number;
+  animationHintCount: number;
+  fieldPaths: string[];
+  confidence: number;
+}
+
+export interface NativeIwaAnimationHint {
+  kind: "magicMove" | "morph" | "transition" | "build";
+  evidence: string;
+  source: "protobuf" | "raw";
+  confidence: number;
+  fieldPath?: string;
+}
+
+export interface NativeQuickLookPreviewMetadata {
+  path: string;
+  byteLength: number;
+  role: "thumbnail" | "preview" | "unknown";
+  mimeType?: string;
+  width?: number;
+  height?: number;
 }
 
 interface NativeAssetReference {
@@ -98,6 +169,8 @@ interface NativeAssetReference {
   name: string;
   kind: Asset["kind"];
   mimeType?: string;
+  width?: number;
+  height?: number;
 }
 
 interface NativeAssetCatalog {
@@ -147,9 +220,19 @@ interface IwaReferenceCandidate {
   fieldPath?: string;
 }
 
+interface IwaNumericCandidate extends NativeIwaNumericCandidate {
+  source: "protobuf";
+  order: number;
+  endOrder: number;
+}
+
 interface IwaScanResult {
   textCandidates: IwaTextCandidate[];
   referenceCandidates: IwaReferenceCandidate[];
+  numericCandidates: IwaNumericCandidate[];
+  geometryCandidates: NativeIwaGeometryCandidate[];
+  groupingHints: NativeIwaGroupingHint[];
+  animationHints: NativeIwaAnimationHint[];
   fieldSummaries: NativeIwaFieldSummary[];
   protobufFieldCount: number;
   nestedMessageCount: number;
@@ -175,6 +258,7 @@ export async function detectNativeKeynotePackage(keynotePath: string): Promise<N
     metadataPaths: parts.metadataPaths,
     assetPaths: parts.assetPaths,
     quickLookPaths: parts.quickLookPaths,
+    quickLookPreviews: parts.quickLookPreviews,
     iwaStreams: classifyIwaStreams(parts.iwaEntries, assets)
   };
 }
@@ -207,6 +291,44 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
   const totalProtobufFieldCount = iwaStreams.reduce((total, stream) => total + stream.protobufFieldCount, 0);
   const totalNestedMessageCount = iwaStreams.reduce((total, stream) => total + stream.nestedMessageCount, 0);
   const totalReferenceCandidateCount = iwaStreams.reduce((total, stream) => total + stream.referenceCandidateCount, 0);
+  const totalNumericCandidateCount = iwaStreams.reduce((total, stream) => total + stream.numericCandidateCount, 0);
+  const totalGeometryCandidateCount = iwaStreams.reduce((total, stream) => total + stream.geometryCandidateCount, 0);
+  const totalGroupingHintCount = iwaStreams.reduce((total, stream) => total + stream.groupingHintCount, 0);
+  const totalAnimationHintCount = iwaStreams.reduce((total, stream) => total + stream.animationHintCount, 0);
+  const totalMagicMoveHintCount = iwaStreams.reduce((total, stream) => total + stream.magicMoveHintCount, 0);
+  const totalMorphHintCount = iwaStreams.reduce((total, stream) => total + stream.morphHintCount, 0);
+  const quickLookPreviewCount = parts.quickLookPreviews.length;
+  const quickLookPreviewWithDimensionsCount = parts.quickLookPreviews.filter((preview) => preview.width !== undefined && preview.height !== undefined).length;
+  const imageAssetCount = assets.assets.filter((asset) => asset.kind === "image").length;
+  const imageAssetWithDimensionsCount = assets.assets.filter((asset) => asset.kind === "image" && asset.width !== undefined && asset.height !== undefined).length;
+  const lossReportMetadata = {
+    schema: "keymorph.keynote.native.loss.v1",
+    nativeContainer: keynotePackage.container,
+    packageFormat,
+    automationUsed: false,
+    parser: "static-iwa-protobuf-field-scan",
+    limitations: [
+      "private-iwa-schema",
+      "approximate-object-placement",
+      "no-keynote-gui-render",
+      "native-animation-not-reconstructed"
+    ],
+    evidenceCounts: {
+      iwaStreamCount: parts.iwaEntries.length,
+      protobufFieldCount: totalProtobufFieldCount,
+      nestedMessageCount: totalNestedMessageCount,
+      numericCandidateCount: totalNumericCandidateCount,
+      geometryCandidateCount: totalGeometryCandidateCount,
+      groupingHintCount: totalGroupingHintCount,
+      animationHintCount: totalAnimationHintCount,
+      assetReferenceCandidateCount: totalReferenceCandidateCount,
+      quickLookPreviewCount,
+      quickLookPreviewWithDimensionsCount,
+      imageAssetCount,
+      imageAssetWithDimensionsCount
+    },
+    recommendedFallback: "Use the Keynote PPTX bridge with explicit automation opt-in for visual layout and animation downgrade."
+  };
   const unsupportedFeatures = [
     {
       code: "keynote-native-layout-schema",
@@ -220,7 +342,10 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       code: "keynote-native-animation-schema",
       severity: "warning" as const,
       area: "animation" as const,
-      description: "Keynote builds, transitions, Magic Move, and timing data are not mapped by the native fallback.",
+      description:
+        totalAnimationHintCount > 0
+          ? `Detected ${totalAnimationHintCount} native animation hint(s), including ${totalMagicMoveHintCount} Magic Move and ${totalMorphHintCount} morph-like hint(s), but Keynote timing data is private and not reconstructed by the native fallback.`
+          : "Keynote builds, transitions, Magic Move, and timing data are not mapped by the native fallback.",
       fallback: "Use the Keynote PPTX bridge for the best available animation downgrade path."
     },
     {
@@ -299,6 +424,39 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
             confidence: 0.5
           }
         ]
+      : []),
+    ...(totalGeometryCandidateCount > 0
+      ? [
+          {
+            code: "keynote-native-geometry-candidate-scan",
+            severity: "warning" as const,
+            description:
+              `Detected ${totalGeometryCandidateCount} numeric geometry candidate(s) from protobuf field groups; object bounds remain approximate until the private schema is mapped.`,
+            confidence: 0.38
+          }
+        ]
+      : []),
+    ...(totalGroupingHintCount > 0
+      ? [
+          {
+            code: "keynote-native-object-grouping-hints",
+            severity: "warning" as const,
+            description:
+              `Detected ${totalGroupingHintCount} slide/object grouping hint(s) from nested field paths and mixed text/reference/geometry evidence.`,
+            confidence: 0.41
+          }
+        ]
+      : []),
+    ...(totalAnimationHintCount > 0
+      ? [
+          {
+            code: "keynote-native-magic-move-morph-hints",
+            severity: "warning" as const,
+            description:
+              `Detected native animation terms in IWA payloads (${totalMagicMoveHintCount} Magic Move, ${totalMorphHintCount} morph-like), but target pairs and timing are uncertain.`,
+            confidence: 0.33
+          }
+        ]
       : [])
   ];
   const deckTitle = metadata.title ?? (path.basename(keynotePath, path.extname(keynotePath)) || "Imported Keynote");
@@ -318,6 +476,9 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         nativeIndexZip: parts.hasIndexZip,
         nativeIwaStreamCount: parts.iwaEntries.length,
         nativeAssetCount: assets.assets.length,
+        nativeImageAssetCount: imageAssetCount,
+        nativeImageAssetWithDimensionsCount: imageAssetWithDimensionsCount,
+        nativeQuickLookPreviews: parts.quickLookPreviews,
         nativeMetadataPaths: metadata.paths,
         ...(metadata.documentIdentifier ? { nativeDocumentIdentifier: metadata.documentIdentifier } : {})
       }
@@ -369,6 +530,22 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
               ? `Detected ${assets.assets.length} package asset(s) and matched ${recoveredAssetObjectCount} approximate slide object(s).`
               : `Detected ${assets.assets.length} package asset(s), but no slide stream references were matched for placement.`
             : "No package image or media assets were detected under Data/."
+        },
+        {
+          severity: totalGeometryCandidateCount > 0 ? "info" : "warning",
+          code: totalGeometryCandidateCount > 0 ? "keynote-native-geometry-candidates-detected" : "keynote-native-geometry-candidates-not-detected",
+          message:
+            totalGeometryCandidateCount > 0
+              ? `Detected ${totalGeometryCandidateCount} numeric geometry candidate(s) from protobuf-like fields.`
+              : "No numeric geometry candidates were detected from protobuf-like fields."
+        },
+        {
+          severity: totalAnimationHintCount > 0 ? "warning" : "info",
+          code: totalAnimationHintCount > 0 ? "keynote-native-animation-hints-detected" : "keynote-native-animation-hints-not-detected",
+          message:
+            totalAnimationHintCount > 0
+              ? `Detected ${totalAnimationHintCount} native animation hint(s), including ${totalMagicMoveHintCount} Magic Move and ${totalMorphHintCount} morph-like hint(s); mappings remain uncertain.`
+              : "No Magic Move or morph-like native animation hints were detected in visible IWA payloads."
         }
       ],
       unsupportedFeatures,
@@ -396,12 +573,23 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         iwaPathCount: parts.iwaEntries.length,
         metadataPathCount: parts.metadataPaths.length,
         assetPathCount: parts.assetPaths.length,
+        quickLookPreviews: parts.quickLookPreviews,
         totalProtobufFieldCount,
         totalNestedMessageCount,
         totalReferenceCandidateCount,
+        totalNumericCandidateCount,
+        totalGeometryCandidateCount,
+        totalGroupingHintCount,
+        totalAnimationHintCount,
+        totalMagicMoveHintCount,
+        totalMorphHintCount,
         recoveredTextObjectCount,
         recoveredAssetObjectCount,
         unrecoveredAssetCount,
+        imageAssetCount,
+        imageAssetWithDimensionsCount,
+        quickLookPreviewWithDimensionsCount,
+        lossReport: lossReportMetadata,
         iwaStreams: iwaStreams.map((stream) => ({
           path: stream.path,
           role: stream.role,
@@ -410,11 +598,21 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
           expandedByteLength: stream.expandedByteLength,
           textCandidateCount: stream.textCandidateCount,
           referenceCandidateCount: stream.referenceCandidateCount,
+          numericCandidateCount: stream.numericCandidateCount,
+          geometryCandidateCount: stream.geometryCandidateCount,
+          groupingHintCount: stream.groupingHintCount,
+          animationHintCount: stream.animationHintCount,
+          magicMoveHintCount: stream.magicMoveHintCount,
+          morphHintCount: stream.morphHintCount,
           assetReferenceCount: stream.assetReferenceCount,
           protobufFieldCount: stream.protobufFieldCount,
           protobufFieldPathCount: stream.protobufFieldPathCount,
           nestedMessageCount: stream.nestedMessageCount,
           rawStringCount: stream.rawStringCount,
+          numericCandidates: stream.numericCandidates,
+          geometryCandidates: stream.geometryCandidates,
+          groupingHints: stream.groupingHints,
+          animationHints: stream.animationHints,
           fieldSummaries: stream.fieldSummaries
         }))
       }
@@ -490,6 +688,9 @@ function readNativeKeynoteParts(entries: Map<string, Uint8Array>): NativeKeynote
 
   const allPaths = Array.from(combinedEntries.keys()).sort(comparePartPaths);
   const quickLookPaths = allPaths.filter((entryPath) => /^QuickLook\//i.test(entryPath));
+  const quickLookPreviews = quickLookPaths.map((entryPath) =>
+    createQuickLookPreviewMetadata(entryPath, combinedEntries.get(entryPath) ?? new Uint8Array())
+  );
   return {
     hasIndexZip,
     entries: combinedEntries,
@@ -499,6 +700,7 @@ function readNativeKeynoteParts(entries: Map<string, Uint8Array>): NativeKeynote
     metadataPaths: allPaths.filter((entryPath) => isMetadataPath(entryPath)),
     assetPaths: allPaths.filter((entryPath) => entryPath.startsWith("Data/")),
     quickLookPaths,
+    quickLookPreviews,
     indexZipEntryCount,
     hasLooseIndexDirectory,
     hasDataDirectory: allPaths.some((entryPath) => entryPath.startsWith("Data/")),
@@ -534,16 +736,25 @@ function createNativeAssetCatalog(assetPaths: string[], entries: Map<string, Uin
     }
 
     const classification = classifyAssetPath(assetPath);
+    const imageDimensions = classification.kind === "image" ? readImageDimensions(data, classification.mimeType) : undefined;
     const assetId = stableAssetId(assetPath);
     const asset: Asset = {
       id: assetId,
       kind: classification.kind,
       name,
       mimeType: classification.mimeType,
+      ...(imageDimensions ? { width: imageDimensions.width, height: imageDimensions.height } : {}),
       checksum: `sha256:${sha256Hex(data)}`,
       metadata: {
         nativeSourcePath: assetPath,
-        byteLength: data.byteLength
+        byteLength: data.byteLength,
+        ...(imageDimensions
+          ? {
+              nativeImageWidth: imageDimensions.width,
+              nativeImageHeight: imageDimensions.height,
+              nativeImageDimensionSource: imageDimensions.source
+            }
+          : {})
       }
     };
     const reference: NativeAssetReference = {
@@ -551,7 +762,9 @@ function createNativeAssetCatalog(assetPaths: string[], entries: Map<string, Uin
       path: assetPath,
       name,
       kind: asset.kind,
-      mimeType: asset.mimeType
+      mimeType: asset.mimeType,
+      width: asset.width,
+      height: asset.height
     };
 
     assets.push(asset);
@@ -580,11 +793,21 @@ function classifyIwaStreams(
       expandedByteLength: scan.expandedByteLength,
       textCandidateCount: scan.textCandidates.length,
       referenceCandidateCount: scan.referenceCandidates.length,
+      numericCandidateCount: scan.numericCandidates.length,
+      geometryCandidateCount: scan.geometryCandidates.length,
+      groupingHintCount: scan.groupingHints.length,
+      animationHintCount: scan.animationHints.length,
+      magicMoveHintCount: scan.animationHints.filter((hint) => hint.kind === "magicMove").length,
+      morphHintCount: scan.animationHints.filter((hint) => hint.kind === "morph").length,
       assetReferenceCount: findIwaAssetMatchesFromScan(scan, assets).length,
       protobufFieldCount: scan.protobufFieldCount,
       protobufFieldPathCount: scan.fieldSummaries.length,
       nestedMessageCount: scan.nestedMessageCount,
       rawStringCount: scan.rawStringCount,
+      numericCandidates: scan.numericCandidates.map(stripNumericCandidateInternalFields),
+      geometryCandidates: scan.geometryCandidates,
+      groupingHints: scan.groupingHints,
+      animationHints: scan.animationHints,
       fieldSummaries: scan.fieldSummaries
     };
   });
@@ -661,10 +884,10 @@ function buildNativeSlides(
     const textCandidates = scan.textCandidates.slice(0, MAX_TEXT_OBJECTS_PER_SLIDE);
     const assetMatches = findIwaAssetMatchesFromScan(scan, assets);
     const textObjects = textCandidates.map((candidate, objectIndex) =>
-      createTextObject(slideId, candidate, objectIndex, entry.path, deckSize)
+      createTextObject(slideId, candidate, objectIndex, entry.path, deckSize, scan.geometryCandidates[objectIndex])
     );
     const assetObjects = assetMatches.map((match, assetIndex) =>
-      createAssetObject(slideId, match, textObjects.length + assetIndex, entry.path, deckSize)
+      createAssetObject(slideId, match, textObjects.length + assetIndex, entry.path, deckSize, scan.geometryCandidates[textObjects.length + assetIndex])
     );
     const objects =
       textObjects.length > 0 || assetObjects.length > 0
@@ -682,9 +905,19 @@ function buildNativeSlides(
         nativeSourcePath: entry.path,
         nativeTextCandidateCount: textCandidates.length,
         nativeReferenceCandidateCount: scan.referenceCandidates.length,
+        nativeNumericCandidateCount: scan.numericCandidates.length,
+        nativeGeometryCandidateCount: scan.geometryCandidates.length,
+        nativeGroupingHintCount: scan.groupingHints.length,
+        nativeAnimationHintCount: scan.animationHints.length,
+        nativeMagicMoveHintCount: scan.animationHints.filter((hint) => hint.kind === "magicMove").length,
+        nativeMorphHintCount: scan.animationHints.filter((hint) => hint.kind === "morph").length,
         nativeAssetReferenceCount: assetMatches.length,
         nativeProtobufFieldCount: scan.protobufFieldCount,
         nativeNestedMessageCount: scan.nestedMessageCount,
+        nativeNumericCandidates: scan.numericCandidates.slice(0, 24).map(stripNumericCandidateInternalFields),
+        nativeGeometryCandidates: scan.geometryCandidates.slice(0, 12),
+        nativeGroupingHints: scan.groupingHints.slice(0, 12),
+        nativeAnimationHints: scan.animationHints.slice(0, 12),
         nativeFieldSummaries: scan.fieldSummaries.slice(0, 12),
         nativeParser: "iwa-protobuf-field-scan"
       }
@@ -732,24 +965,28 @@ function createTextObject(
   candidate: IwaTextCandidate,
   objectIndex: number,
   sourcePath: string,
-  deckSize: { width: number; height: number }
+  deckSize: { width: number; height: number },
+  geometryCandidate?: NativeIwaGeometryCandidate
 ): IRObject {
   const text = candidate.text;
   const marginX = Math.round(deckSize.width * 0.075);
   const top = Math.round(deckSize.height * 0.12);
   const lineHeight = objectIndex === 0 ? 76 : 54;
   const y = top + objectIndex * (lineHeight + 18);
+  const bounds = geometryCandidate
+    ? clampGeometryCandidateBounds(geometryCandidate.bounds, deckSize)
+    : {
+        x: marginX,
+        y,
+        width: deckSize.width - marginX * 2,
+        height: Math.max(44, lineHeight)
+      };
 
   return {
     id: `${slideId}-text-${objectIndex + 1}`,
     type: "text",
     name: objectIndex === 0 ? "Native text" : `Native text ${objectIndex + 1}`,
-    bounds: {
-      x: marginX,
-      y,
-      width: deckSize.width - marginX * 2,
-      height: Math.max(44, lineHeight)
-    },
+    bounds,
     opacity: 1,
     text: {
       plainText: text,
@@ -768,7 +1005,13 @@ function createTextObject(
       nativeSourcePath: sourcePath,
       nativeExtraction: candidate.source === "protobuf" ? "protobuf-field-string" : "raw-string",
       nativeFieldPath: candidate.fieldPath,
-      nativeTextConfidence: candidate.confidence
+      nativeTextConfidence: candidate.confidence,
+      ...(geometryCandidate
+        ? {
+            nativeGeometryCandidate: geometryCandidate,
+            nativeGeometryConfidence: geometryCandidate.confidence
+          }
+        : {})
     }
   };
 }
@@ -803,27 +1046,43 @@ function createAssetObject(
   match: NativeAssetMatch,
   objectIndex: number,
   sourcePath: string,
-  deckSize: { width: number; height: number }
+  deckSize: { width: number; height: number },
+  geometryCandidate?: NativeIwaGeometryCandidate
 ): IRObject {
   const asset = match.asset;
   const marginX = Math.round(deckSize.width * 0.075);
+  const aspect = asset.width && asset.height ? asset.width / asset.height : undefined;
   const width = Math.round(deckSize.width * 0.38);
-  const height = Math.round(deckSize.height * 0.38);
+  const height = aspect && aspect > 0 ? Math.round(width / aspect) : Math.round(deckSize.height * 0.38);
   const column = objectIndex % 2;
   const row = Math.floor(objectIndex / 2);
-  const bounds = {
-    x: marginX + column * Math.round(deckSize.width * 0.42),
-    y: Math.round(deckSize.height * 0.48) + row * Math.round(deckSize.height * 0.12),
-    width,
-    height
-  };
+  const bounds = geometryCandidate
+    ? clampGeometryCandidateBounds(geometryCandidate.bounds, deckSize)
+    : {
+        x: marginX + column * Math.round(deckSize.width * 0.42),
+        y: Math.round(deckSize.height * 0.48) + row * Math.round(deckSize.height * 0.12),
+        width,
+        height
+      };
   const metadata = {
     nativeSourcePath: sourcePath,
     nativeAssetPath: asset.path,
+    ...(asset.width !== undefined && asset.height !== undefined
+      ? {
+          nativeAssetWidth: asset.width,
+          nativeAssetHeight: asset.height
+        }
+      : {}),
     nativeAssetEvidence: match.evidence,
     nativeAssetMatchConfidence: match.confidence,
     nativeAssetFieldPath: match.fieldPath,
-    nativeExtraction: match.source === "protobuf" ? "asset-protobuf-field-string-scan" : "asset-raw-string-scan"
+    nativeExtraction: match.source === "protobuf" ? "asset-protobuf-field-string-scan" : "asset-raw-string-scan",
+    ...(geometryCandidate
+      ? {
+          nativeGeometryCandidate: geometryCandidate,
+          nativeGeometryConfidence: geometryCandidate.confidence
+        }
+      : {})
   };
 
   if (asset.kind === "image") {
@@ -837,7 +1096,13 @@ function createAssetObject(
         assetId: asset.assetId,
         metadata: {
           nativeAssetPath: asset.path,
-          mimeType: asset.mimeType
+          mimeType: asset.mimeType,
+          ...(asset.width !== undefined && asset.height !== undefined
+            ? {
+                width: asset.width,
+                height: asset.height
+              }
+            : {})
         }
       },
       metadata
@@ -856,7 +1121,13 @@ function createAssetObject(
         assetId: asset.assetId,
         metadata: {
           nativeAssetPath: asset.path,
-          mimeType: asset.mimeType
+          mimeType: asset.mimeType,
+          ...(asset.width !== undefined && asset.height !== undefined
+            ? {
+                width: asset.width,
+                height: asset.height
+              }
+            : {})
         }
       },
       metadata
@@ -884,6 +1155,8 @@ function scanIwaEntry(data: Uint8Array): IwaScanResult {
 function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
   const textCandidates = new Map<string, IwaTextCandidate>();
   const referenceCandidates = new Map<string, IwaReferenceCandidate>();
+  const numericCandidates = new Map<string, IwaNumericCandidate>();
+  const animationHints = new Map<string, NativeIwaAnimationHint>();
   const fieldSummaries = new Map<string, NativeIwaFieldSummary>();
   let protobufFieldCount = 0;
   let nestedMessageCount = 0;
@@ -903,6 +1176,12 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
     for (const candidate of protobufScan.referenceCandidates) {
       addBestReferenceCandidate(referenceCandidates, candidate);
     }
+    for (const candidate of protobufScan.numericCandidates) {
+      addBestNumericCandidate(numericCandidates, candidate);
+    }
+    for (const hint of protobufScan.animationHints) {
+      addBestAnimationHint(animationHints, hint);
+    }
 
     const rawScan = scanRawStrings(payload.data, orderBase + payload.data.byteLength + 1);
     rawStringCount += rawScan.rawStringCount;
@@ -912,15 +1191,32 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
     for (const candidate of rawScan.referenceCandidates) {
       addBestReferenceCandidate(referenceCandidates, candidate);
     }
+    for (const hint of rawScan.animationHints) {
+      addBestAnimationHint(animationHints, hint);
+    }
     orderBase += payload.data.byteLength * 2 + 2;
   }
 
   const fieldSummaryList = Array.from(fieldSummaries.values()).sort(compareFieldSummaries).slice(0, MAX_FIELD_SUMMARIES_PER_STREAM);
+  const numericCandidateList = Array.from(numericCandidates.values())
+    .sort(compareNumericCandidates)
+    .slice(0, MAX_NUMERIC_CANDIDATES_PER_STREAM);
+  const geometryCandidates = inferGeometryCandidates(numericCandidateList);
+  const animationHintList = Array.from(animationHints.values()).sort(compareAnimationHints).slice(0, MAX_ANIMATION_HINTS_PER_STREAM);
   return {
     textCandidates: Array.from(textCandidates.values()).sort(compareTextCandidates).slice(0, MAX_TEXT_CANDIDATES_PER_STREAM),
     referenceCandidates: Array.from(referenceCandidates.values())
       .sort(compareReferenceCandidates)
       .slice(0, MAX_REFERENCE_CANDIDATES_PER_STREAM),
+    numericCandidates: numericCandidateList,
+    geometryCandidates,
+    groupingHints: inferGroupingHints(
+      Array.from(textCandidates.values()),
+      Array.from(referenceCandidates.values()),
+      geometryCandidates,
+      animationHintList
+    ),
+    animationHints: animationHintList,
     fieldSummaries: fieldSummaryList,
     protobufFieldCount,
     nestedMessageCount,
@@ -952,11 +1248,19 @@ function scanProtobufPayload(
   orderBase: number
 ): Pick<
   IwaScanResult,
-  "textCandidates" | "referenceCandidates" | "fieldSummaries" | "protobufFieldCount" | "nestedMessageCount"
+  | "textCandidates"
+  | "referenceCandidates"
+  | "numericCandidates"
+  | "animationHints"
+  | "fieldSummaries"
+  | "protobufFieldCount"
+  | "nestedMessageCount"
 > {
   const state = {
     textCandidates: new Map<string, IwaTextCandidate>(),
     referenceCandidates: new Map<string, IwaReferenceCandidate>(),
+    numericCandidates: new Map<string, IwaNumericCandidate>(),
+    animationHints: new Map<string, NativeIwaAnimationHint>(),
     fieldSummaries: new Map<string, NativeIwaFieldSummary>(),
     protobufFieldCount: 0,
     nestedMessageCount: 0,
@@ -966,6 +1270,8 @@ function scanProtobufPayload(
   return {
     textCandidates: Array.from(state.textCandidates.values()),
     referenceCandidates: Array.from(state.referenceCandidates.values()),
+    numericCandidates: Array.from(state.numericCandidates.values()),
+    animationHints: Array.from(state.animationHints.values()),
     fieldSummaries: Array.from(state.fieldSummaries.values()),
     protobufFieldCount: state.protobufFieldCount,
     nestedMessageCount: state.nestedMessageCount
@@ -979,6 +1285,8 @@ function scanProtobufFields(
   state: {
     textCandidates: Map<string, IwaTextCandidate>;
     referenceCandidates: Map<string, IwaReferenceCandidate>;
+    numericCandidates: Map<string, IwaNumericCandidate>;
+    animationHints: Map<string, NativeIwaAnimationHint>;
     fieldSummaries: Map<string, NativeIwaFieldSummary>;
     protobufFieldCount: number;
     nestedMessageCount: number;
@@ -1000,6 +1308,18 @@ function scanProtobufFields(
     const summary = getFieldSummary(state.fieldSummaries, fieldPath, field.fieldNumber, field.wireType);
     summary.occurrences += 1;
 
+    const numeric = decodeNumericCandidate(field, fieldPath, state.orderBase + offset);
+    if (numeric) {
+      summary.numericCandidateCount += 1;
+      summary.minNumericValue =
+        summary.minNumericValue === undefined ? numeric.value : Math.min(summary.minNumericValue, numeric.value);
+      summary.maxNumericValue =
+        summary.maxNumericValue === undefined ? numeric.value : Math.max(summary.maxNumericValue, numeric.value);
+      summary.sampleNumericValue ??= numeric.value;
+      summary.sampleNumericEncoding ??= numeric.encoding;
+      addBestNumericCandidate(state.numericCandidates, numeric);
+    }
+
     if (field.wireType !== 2 || !field.value) {
       continue;
     }
@@ -1018,6 +1338,9 @@ function scanProtobufFields(
         order: state.orderBase + offset,
         fieldPath
       });
+      for (const hint of detectAnimationHints(text, "protobuf", depth > 0 ? 0.6 : 0.54, fieldPath)) {
+        addBestAnimationHint(state.animationHints, hint);
+      }
     }
 
     const reference = decodeReferenceCandidate(field.value);
@@ -1049,7 +1372,7 @@ function scanProtobufFields(
 function readProtobufFieldAt(
   data: Uint8Array,
   offset: number
-): { fieldNumber: number; wireType: number; nextOffset: number; value?: Uint8Array } | undefined {
+): { fieldNumber: number; wireType: number; nextOffset: number; value?: Uint8Array; numericValue?: number; rawValue?: Uint8Array } | undefined {
   const key = readVarint(data, offset);
   if (!key || key.nextOffset <= offset) {
     return undefined;
@@ -1063,17 +1386,27 @@ function readProtobufFieldAt(
   if (wireType === 0) {
     const value = readVarint(data, key.nextOffset);
     if (!value) return undefined;
-    return { fieldNumber, wireType, nextOffset: value.nextOffset };
+    return {
+      fieldNumber,
+      wireType,
+      nextOffset: value.nextOffset,
+      numericValue: value.value,
+      rawValue: data.subarray(key.nextOffset, value.nextOffset)
+    };
   }
 
   if (wireType === 1) {
     const nextOffset = key.nextOffset + 8;
-    return nextOffset <= data.length ? { fieldNumber, wireType, nextOffset } : undefined;
+    return nextOffset <= data.length
+      ? { fieldNumber, wireType, nextOffset, rawValue: data.subarray(key.nextOffset, nextOffset) }
+      : undefined;
   }
 
   if (wireType === 5) {
     const nextOffset = key.nextOffset + 4;
-    return nextOffset <= data.length ? { fieldNumber, wireType, nextOffset } : undefined;
+    return nextOffset <= data.length
+      ? { fieldNumber, wireType, nextOffset, rawValue: data.subarray(key.nextOffset, nextOffset) }
+      : undefined;
   }
 
   const lengthInfo = readVarint(data, key.nextOffset);
@@ -1111,13 +1444,431 @@ function looksLikeNestedProtobufMessage(data: Uint8Array): boolean {
   return offset === data.length && fieldCount >= 2 && lengthDelimitedCount > 0;
 }
 
+function decodeNumericCandidate(
+  field: {
+    fieldNumber: number;
+    wireType: number;
+    nextOffset: number;
+    numericValue?: number;
+    rawValue?: Uint8Array;
+  },
+  fieldPath: string,
+  order: number
+): IwaNumericCandidate | undefined {
+  if (field.wireType === 0 && field.numericValue !== undefined) {
+    const value = field.numericValue;
+    if (!Number.isFinite(value) || value < 0 || value > MAX_VISUAL_NUMERIC_VALUE) {
+      return undefined;
+    }
+    return {
+      fieldPath,
+      fieldNumber: field.fieldNumber,
+      wireType: field.wireType,
+      value,
+      encoding: "varint",
+      source: "protobuf",
+      confidence: value <= 10000 ? 0.52 : 0.36,
+      order,
+      endOrder: order + (field.rawValue?.byteLength ?? 1)
+    };
+  }
+
+  if (field.wireType === 5 && field.rawValue?.byteLength === 4) {
+    const view = new DataView(field.rawValue.buffer, field.rawValue.byteOffset, field.rawValue.byteLength);
+    const floatValue = view.getFloat32(0, true);
+    if (Number.isFinite(floatValue) && Math.abs(floatValue) <= MAX_VISUAL_NUMERIC_VALUE && Math.abs(floatValue) >= 0.0001) {
+      return {
+        fieldPath,
+        fieldNumber: field.fieldNumber,
+        wireType: field.wireType,
+        value: roundGeometryNumber(floatValue),
+        encoding: "fixed32-float",
+        source: "protobuf",
+        confidence: 0.7,
+        order,
+        endOrder: order + 4
+      };
+    }
+
+    const intValue = view.getUint32(0, true);
+    if (intValue <= MAX_VISUAL_NUMERIC_VALUE) {
+      return {
+        fieldPath,
+        fieldNumber: field.fieldNumber,
+        wireType: field.wireType,
+        value: intValue,
+        encoding: "fixed32-uint",
+        source: "protobuf",
+        confidence: intValue <= 10000 ? 0.5 : 0.34,
+        order,
+        endOrder: order + 4
+      };
+    }
+  }
+
+  if (field.wireType === 1 && field.rawValue?.byteLength === 8) {
+    const view = new DataView(field.rawValue.buffer, field.rawValue.byteOffset, field.rawValue.byteLength);
+    const doubleValue = view.getFloat64(0, true);
+    if (Number.isFinite(doubleValue) && Math.abs(doubleValue) <= MAX_VISUAL_NUMERIC_VALUE && Math.abs(doubleValue) >= 0.0001) {
+      return {
+        fieldPath,
+        fieldNumber: field.fieldNumber,
+        wireType: field.wireType,
+        value: roundGeometryNumber(doubleValue),
+        encoding: "fixed64-double",
+        source: "protobuf",
+        confidence: 0.72,
+        order,
+        endOrder: order + 8
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function inferGeometryCandidates(numericCandidates: IwaNumericCandidate[]): NativeIwaGeometryCandidate[] {
+  const candidates: NativeIwaGeometryCandidate[] = [];
+  candidates.push(...inferGroupedGeometryCandidates(numericCandidates));
+  const windows = consecutiveNumericWindows(numericCandidates);
+
+  for (const window of windows) {
+    if (window.length < 4) {
+      continue;
+    }
+    for (let index = 0; index <= window.length - 4; index += 1) {
+      const group = window.slice(index, index + 4);
+      const values = group.map((candidate) => candidate.value);
+      const [x, y, width, height] = values;
+      if (!isPlausibleGeometryTuple(x, y, width, height)) {
+        continue;
+      }
+      if (!hasSameParentFieldPath(group) || !hasSequentialFieldNumbers(group)) {
+        continue;
+      }
+      const fieldPaths = group.map((candidate) => candidate.fieldPath);
+      const groupPath = commonFieldPathPrefix(fieldPaths);
+      candidates.push({
+        bounds: {
+          x: roundGeometryNumber(x),
+          y: roundGeometryNumber(y),
+          width: roundGeometryNumber(width),
+          height: roundGeometryNumber(height)
+        },
+        fieldPaths,
+        values: values.map(roundGeometryNumber),
+        source: "protobuf",
+        confidence: geometryTupleConfidence(group, groupPath),
+        groupPath,
+        reason: groupPath
+          ? "four nearby visual numeric fields under a common protobuf field path"
+          : "four nearby visual numeric fields in protobuf order"
+      });
+    }
+  }
+
+  return dedupeGeometryCandidates(candidates)
+    .sort((left, right) => right.confidence - left.confidence || compareFieldPaths(left.fieldPaths[0] ?? "", right.fieldPaths[0] ?? ""))
+    .slice(0, MAX_GEOMETRY_CANDIDATES_PER_STREAM);
+}
+
+function inferGroupedGeometryCandidates(numericCandidates: IwaNumericCandidate[]): NativeIwaGeometryCandidate[] {
+  const groups = new Map<string, IwaNumericCandidate[]>();
+  for (const candidate of numericCandidates) {
+    const parent = parentFieldPath(candidate.fieldPath);
+    if (!parent) {
+      continue;
+    }
+    const group = groups.get(parent);
+    if (group) {
+      group.push(candidate);
+    } else {
+      groups.set(parent, [candidate]);
+    }
+  }
+
+  const candidates: NativeIwaGeometryCandidate[] = [];
+  for (const [groupPath, group] of groups) {
+    const byFieldNumber = new Map<number, IwaNumericCandidate[]>();
+    for (const candidate of group) {
+      const existing = byFieldNumber.get(candidate.fieldNumber);
+      if (existing) {
+        existing.push(candidate);
+      } else {
+        byFieldNumber.set(candidate.fieldNumber, [candidate]);
+      }
+    }
+
+    const fieldNumbers = Array.from(byFieldNumber.keys()).sort((left, right) => left - right);
+    for (let index = 0; index <= fieldNumbers.length - 4; index += 1) {
+      const first = fieldNumbers[index]!;
+      const tupleFieldNumbers = [first, first + 1, first + 2, first + 3];
+      if (!tupleFieldNumbers.every((fieldNumber) => byFieldNumber.has(fieldNumber))) {
+        continue;
+      }
+
+      const tuple = tupleFieldNumbers.map((fieldNumber) =>
+        byFieldNumber.get(fieldNumber)!.sort(compareNumericCandidates)[0]!
+      );
+      const orderedTuple = tuple.slice().sort((left, right) => left.order - right.order);
+      if (!tuple.every((candidate, tupleIndex) => candidate === orderedTuple[tupleIndex])) {
+        continue;
+      }
+      const values = tuple.map((candidate) => candidate.value);
+      const [x, y, width, height] = values;
+      if (!isPlausibleGeometryTuple(x, y, width, height)) {
+        continue;
+      }
+      candidates.push({
+        bounds: {
+          x: roundGeometryNumber(x),
+          y: roundGeometryNumber(y),
+          width: roundGeometryNumber(width),
+          height: roundGeometryNumber(height)
+        },
+        fieldPaths: tuple.map((candidate) => candidate.fieldPath),
+        values: values.map(roundGeometryNumber),
+        source: "protobuf",
+        confidence: geometryTupleConfidence(tuple, groupPath),
+        groupPath,
+        reason: "sequential visual numeric fields under a common protobuf parent path"
+      });
+    }
+  }
+  return candidates;
+}
+
+function consecutiveNumericWindows(numericCandidates: IwaNumericCandidate[]): IwaNumericCandidate[][] {
+  const sorted = numericCandidates
+    .filter((candidate) => candidate.value >= 0 && candidate.value <= MAX_VISUAL_NUMERIC_VALUE)
+    .sort((left, right) => left.order - right.order);
+  const windows: IwaNumericCandidate[][] = [];
+  let current: IwaNumericCandidate[] = [];
+
+  for (const candidate of sorted) {
+    const previous = current[current.length - 1];
+    if (!previous || candidate.order - previous.endOrder <= 8) {
+      current.push(candidate);
+      continue;
+    }
+    if (current.length >= 4) {
+      windows.push(current);
+    }
+    current = [candidate];
+  }
+  if (current.length >= 4) {
+    windows.push(current);
+  }
+  return windows;
+}
+
+function isPlausibleGeometryTuple(x: number, y: number, width: number, height: number): boolean {
+  if (![x, y, width, height].every((value) => Number.isFinite(value) && value >= 0)) {
+    return false;
+  }
+  if (width < 1 || height < 1 || width > MAX_VISUAL_NUMERIC_VALUE || height > MAX_VISUAL_NUMERIC_VALUE) {
+    return false;
+  }
+  if (x > MAX_VISUAL_NUMERIC_VALUE || y > MAX_VISUAL_NUMERIC_VALUE) {
+    return false;
+  }
+  return width >= 2 || height >= 2;
+}
+
+function geometryTupleConfidence(group: IwaNumericCandidate[], groupPath: string | undefined): number {
+  const encodingScore = group.reduce((total, candidate) => total + candidate.confidence, 0) / group.length;
+  const pathScore = groupPath ? 0.12 : 0;
+  const fieldScore = hasSequentialFieldNumbers(group) ? 0.1 : 0;
+  return roundConfidence(Math.min(0.88, encodingScore + pathScore + fieldScore));
+}
+
+function hasSequentialFieldNumbers(group: IwaNumericCandidate[]): boolean {
+  for (let index = 1; index < group.length; index += 1) {
+    if (group[index]!.fieldNumber !== group[index - 1]!.fieldNumber + 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasSameParentFieldPath(group: IwaNumericCandidate[]): boolean {
+  const parent = parentFieldPath(group[0]?.fieldPath ?? "");
+  return parent !== undefined && group.every((candidate) => parentFieldPath(candidate.fieldPath) === parent);
+}
+
+function dedupeGeometryCandidates(candidates: NativeIwaGeometryCandidate[]): NativeIwaGeometryCandidate[] {
+  const seen = new Map<string, NativeIwaGeometryCandidate>();
+  for (const candidate of candidates) {
+    const key = `${candidate.bounds.x}:${candidate.bounds.y}:${candidate.bounds.width}:${candidate.bounds.height}:${candidate.fieldPaths.join(",")}`;
+    const existing = seen.get(key);
+    if (!existing || candidate.confidence > existing.confidence) {
+      seen.set(key, candidate);
+    }
+  }
+  return Array.from(seen.values());
+}
+
+function inferGroupingHints(
+  textCandidates: IwaTextCandidate[],
+  referenceCandidates: IwaReferenceCandidate[],
+  geometryCandidates: NativeIwaGeometryCandidate[],
+  animationHints: NativeIwaAnimationHint[]
+): NativeIwaGroupingHint[] {
+  const groups = new Map<
+    string,
+    {
+      textCandidates: IwaTextCandidate[];
+      referenceCandidates: IwaReferenceCandidate[];
+      geometryCandidates: NativeIwaGeometryCandidate[];
+      animationHints: NativeIwaAnimationHint[];
+      fieldPaths: Set<string>;
+    }
+  >();
+
+  for (const candidate of textCandidates) {
+    addGroupingFieldPath(groups, candidate.fieldPath, "textCandidates", candidate);
+  }
+  for (const candidate of referenceCandidates) {
+    addGroupingFieldPath(groups, candidate.fieldPath, "referenceCandidates", candidate);
+  }
+  for (const candidate of geometryCandidates) {
+    const groupPath = candidate.groupPath ?? commonFieldPathPrefix(candidate.fieldPaths);
+    addGroupingFieldPath(groups, groupPath, "geometryCandidates", candidate);
+    for (const fieldPath of candidate.fieldPaths) {
+      const group = groupPath ? groups.get(groupPath) : undefined;
+      group?.fieldPaths.add(fieldPath);
+    }
+  }
+  for (const hint of animationHints) {
+    addGroupingFieldPath(groups, hint.fieldPath, "animationHints", hint);
+  }
+
+  return Array.from(groups.entries())
+    .map(([groupPath, group]) => {
+      const titleCandidate = group.textCandidates.sort(compareTextCandidates)[0]?.text;
+      const signalKinds = [
+        group.textCandidates.length > 0,
+        group.referenceCandidates.length > 0,
+        group.geometryCandidates.length > 0,
+        group.animationHints.length > 0
+      ].filter(Boolean).length;
+      return {
+        groupPath,
+        ...(titleCandidate ? { titleCandidate } : {}),
+        textCandidateCount: group.textCandidates.length,
+        referenceCandidateCount: group.referenceCandidates.length,
+        geometryCandidateCount: group.geometryCandidates.length,
+        animationHintCount: group.animationHints.length,
+        fieldPaths: Array.from(group.fieldPaths).sort(compareFieldPaths).slice(0, 12),
+        confidence: roundConfidence(Math.min(0.82, 0.24 + signalKinds * 0.12 + Math.min(0.18, group.fieldPaths.size * 0.015)))
+      };
+    })
+    .filter((hint) => hint.fieldPaths.length >= 2 || hint.geometryCandidateCount > 0 || hint.animationHintCount > 0)
+    .sort((left, right) => right.confidence - left.confidence || compareFieldPaths(left.groupPath, right.groupPath))
+    .slice(0, MAX_GROUPING_HINTS_PER_STREAM);
+}
+
+function addGroupingFieldPath<
+  K extends "textCandidates" | "referenceCandidates" | "geometryCandidates" | "animationHints"
+>(
+  groups: Map<
+    string,
+    {
+      textCandidates: IwaTextCandidate[];
+      referenceCandidates: IwaReferenceCandidate[];
+      geometryCandidates: NativeIwaGeometryCandidate[];
+      animationHints: NativeIwaAnimationHint[];
+      fieldPaths: Set<string>;
+    }
+  >,
+  fieldPath: string | undefined,
+  key: K,
+  value: {
+    textCandidates: IwaTextCandidate;
+    referenceCandidates: IwaReferenceCandidate;
+    geometryCandidates: NativeIwaGeometryCandidate;
+    animationHints: NativeIwaAnimationHint;
+  }[K]
+): void {
+  if (!fieldPath) {
+    return;
+  }
+  const groupPath = parentFieldPath(fieldPath);
+  if (!groupPath) {
+    return;
+  }
+  let group = groups.get(groupPath);
+  if (!group) {
+    group = {
+      textCandidates: [],
+      referenceCandidates: [],
+      geometryCandidates: [],
+      animationHints: [],
+      fieldPaths: new Set<string>()
+    };
+    groups.set(groupPath, group);
+  }
+  (group[key] as Array<typeof value>).push(value);
+  group.fieldPaths.add(fieldPath);
+}
+
+function detectAnimationHints(
+  text: string,
+  source: "protobuf" | "raw",
+  confidence: number,
+  fieldPath?: string
+): NativeIwaAnimationHint[] {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  const lower = normalized.toLowerCase();
+  const hints: NativeIwaAnimationHint[] = [];
+  if (/\bmagic\s*move\b/.test(lower) || /\bmagicmove\b/.test(lower)) {
+    hints.push({
+      kind: "magicMove",
+      evidence: normalized.slice(0, 120),
+      source,
+      confidence: roundConfidence(confidence + 0.18),
+      fieldPath
+    });
+  }
+  if (/\bmorph(?:ing)?\b/.test(lower)) {
+    hints.push({
+      kind: "morph",
+      evidence: normalized.slice(0, 120),
+      source,
+      confidence: roundConfidence(confidence + 0.12),
+      fieldPath
+    });
+  }
+  if (/\btransition\b/.test(lower)) {
+    hints.push({
+      kind: "transition",
+      evidence: normalized.slice(0, 120),
+      source,
+      confidence: roundConfidence(confidence + 0.06),
+      fieldPath
+    });
+  }
+  if (/\b(build|appear|dissolve|move in|fly in)\b/.test(lower)) {
+    hints.push({
+      kind: "build",
+      evidence: normalized.slice(0, 120),
+      source,
+      confidence: roundConfidence(confidence),
+      fieldPath
+    });
+  }
+  return hints;
+}
+
 function scanRawStrings(data: Uint8Array, orderBase: number): {
   textCandidates: IwaTextCandidate[];
   referenceCandidates: IwaReferenceCandidate[];
+  animationHints: NativeIwaAnimationHint[];
   rawStringCount: number;
 } {
   const textCandidates = new Map<string, IwaTextCandidate>();
   const referenceCandidates = new Map<string, IwaReferenceCandidate>();
+  const animationHints = new Map<string, NativeIwaAnimationHint>();
   let rawStringCount = 0;
   let start = -1;
 
@@ -1135,6 +1886,9 @@ function scanRawStrings(data: Uint8Array, orderBase: number): {
       const text = decodeTextCandidate(bytes, 4);
       if (text) {
         addBestTextCandidate(textCandidates, { text, source: "raw", confidence: 0.36, order: orderBase + start });
+        for (const hint of detectAnimationHints(text, "raw", 0.36)) {
+          addBestAnimationHint(animationHints, hint);
+        }
       }
 
       const reference = decodeReferenceCandidate(bytes);
@@ -1148,6 +1902,7 @@ function scanRawStrings(data: Uint8Array, orderBase: number): {
   return {
     textCandidates: Array.from(textCandidates.values()),
     referenceCandidates: Array.from(referenceCandidates.values()),
+    animationHints: Array.from(animationHints.values()),
     rawStringCount
   };
 }
@@ -1286,6 +2041,7 @@ function getFieldSummary(
     occurrences: 0,
     textCandidateCount: 0,
     referenceCandidateCount: 0,
+    numericCandidateCount: 0,
     nestedMessageCount: 0
   };
   summaries.set(fieldPath, summary);
@@ -1297,6 +2053,7 @@ function mergeFieldSummary(summaries: Map<string, NativeIwaFieldSummary>, incomi
   summary.occurrences += incoming.occurrences;
   summary.textCandidateCount += incoming.textCandidateCount;
   summary.referenceCandidateCount += incoming.referenceCandidateCount;
+  summary.numericCandidateCount += incoming.numericCandidateCount;
   summary.nestedMessageCount += incoming.nestedMessageCount;
   summary.minLength =
     summary.minLength === undefined
@@ -1310,6 +2067,20 @@ function mergeFieldSummary(summaries: Map<string, NativeIwaFieldSummary>, incomi
       : incoming.maxLength === undefined
         ? summary.maxLength
         : Math.max(summary.maxLength, incoming.maxLength);
+  summary.minNumericValue =
+    summary.minNumericValue === undefined
+      ? incoming.minNumericValue
+      : incoming.minNumericValue === undefined
+        ? summary.minNumericValue
+        : Math.min(summary.minNumericValue, incoming.minNumericValue);
+  summary.maxNumericValue =
+    summary.maxNumericValue === undefined
+      ? incoming.maxNumericValue
+      : incoming.maxNumericValue === undefined
+        ? summary.maxNumericValue
+        : Math.max(summary.maxNumericValue, incoming.maxNumericValue);
+  summary.sampleNumericValue ??= incoming.sampleNumericValue;
+  summary.sampleNumericEncoding ??= incoming.sampleNumericEncoding;
   summary.sampleText ??= incoming.sampleText;
   summary.sampleReference ??= incoming.sampleReference;
 }
@@ -1337,6 +2108,22 @@ function addBestReferenceCandidate(candidates: Map<string, IwaReferenceCandidate
   const existing = candidates.get(key);
   if (!existing || compareReferenceCandidates(normalized, existing) < 0) {
     candidates.set(key, normalized);
+  }
+}
+
+function addBestNumericCandidate(candidates: Map<string, IwaNumericCandidate>, candidate: IwaNumericCandidate): void {
+  const key = `${candidate.fieldPath}:${candidate.encoding}:${candidate.value}:${candidate.order}`;
+  const existing = candidates.get(key);
+  if (!existing || compareNumericCandidates(candidate, existing) < 0) {
+    candidates.set(key, candidate);
+  }
+}
+
+function addBestAnimationHint(candidates: Map<string, NativeIwaAnimationHint>, candidate: NativeIwaAnimationHint): void {
+  const key = `${candidate.kind}:${candidate.evidence.toLowerCase()}`;
+  const existing = candidates.get(key);
+  if (!existing || compareAnimationHints(candidate, existing) < 0) {
+    candidates.set(key, candidate);
   }
 }
 
@@ -1386,9 +2173,52 @@ function compareReferenceCandidates(left: IwaReferenceCandidate, right: IwaRefer
   return left.value.localeCompare(right.value);
 }
 
+function compareNumericCandidates(left: IwaNumericCandidate, right: IwaNumericCandidate): number {
+  const confidence = right.confidence - left.confidence;
+  if (confidence !== 0) {
+    return confidence;
+  }
+  if (left.order !== right.order) {
+    return left.order - right.order;
+  }
+  const fieldPath = compareFieldPaths(left.fieldPath, right.fieldPath);
+  if (fieldPath !== 0) return fieldPath;
+  return left.value - right.value;
+}
+
+function compareAnimationHints(left: NativeIwaAnimationHint, right: NativeIwaAnimationHint): number {
+  const kind = animationKindRank(right.kind) - animationKindRank(left.kind);
+  if (kind !== 0) {
+    return kind;
+  }
+  const confidence = (right.confidence ?? 0) - (left.confidence ?? 0);
+  if (confidence !== 0) {
+    return confidence;
+  }
+  if (left.fieldPath && right.fieldPath) {
+    const fieldPath = compareFieldPaths(left.fieldPath, right.fieldPath);
+    if (fieldPath !== 0) return fieldPath;
+  } else if (left.fieldPath) {
+    return -1;
+  } else if (right.fieldPath) {
+    return 1;
+  }
+  return left.evidence.localeCompare(right.evidence);
+}
+
 function compareFieldSummaries(left: NativeIwaFieldSummary, right: NativeIwaFieldSummary): number {
-  const leftScore = left.textCandidateCount * 4 + left.referenceCandidateCount * 4 + left.nestedMessageCount * 2 + left.occurrences;
-  const rightScore = right.textCandidateCount * 4 + right.referenceCandidateCount * 4 + right.nestedMessageCount * 2 + right.occurrences;
+  const leftScore =
+    left.textCandidateCount * 4 +
+    left.referenceCandidateCount * 4 +
+    left.numericCandidateCount * 2 +
+    left.nestedMessageCount * 2 +
+    left.occurrences;
+  const rightScore =
+    right.textCandidateCount * 4 +
+    right.referenceCandidateCount * 4 +
+    right.numericCandidateCount * 2 +
+    right.nestedMessageCount * 2 +
+    right.occurrences;
   if (leftScore !== rightScore) {
     return rightScore - leftScore;
   }
@@ -1411,6 +2241,80 @@ function compareFieldPaths(left: string, right: string): number {
 
 function sourceRank(source: "protobuf" | "raw"): number {
   return source === "protobuf" ? 2 : 1;
+}
+
+function animationKindRank(kind: NativeIwaAnimationHint["kind"]): number {
+  switch (kind) {
+    case "magicMove":
+      return 4;
+    case "morph":
+      return 3;
+    case "transition":
+      return 2;
+    case "build":
+      return 1;
+  }
+}
+
+function stripNumericCandidateInternalFields(candidate: IwaNumericCandidate): NativeIwaNumericCandidate {
+  return {
+    fieldPath: candidate.fieldPath,
+    fieldNumber: candidate.fieldNumber,
+    wireType: candidate.wireType,
+    value: candidate.value,
+    encoding: candidate.encoding,
+    confidence: candidate.confidence
+  };
+}
+
+function parentFieldPath(fieldPath: string): string | undefined {
+  const parts = fieldPath.split(".");
+  if (parts.length < 2) {
+    return undefined;
+  }
+  return parts.slice(0, -1).join(".");
+}
+
+function commonFieldPathPrefix(fieldPaths: string[]): string | undefined {
+  if (fieldPaths.length === 0) {
+    return undefined;
+  }
+  const first = fieldPaths[0]?.split(".") ?? [];
+  const prefix: string[] = [];
+  for (let index = 0; index < first.length; index += 1) {
+    const value = first[index];
+    if (value === undefined || !fieldPaths.every((fieldPath) => fieldPath.split(".")[index] === value)) {
+      break;
+    }
+    prefix.push(value);
+  }
+  return prefix.length > 0 ? prefix.join(".") : undefined;
+}
+
+function roundGeometryNumber(value: number): number {
+  return Number(value.toFixed(3));
+}
+
+function roundConfidence(value: number): number {
+  return Number(Math.max(0, Math.min(1, value)).toFixed(3));
+}
+
+function clampGeometryCandidateBounds(
+  bounds: { x: number; y: number; width: number; height: number },
+  deckSize: { width: number; height: number }
+): { x: number; y: number; width: number; height: number } {
+  const maxWidth = Math.max(1, deckSize.width * 2);
+  const maxHeight = Math.max(1, deckSize.height * 2);
+  const x = Math.max(0, Math.min(bounds.x, maxWidth));
+  const y = Math.max(0, Math.min(bounds.y, maxHeight));
+  const width = Math.max(1, Math.min(bounds.width, Math.max(1, maxWidth - x)));
+  const height = Math.max(1, Math.min(bounds.height, Math.max(1, maxHeight - y)));
+  return {
+    x: roundGeometryNumber(x),
+    y: roundGeometryNumber(y),
+    width: roundGeometryNumber(width),
+    height: roundGeometryNumber(height)
+  };
 }
 
 function normalizeAssetStem(value: string): string {
@@ -1669,6 +2573,187 @@ function readDeckSize(values: JSONRecord): { width: number; height: number } | u
     return undefined;
   }
   return { width, height };
+}
+
+function createQuickLookPreviewMetadata(entryPath: string, data: Uint8Array): NativeQuickLookPreviewMetadata {
+  const classification = classifyAssetPath(entryPath);
+  const dimensions = readImageDimensions(data, classification.mimeType);
+  return {
+    path: entryPath,
+    byteLength: data.byteLength,
+    role: classifyQuickLookRole(entryPath),
+    mimeType: classification.mimeType,
+    ...(dimensions ? { width: dimensions.width, height: dimensions.height } : {})
+  };
+}
+
+function classifyQuickLookRole(entryPath: string): NativeQuickLookPreviewMetadata["role"] {
+  const baseName = path.posix.basename(entryPath).toLowerCase();
+  if (/thumb|thumbnail/.test(baseName)) {
+    return "thumbnail";
+  }
+  if (/preview|slide|page/.test(baseName)) {
+    return "preview";
+  }
+  return "unknown";
+}
+
+function readImageDimensions(
+  data: Uint8Array,
+  mimeType: string | undefined
+): { width: number; height: number; source: string } | undefined {
+  return (
+    readPngDimensions(data) ??
+    readJpegDimensions(data) ??
+    readGifDimensions(data) ??
+    readWebpDimensions(data) ??
+    (mimeType === "image/tiff" ? readTiffDimensions(data) : undefined)
+  );
+}
+
+function readPngDimensions(data: Uint8Array): { width: number; height: number; source: string } | undefined {
+  if (
+    data.byteLength < 24 ||
+    data[0] !== 0x89 ||
+    data[1] !== 0x50 ||
+    data[2] !== 0x4e ||
+    data[3] !== 0x47 ||
+    decodeAscii(data.subarray(12, 16)) !== "IHDR"
+  ) {
+    return undefined;
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  return validateImageDimensions(view.getUint32(16, false), view.getUint32(20, false), "png-ihdr");
+}
+
+function readJpegDimensions(data: Uint8Array): { width: number; height: number; source: string } | undefined {
+  if (data.byteLength < 4 || data[0] !== 0xff || data[1] !== 0xd8) {
+    return undefined;
+  }
+  let offset = 2;
+  while (offset + 9 <= data.byteLength) {
+    if (data[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    let markerOffset = offset + 1;
+    while (data[markerOffset] === 0xff) {
+      markerOffset += 1;
+    }
+    const marker = data[markerOffset];
+    if (marker === undefined || marker === 0xd9 || marker === 0xda) {
+      break;
+    }
+    const lengthOffset = markerOffset + 1;
+    if (lengthOffset + 2 > data.byteLength) {
+      break;
+    }
+    const segmentLength = ((data[lengthOffset] ?? 0) << 8) | (data[lengthOffset + 1] ?? 0);
+    if (segmentLength < 2 || lengthOffset + segmentLength > data.byteLength) {
+      break;
+    }
+    if (isJpegStartOfFrameMarker(marker)) {
+      const height = ((data[lengthOffset + 3] ?? 0) << 8) | (data[lengthOffset + 4] ?? 0);
+      const width = ((data[lengthOffset + 5] ?? 0) << 8) | (data[lengthOffset + 6] ?? 0);
+      return validateImageDimensions(width, height, "jpeg-sof");
+    }
+    offset = lengthOffset + segmentLength;
+  }
+  return undefined;
+}
+
+function isJpegStartOfFrameMarker(marker: number | undefined): boolean {
+  return marker !== undefined && marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker);
+}
+
+function readGifDimensions(data: Uint8Array): { width: number; height: number; source: string } | undefined {
+  if (data.byteLength < 10) {
+    return undefined;
+  }
+  const signature = decodeAscii(data.subarray(0, 6));
+  if (signature !== "GIF87a" && signature !== "GIF89a") {
+    return undefined;
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  return validateImageDimensions(view.getUint16(6, true), view.getUint16(8, true), "gif-logical-screen");
+}
+
+function readWebpDimensions(data: Uint8Array): { width: number; height: number; source: string } | undefined {
+  if (data.byteLength < 30 || decodeAscii(data.subarray(0, 4)) !== "RIFF" || decodeAscii(data.subarray(8, 12)) !== "WEBP") {
+    return undefined;
+  }
+  const chunkType = decodeAscii(data.subarray(12, 16));
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  if (chunkType === "VP8X" && data.byteLength >= 30) {
+    const width = 1 + (data[24] ?? 0) + ((data[25] ?? 0) << 8) + ((data[26] ?? 0) << 16);
+    const height = 1 + (data[27] ?? 0) + ((data[28] ?? 0) << 8) + ((data[29] ?? 0) << 16);
+    return validateImageDimensions(width, height, "webp-vp8x");
+  }
+  if (chunkType === "VP8 " && data.byteLength >= 30) {
+    const width = view.getUint16(26, true) & 0x3fff;
+    const height = view.getUint16(28, true) & 0x3fff;
+    return validateImageDimensions(width, height, "webp-vp8");
+  }
+  if (chunkType === "VP8L" && data.byteLength >= 25) {
+    const b0 = data[21] ?? 0;
+    const b1 = data[22] ?? 0;
+    const b2 = data[23] ?? 0;
+    const b3 = data[24] ?? 0;
+    const width = 1 + (((b1 & 0x3f) << 8) | b0);
+    const height = 1 + ((b3 << 6) | (b2 << 2) | ((b1 & 0xc0) >>> 6));
+    return validateImageDimensions(width, height, "webp-vp8l");
+  }
+  return undefined;
+}
+
+function readTiffDimensions(data: Uint8Array): { width: number; height: number; source: string } | undefined {
+  if (data.byteLength < 16) {
+    return undefined;
+  }
+  const littleEndian = data[0] === 0x49 && data[1] === 0x49;
+  const bigEndian = data[0] === 0x4d && data[1] === 0x4d;
+  if (!littleEndian && !bigEndian) {
+    return undefined;
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const magic = view.getUint16(2, littleEndian);
+  if (magic !== 42) {
+    return undefined;
+  }
+  const ifdOffset = view.getUint32(4, littleEndian);
+  if (ifdOffset + 2 > data.byteLength) {
+    return undefined;
+  }
+  const entryCount = view.getUint16(ifdOffset, littleEndian);
+  let width: number | undefined;
+  let height: number | undefined;
+  for (let index = 0; index < entryCount; index += 1) {
+    const entryOffset = ifdOffset + 2 + index * 12;
+    if (entryOffset + 12 > data.byteLength) {
+      break;
+    }
+    const tag = view.getUint16(entryOffset, littleEndian);
+    const type = view.getUint16(entryOffset + 2, littleEndian);
+    const count = view.getUint32(entryOffset + 4, littleEndian);
+    if (count !== 1 || (type !== 3 && type !== 4)) {
+      continue;
+    }
+    const value = type === 3 ? view.getUint16(entryOffset + 8, littleEndian) : view.getUint32(entryOffset + 8, littleEndian);
+    if (tag === 256) width = value;
+    if (tag === 257) height = value;
+  }
+  return width !== undefined && height !== undefined ? validateImageDimensions(width, height, "tiff-ifd") : undefined;
+}
+
+function validateImageDimensions(
+  width: number,
+  height: number,
+  source: string
+): { width: number; height: number; source: string } | undefined {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0 || width > 100000 || height > 100000) {
+    return undefined;
+  }
+  return { width, height, source };
 }
 
 function stringValue(values: JSONRecord, keys: string[]): string | undefined {

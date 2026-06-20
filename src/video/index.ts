@@ -5,8 +5,20 @@ import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 import type { DeckIR } from "../ir/index.ts";
-import { comparePngFiles, type PixelFidelityOptions, type PixelFidelityResult } from "../report/fidelity.ts";
-import { createDeckTimeline, renderHtmlDocument, resolveDeckTime, type DeckTimeResolution } from "../runtime/index.ts";
+import {
+  aggregatePixelFidelityResults,
+  comparePngFiles,
+  type PixelFidelityOptions,
+  type PixelFidelityResult
+} from "../report/fidelity.ts";
+import {
+  createDeckTimeline,
+  createRuntimeFrameSnapshot,
+  renderHtmlDocument,
+  resolveDeckTime,
+  type DeckTimeResolution,
+  type RuntimeFrameSnapshot
+} from "../runtime/index.ts";
 
 export interface VideoExportOptions {
   fps?: number;
@@ -18,6 +30,11 @@ export interface VideoExportOptions {
 
 export interface VideoFrameCaptureOptions extends VideoExportOptions {
   outputDir?: string;
+  captureRuntimeSnapshots?: boolean;
+  includeInactiveSlides?: boolean;
+  frameSettleAnimationFrames?: number;
+  onBeforeFrameCapture?: (frame: VideoFramePlan) => void | Promise<void>;
+  onAfterFrameCapture?: (frame: CapturedVideoFrame) => void | Promise<void>;
 }
 
 export interface VideoFrameCaptureResult {
@@ -30,6 +47,12 @@ export interface VideoFrameCaptureResult {
 
 export interface CapturedVideoFrame extends VideoFramePlan {
   filePath: string;
+  runtimeSnapshot?: RuntimeFrameSnapshot;
+  expectedSnapshot: RuntimeFrameSnapshot;
+}
+
+export interface VideoFrameDiagnostic extends VideoFramePlan {
+  snapshot: RuntimeFrameSnapshot;
 }
 
 export interface PixelFrameFidelityOptions extends PixelFidelityOptions {
@@ -42,6 +65,7 @@ export type PixelFrameFidelityResult = PixelFidelityResult;
 export interface VideoFrameFidelityOptions extends PixelFrameFidelityOptions {
   diffDir?: string;
   reportPath?: string;
+  framePassThreshold?: number;
 }
 
 export interface VideoFrameFidelityEntry extends PixelFidelityResult {
@@ -62,11 +86,36 @@ export interface VideoFrameFidelityReport {
     totalPixels: number;
     comparedPixels: number;
     mismatchedPixels: number;
+    matchedFrames: number;
+    mismatchedFrames: number;
+    passingFrames: number;
+    failingFrames: number;
     mismatchRatio: number;
+    meanMismatchRatio: number;
+    maxMismatchRatio: number;
     meanPixelFidelityScore: number;
+    minPixelFidelityScore: number;
+    maxPixelFidelityScore: number;
+    frameFidelityPassThreshold: number;
+    transitionFrameCount: number;
+    contentFrameCount: number;
     worstFrame?: VideoFrameFidelityEntry;
+    bestFrame?: VideoFrameFidelityEntry;
+    bySlide: VideoFrameFidelitySlideSummary[];
   };
   reportPath?: string;
+}
+
+export interface VideoFrameFidelitySlideSummary {
+  slideIndex: number;
+  slideId: string;
+  frameCount: number;
+  transitionFrameCount: number;
+  totalPixels: number;
+  mismatchedPixels: number;
+  mismatchRatio: number;
+  meanPixelFidelityScore: number;
+  worstFrame?: number;
 }
 
 export interface VideoDependencyStatus {
@@ -79,6 +128,9 @@ export interface VideoDependencyStatus {
     pixelmatch: boolean;
     pngjs: boolean;
   };
+  canCaptureFrames: boolean;
+  canExportVideo: boolean;
+  canComparePng: boolean;
   guidance: string[];
 }
 
@@ -164,6 +216,23 @@ export function createVideoFramePlan(
   });
 }
 
+export function createVideoFrameDiagnostics(
+  deck: DeckIR,
+  options: Pick<VideoExportOptions, "fps" | "scale"> & {
+    totalFrames?: number;
+    framePathPrefix?: string;
+    includeInactiveSlides?: boolean;
+  } = {}
+): VideoFrameDiagnostic[] {
+  return createVideoFramePlan(deck, options).map((frame) => ({
+    ...frame,
+    snapshot: createRuntimeFrameSnapshot(deck, frame.timeMs, {
+      effectiveGroupStates: true,
+      includeInactiveSlides: options.includeInactiveSlides
+    })
+  }));
+}
+
 export async function comparePixelFrames(
   referencePngPath: string,
   actualPngPath: string,
@@ -176,15 +245,16 @@ export async function captureVideoFrames(
   deck: DeckIR,
   options: VideoFrameCaptureOptions = {}
 ): Promise<VideoFrameCaptureResult> {
-  const { chromium } = await importPlaywright().catch(() => {
-    throw new VideoExportDependencyError(["playwright"]);
-  });
+  const missing = await missingFrameCaptureDependencies();
+  if (missing.length) throw new VideoExportDependencyError(missing);
+  const { chromium } = await importPlaywright();
   const plan = createVideoExportPlan(deck, options);
   const ownsFramesDir = !options.outputDir && !options.framesDir;
   const framesDir = path.resolve(options.outputDir ?? options.framesDir ?? (await mkdtemp(path.join(tmpdir(), "keymorph-frames-"))));
   const htmlPath = path.join(framesDir, "runtime.html");
   let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
   let completed = false;
+  const capturedFrames: CapturedVideoFrame[] = [];
 
   try {
     await mkdir(framesDir, { recursive: true });
@@ -202,13 +272,42 @@ export async function captureVideoFrames(
 
     for (const frame of plan.frames) {
       const framePath = path.join(framesDir, frame.outputPath);
+      const expectedSnapshot = createRuntimeFrameSnapshot(deck, frame.timeMs, {
+        effectiveGroupStates: true,
+        includeInactiveSlides: options.includeInactiveSlides
+      });
       await mkdir(path.dirname(framePath), { recursive: true });
-      await page.evaluate(async (time) => {
-        window.__keyMorphRuntime?.seekGlobal(time);
-        await document.fonts?.ready;
-        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      }, frame.timeMs);
+      await options.onBeforeFrameCapture?.(frame);
+      const runtimeSnapshot = await page.evaluate(
+        async ({ timeMs, includeInactiveSlides, animationFrames, captureRuntimeSnapshots }) => {
+          if (captureRuntimeSnapshots && window.__keyMorphRuntime?.captureFrame) {
+            return window.__keyMorphRuntime.captureFrame(timeMs, {
+              includeInactiveSlides,
+              animationFrames,
+              effectiveGroupStates: true
+            });
+          }
+          window.__keyMorphRuntime?.seekGlobal(timeMs);
+          await document.fonts?.ready;
+          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          return captureRuntimeSnapshots ? window.__keyMorphRuntime?.getGlobalSnapshot?.(timeMs, { includeInactiveSlides }) : undefined;
+        },
+        {
+          timeMs: frame.timeMs,
+          includeInactiveSlides: options.includeInactiveSlides ?? false,
+          animationFrames: options.frameSettleAnimationFrames ?? 2,
+          captureRuntimeSnapshots: options.captureRuntimeSnapshots ?? true
+        }
+      );
       await page.screenshot({ path: framePath });
+      const capturedFrame: CapturedVideoFrame = {
+        ...frame,
+        filePath: framePath,
+        runtimeSnapshot: runtimeSnapshot ?? undefined,
+        expectedSnapshot
+      };
+      capturedFrames.push(capturedFrame);
+      await options.onAfterFrameCapture?.(capturedFrame);
     }
 
     completed = true;
@@ -216,7 +315,7 @@ export async function captureVideoFrames(
       plan,
       framesDir,
       htmlPath,
-      frames: plan.frames.map((frame) => ({ ...frame, filePath: path.join(framesDir, frame.outputPath) })),
+      frames: capturedFrames,
       cleanup: ownsFramesDir ? () => rm(framesDir, { recursive: true, force: true }) : undefined
     };
   } finally {
@@ -255,7 +354,7 @@ export async function createVideoFrameFidelityReport(
     generatedAt: new Date().toISOString(),
     plan: summarizePlan(plan),
     frames,
-    summary: summarizeFrameFidelity(frames),
+    summary: summarizeFrameFidelity(frames, normalizeFramePassThreshold(options.framePassThreshold)),
     reportPath: options.reportPath
   };
   if (options.reportPath) {
@@ -306,30 +405,87 @@ function summarizePlan(plan: VideoExportPlan): Omit<VideoExportPlan, "frames"> {
   };
 }
 
-function summarizeFrameFidelity(frames: VideoFrameFidelityEntry[]): VideoFrameFidelityReport["summary"] {
+function summarizeFrameFidelity(
+  frames: VideoFrameFidelityEntry[],
+  frameFidelityPassThreshold: number
+): VideoFrameFidelityReport["summary"] {
+  const aggregate = aggregatePixelFidelityResults(frames, { passThreshold: frameFidelityPassThreshold });
   const frameCount = frames.length;
-  const totalPixels = frames.reduce((sum, frame) => sum + frame.totalPixels, 0);
-  const comparedPixels = frames.reduce((sum, frame) => sum + frame.comparedPixels, 0);
-  const mismatchedPixels = frames.reduce((sum, frame) => sum + frame.mismatchedPixels, 0);
-  const meanPixelFidelityScore = frameCount
-    ? frames.reduce((sum, frame) => sum + frame.pixelFidelityScore, 0) / frameCount
-    : 1;
+  const transitionFrameCount = frames.filter((frame) => frame.resolution.inTransition).length;
+  const contentFrameCount = frameCount - transitionFrameCount;
   const worstFrame = frames.reduce<VideoFrameFidelityEntry | undefined>((worst, frame) => {
     if (!worst) return frame;
     if (frame.pixelFidelityScore < worst.pixelFidelityScore) return frame;
     if (frame.pixelFidelityScore === worst.pixelFidelityScore && frame.mismatchRatio > worst.mismatchRatio) return frame;
     return worst;
   }, undefined);
+  const bestFrame = frames.reduce<VideoFrameFidelityEntry | undefined>((best, frame) => {
+    if (!best) return frame;
+    if (frame.pixelFidelityScore > best.pixelFidelityScore) return frame;
+    if (frame.pixelFidelityScore === best.pixelFidelityScore && frame.mismatchRatio < best.mismatchRatio) return frame;
+    return best;
+  }, undefined);
 
   return {
     frameCount,
-    totalPixels,
-    comparedPixels,
-    mismatchedPixels,
-    mismatchRatio: Number((mismatchedPixels / Math.max(1, totalPixels)).toFixed(6)),
-    meanPixelFidelityScore: Number(meanPixelFidelityScore.toFixed(4)),
-    worstFrame
+    totalPixels: aggregate.totalPixels,
+    comparedPixels: aggregate.comparedPixels,
+    mismatchedPixels: aggregate.mismatchedPixels,
+    matchedFrames: aggregate.matchedItems,
+    mismatchedFrames: aggregate.mismatchedItems,
+    passingFrames: aggregate.passingItems,
+    failingFrames: aggregate.failingItems,
+    mismatchRatio: aggregate.mismatchRatio,
+    meanMismatchRatio: aggregate.meanMismatchRatio,
+    maxMismatchRatio: aggregate.maxMismatchRatio,
+    meanPixelFidelityScore: aggregate.meanPixelFidelityScore,
+    minPixelFidelityScore: aggregate.minPixelFidelityScore,
+    maxPixelFidelityScore: aggregate.maxPixelFidelityScore,
+    frameFidelityPassThreshold: aggregate.passThreshold,
+    transitionFrameCount,
+    contentFrameCount,
+    worstFrame,
+    bestFrame,
+    bySlide: summarizeFrameFidelityBySlide(frames)
   };
+}
+
+function summarizeFrameFidelityBySlide(frames: VideoFrameFidelityEntry[]): VideoFrameFidelitySlideSummary[] {
+  const groups = new Map<string, VideoFrameFidelityEntry[]>();
+  for (const frame of frames) {
+    const key = `${frame.resolution.slideIndex}:${frame.resolution.slideId}`;
+    const list = groups.get(key) ?? [];
+    list.push(frame);
+    groups.set(key, list);
+  }
+
+  return Array.from(groups.values()).map((slideFrames) => {
+    const first = slideFrames[0];
+    const frameCount = slideFrames.length;
+    const totalPixels = slideFrames.reduce((sum, frame) => sum + frame.totalPixels, 0);
+    const mismatchedPixels = slideFrames.reduce((sum, frame) => sum + frame.mismatchedPixels, 0);
+    const meanPixelFidelityScore = frameCount
+      ? slideFrames.reduce((sum, frame) => sum + frame.pixelFidelityScore, 0) / frameCount
+      : 1;
+    const worst = slideFrames.reduce<VideoFrameFidelityEntry | undefined>((candidate, frame) => {
+      if (!candidate) return frame;
+      if (frame.pixelFidelityScore < candidate.pixelFidelityScore) return frame;
+      if (frame.pixelFidelityScore === candidate.pixelFidelityScore && frame.mismatchRatio > candidate.mismatchRatio) return frame;
+      return candidate;
+    }, undefined);
+
+    return {
+      slideIndex: first?.resolution.slideIndex ?? 0,
+      slideId: first?.resolution.slideId ?? "",
+      frameCount,
+      transitionFrameCount: slideFrames.filter((frame) => frame.resolution.inTransition).length,
+      totalPixels,
+      mismatchedPixels,
+      mismatchRatio: Number((mismatchedPixels / Math.max(1, totalPixels)).toFixed(6)),
+      meanPixelFidelityScore: Number(meanPixelFidelityScore.toFixed(4)),
+      worstFrame: worst?.frame
+    };
+  });
 }
 
 async function missingVideoDependencies(ffmpegPath = "ffmpeg"): Promise<string[]> {
@@ -362,18 +518,27 @@ export async function describeVideoDependencies(ffmpegPath = "ffmpeg"): Promise<
     missingPixelFrameDependencies()
   ]);
   const missing = Array.from(new Set([...videoMissing, ...frameCaptureMissing]));
+  const available = {
+    playwright: !missing.includes("playwright"),
+    browser: !missing.includes("playwright") && !missing.includes("playwright chromium browser"),
+    ffmpeg: !missing.includes("ffmpeg"),
+    pngFidelity: true,
+    pixelmatch: !pixelMissing.includes("pixelmatch"),
+    pngjs: !pixelMissing.includes("pngjs")
+  };
   return {
     missing,
-    available: {
-      playwright: !missing.includes("playwright"),
-      browser: !missing.includes("playwright") && !missing.includes("playwright chromium browser"),
-      ffmpeg: !missing.includes("ffmpeg"),
-      pngFidelity: true,
-      pixelmatch: !pixelMissing.includes("pixelmatch"),
-      pngjs: !pixelMissing.includes("pngjs")
-    },
+    available,
+    canCaptureFrames: available.playwright && available.browser,
+    canExportVideo: available.playwright && available.browser && available.ffmpeg,
+    canComparePng: available.pngFidelity,
     guidance: videoDependencyGuidance(missing)
   };
+}
+
+function normalizeFramePassThreshold(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return 0.995;
+  return Math.max(0, Math.min(1, value));
 }
 
 function videoDependencyGuidance(missing: string[]): string[] {

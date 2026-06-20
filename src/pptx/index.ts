@@ -291,7 +291,7 @@ interface ParsedTimingNode {
   path: string[];
 }
 
-type SupportedTimingTag = "animEffect" | "set" | "animMotion" | "animScale" | "animRot";
+type SupportedTimingTag = "animEffect" | "anim" | "set" | "animMotion" | "animScale" | "animRot";
 
 interface TimingSequenceContext {
   kind: "absolute" | "withPrevious" | "afterPrevious" | "onClick";
@@ -343,7 +343,15 @@ function parseSlideTiming(
   const parsedEvents: ParsedTimingEvent[] = [];
 
   for (const node of timingNodes) {
-    const event = parseSupportedTimingEvent(node, slideIndex, parsedEvents.length, slideSize, shapeIdToObjectId, result.unsupportedFeatures);
+    const event = parseSupportedTimingEvent(
+      node,
+      slideIndex,
+      parsedEvents.length,
+      slideSize,
+      shapeIdToObjectId,
+      result.unsupportedFeatures,
+      result.degradedFeatures
+    );
     if (!event) continue;
     const timingContext = readTimingSequenceContext(
       timingXml,
@@ -359,29 +367,8 @@ function parseSlideTiming(
     result.events.push(event);
   }
 
-  for (const tag of ["anim", "animClr", "cmd"]) {
-    for (const _node of extractXmlElements(timingXml, tag)) {
-      result.unsupportedFeatures.push({
-        code: `presentationml-${tag}`,
-        severity: "warning",
-        area: "animation",
-        description: `PowerPoint p:${tag} animation nodes are not mapped to the IR timeline yet.`,
-        sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:${tag}`,
-        fallback: "Preserve the static object and omit this animation."
-      });
-    }
-  }
-
-  if (/<p:(?:nextCondLst|endCondLst)\b/.test(timingXml)) {
-    result.degradedFeatures.push({
-      code: "presentationml-timing-conditions",
-      severity: "warning",
-      area: "animation",
-      description: "PowerPoint sequence next/end conditions are not fully modeled by the IR timeline.",
-      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing`,
-      fallback: "Import supported effect order and explicit start conditions; omit next/end condition behavior."
-    });
-  }
+  reportUnsupportedTimingNodes(timingXml, timingTree, slideIndex, result.unsupportedFeatures);
+  reportTimingConditionLists(timingXml, timingTree, slideIndex, result.degradedFeatures);
 
   const triggerBuildSequences = parseTriggerBuildSequences(timingXml, shapeIdToObjectId);
   addTimingDependencies(slideIndex, parsedEvents, triggerBuildSequences, result);
@@ -397,21 +384,25 @@ function parseSupportedTimingEvent(
   eventIndex: number,
   slideSize: { width: number; height: number },
   shapeIdToObjectId: Map<string, string>,
-  unsupportedFeatures: UnsupportedFeature[]
+  unsupportedFeatures: UnsupportedFeature[],
+  degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
   if (node.tag === "animEffect") {
-    return parseFadeEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures);
+    return parseFadeEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
+  }
+  if (node.tag === "anim") {
+    return parsePropertyAnimation(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
   }
   if (node.tag === "set") {
-    return parseVisibilitySet(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures);
+    return parseVisibilitySet(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
   }
   if (node.tag === "animMotion") {
-    return parseMotionEffect(node.xml, slideIndex, eventIndex, slideSize, shapeIdToObjectId, unsupportedFeatures);
+    return parseMotionEffect(node.xml, slideIndex, eventIndex, slideSize, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
   }
   if (node.tag === "animScale") {
-    return parseScaleEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures);
+    return parseScaleEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
   }
-  return parseRotationEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures);
+  return parseRotationEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
 }
 
 function applyTimingContext(event: AnimationEvent, context: TimingSequenceContext): void {
@@ -433,18 +424,20 @@ function parseFadeEffect(
   slideIndex: number,
   eventIndex: number,
   shapeIdToObjectId: Map<string, string>,
-  unsupportedFeatures: UnsupportedFeature[]
+  unsupportedFeatures: UnsupportedFeature[],
+  degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
   const attrs = readXmlAttributes(node, "animEffect");
   const filter = String(attrs.get("filter") ?? "").toLowerCase();
   if (!filter.includes("fade")) {
+    const metadata = describeAnimEffectMetadata(node);
     unsupportedFeatures.push({
       code: "presentationml-animation-effect",
       severity: "warning",
       area: "animation",
-      description: `PowerPoint animEffect filter "${attrs.get("filter") ?? "unknown"}" is not mapped to IR keyframes.`,
+      description: `PowerPoint animEffect is not mapped to IR keyframes (${metadata}).`,
       sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:animEffect`,
-      fallback: "Preserve the static object and omit this effect."
+      fallback: "Preserve the static object and report the effect metadata; omit this effect."
     });
     return undefined;
   }
@@ -454,15 +447,16 @@ function parseFadeEffect(
 
   const transition = String(attrs.get("transition") ?? "in").toLowerCase();
   const fadesOut = transition === "out";
+  const timing = readTimingNodeSemantics(node, 500, slideIndex, "animEffect", degradedFeatures);
   return {
     id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
     kind: "keyframes",
     label: fadesOut ? "Fade out" : "Fade in",
     targetId,
     start: { type: "absolute", atMs: readTimingDelay(node) },
-    durationMs: readTimingDuration(node, 500),
+    durationMs: timing.durationMs,
     easing: "linear",
-    fill: "both",
+    fill: timing.fill,
     tracks: [
       {
         property: "opacity",
@@ -472,7 +466,57 @@ function parseFadeEffect(
         ]
       }
     ],
-    metadata: { pptxEffect: "fade", pptxTransition: fadesOut ? "out" : "in" }
+    metadata: { ...timing.metadata, pptxEffect: "fade", pptxTransition: fadesOut ? "out" : "in" }
+  };
+}
+
+function parsePropertyAnimation(
+  node: string,
+  slideIndex: number,
+  eventIndex: number,
+  shapeIdToObjectId: Map<string, string>,
+  unsupportedFeatures: UnsupportedFeature[],
+  degradedFeatures: DegradedFeature[]
+): AnimationEvent | undefined {
+  const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
+  if (!targetId) return undefined;
+
+  const attrNames = readTimingAttrNames(node);
+  const property = firstMappedAnimProperty(attrNames);
+  const values = readPropertyAnimationKeyframes(node, property);
+  if (!property || values.length < 2) {
+    const attrs = readXmlAttributes(node, "anim");
+    unsupportedFeatures.push({
+      code: "presentationml-anim-property",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint p:anim attributes "${attrNames.join(", ") || "unknown"}" with valueType="${attrs.get("valueType") ?? "unknown"}" are not a supported numeric property animation.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:anim`,
+      fallback: "Preserve the static object and omit this property animation."
+    });
+    return undefined;
+  }
+
+  const attrs = readXmlAttributes(node, "anim");
+  const timing = readTimingNodeSemantics(node, 500, slideIndex, "anim", degradedFeatures);
+  return {
+    id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+    kind: "keyframes",
+    label: `Animate ${property}`,
+    targetId,
+    start: { type: "absolute", atMs: readTimingDelay(node) },
+    durationMs: timing.durationMs,
+    easing: attrs.get("calcmode") === "discrete" ? { type: "steps", count: 1, position: "end" } : "linear",
+    fill: timing.fill,
+    tracks: [{ property, keyframes: values }],
+    metadata: {
+      ...timing.metadata,
+      pptxEffect: "propertyAnimation",
+      pptxTag: "anim",
+      pptxAttribute: attrNames[0] ?? property,
+      ...(attrs.get("calcmode") ? { pptxCalcMode: attrs.get("calcmode") ?? "" } : {}),
+      ...(attrs.get("valueType") ? { pptxValueType: attrs.get("valueType") ?? "" } : {})
+    }
   };
 }
 
@@ -481,9 +525,10 @@ function parseVisibilitySet(
   slideIndex: number,
   eventIndex: number,
   shapeIdToObjectId: Map<string, string>,
-  unsupportedFeatures: UnsupportedFeature[]
+  unsupportedFeatures: UnsupportedFeature[],
+  degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
-  const attrNames = Array.from(node.matchAll(/<p:attrName>([\s\S]*?)<\/p:attrName>/g)).map((match) => unescapeXml(match[1]));
+  const attrNames = readTimingAttrNames(node);
   if (!attrNames.some((name) => name.toLowerCase() === "style.visibility")) {
     unsupportedFeatures.push({
       code: "presentationml-set-animation",
@@ -512,6 +557,7 @@ function parseVisibilitySet(
     return undefined;
   }
 
+  const timing = readTimingNodeSemantics(node, 0, slideIndex, "set", degradedFeatures);
   return {
     id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
     kind: "visibility",
@@ -519,9 +565,9 @@ function parseVisibilitySet(
     targetId,
     start: { type: "absolute", atMs: readTimingDelay(node) },
     durationMs: 0,
-    fill: "both",
+    fill: timing.fill,
     visible,
-    metadata: { pptxEffect: "visibility" }
+    metadata: { ...timing.metadata, pptxEffect: "visibility" }
   };
 }
 
@@ -531,7 +577,8 @@ function parseMotionEffect(
   eventIndex: number,
   slideSize: { width: number; height: number },
   shapeIdToObjectId: Map<string, string>,
-  unsupportedFeatures: UnsupportedFeature[]
+  unsupportedFeatures: UnsupportedFeature[],
+  degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
   const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
   if (!targetId) return undefined;
@@ -574,17 +621,18 @@ function parseMotionEffect(
   }
   if (tracks.length === 0) return undefined;
 
+  const timing = readTimingNodeSemantics(node, 500, slideIndex, "animMotion", degradedFeatures);
   return {
     id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
     kind: "keyframes",
     label: "Motion path",
     targetId,
     start: { type: "absolute", atMs: readTimingDelay(node) },
-    durationMs: readTimingDuration(node, 500),
+    durationMs: timing.durationMs,
     easing: "linear",
-    fill: "both",
+    fill: timing.fill,
     tracks,
-    metadata: { pptxEffect: "motionPath" }
+    metadata: { ...timing.metadata, pptxEffect: "motionPath" }
   };
 }
 
@@ -593,7 +641,8 @@ function parseScaleEffect(
   slideIndex: number,
   eventIndex: number,
   shapeIdToObjectId: Map<string, string>,
-  unsupportedFeatures: UnsupportedFeature[]
+  unsupportedFeatures: UnsupportedFeature[],
+  degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
   const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
   if (!targetId) return undefined;
@@ -636,17 +685,18 @@ function parseScaleEffect(
   }
   if (tracks.length === 0) return undefined;
 
+  const timing = readTimingNodeSemantics(node, 500, slideIndex, "animScale", degradedFeatures);
   return {
     id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
     kind: "keyframes",
     label: "Scale",
     targetId,
     start: { type: "absolute", atMs: readTimingDelay(node) },
-    durationMs: readTimingDuration(node, 500),
+    durationMs: timing.durationMs,
     easing: "linear",
-    fill: "both",
+    fill: timing.fill,
     tracks,
-    metadata: { pptxEffect: "scale" }
+    metadata: { ...timing.metadata, pptxEffect: "scale" }
   };
 }
 
@@ -655,7 +705,8 @@ function parseRotationEffect(
   slideIndex: number,
   eventIndex: number,
   shapeIdToObjectId: Map<string, string>,
-  unsupportedFeatures: UnsupportedFeature[]
+  unsupportedFeatures: UnsupportedFeature[],
+  degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
   const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
   if (!targetId) return undefined;
@@ -674,15 +725,16 @@ function parseRotationEffect(
     return undefined;
   }
 
+  const timing = readTimingNodeSemantics(node, 500, slideIndex, "animRot", degradedFeatures);
   return {
     id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
     kind: "keyframes",
     label: "Rotate",
     targetId,
     start: { type: "absolute", atMs: readTimingDelay(node) },
-    durationMs: readTimingDuration(node, 500),
+    durationMs: timing.durationMs,
     easing: "linear",
-    fill: "both",
+    fill: timing.fill,
     tracks: [
       {
         property: "transform.rotateDeg",
@@ -692,7 +744,7 @@ function parseRotationEffect(
         ]
       }
     ],
-    metadata: { pptxEffect: "rotation" }
+    metadata: { ...timing.metadata, pptxEffect: "rotation" }
   };
 }
 
@@ -741,7 +793,7 @@ function parseBuildListSequencing(
 }
 
 function extractSupportedTimingNodes(timingXml: string, ranges: XmlElementRange[]): ParsedTimingNode[] {
-  const supported = new Set<SupportedTimingTag>(["animEffect", "set", "animMotion", "animScale", "animRot"]);
+  const supported = new Set<SupportedTimingTag>(["animEffect", "anim", "set", "animMotion", "animScale", "animRot"]);
   return ranges
     .filter((range): range is XmlElementRange & { localName: SupportedTimingTag } => supported.has(range.localName as SupportedTimingTag))
     .sort((a, b) => a.start - b.start)
@@ -751,6 +803,113 @@ function extractSupportedTimingNodes(timingXml: string, ranges: XmlElementRange[
       range,
       path: xmlAncestorPath(range)
     }));
+}
+
+function reportUnsupportedTimingNodes(
+  timingXml: string,
+  ranges: XmlElementRange[],
+  slideIndex: number,
+  unsupportedFeatures: UnsupportedFeature[]
+): void {
+  const supported = new Set<SupportedTimingTag>(["animEffect", "anim", "set", "animMotion", "animScale", "animRot"]);
+  for (const range of ranges) {
+    if (!["animClr", "cmd"].includes(range.localName)) continue;
+    const nodeXml = timingXml.slice(range.start, range.end);
+    unsupportedFeatures.push({
+      code: `presentationml-${range.localName}`,
+      severity: "warning",
+      area: "animation",
+      description: unsupportedTimingNodeDescription(range.localName, nodeXml),
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/${xmlAncestorPath(range).join("/")}`,
+      fallback: "Preserve the static object and omit this animation."
+    });
+  }
+
+  const knownTimingNodes = new Set([
+    ...supported,
+    "animClr",
+    "cmd",
+    "par",
+    "seq",
+    "cTn",
+    "childTnLst",
+    "stCondLst",
+    "nextCondLst",
+    "endCondLst",
+    "cond",
+    "tgtEl",
+    "spTgt",
+    "cBhvr",
+    "attrNameLst",
+    "attrName",
+    "to",
+    "from",
+    "by",
+    "tmAbs",
+    "tavLst",
+    "tav",
+    "val",
+    "fltVal",
+    "strVal",
+    "boolVal",
+    "pt",
+    "bldLst",
+    "bldP",
+    "bld"
+  ]);
+  for (const range of ranges) {
+    if (!range.parent || knownTimingNodes.has(range.localName)) continue;
+    if (!isTimingAnimationElement(range.localName)) continue;
+    unsupportedFeatures.push({
+      code: `presentationml-${range.localName}`,
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint p:${range.localName} timing nodes are not mapped to the IR timeline yet.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/${xmlAncestorPath(range).join("/")}`,
+      fallback: "Preserve the static object and omit this animation."
+    });
+  }
+}
+
+function unsupportedTimingNodeDescription(localName: string, nodeXml: string): string {
+  if (localName === "cmd") {
+    const attrs = readXmlAttributes(nodeXml, "cmd");
+    const commandType = attrs.get("type") ?? "unknown";
+    const command = nodeXml.match(/<p:cmd\b[^>]*cmd="([^"]*)"/)?.[1] ?? attrs.get("cmd");
+    return `PowerPoint p:cmd animation command type "${commandType}"${command ? ` (${command})` : ""} is not executable in the IR timeline.`;
+  }
+  if (localName === "animClr") {
+    return "PowerPoint p:animClr color animation is not mapped to IR color keyframes yet.";
+  }
+  return `PowerPoint p:${localName} animation nodes are not mapped to the IR timeline yet.`;
+}
+
+function isTimingAnimationElement(localName: string): boolean {
+  return localName.startsWith("anim") || localName === "cmd" || localName === "set";
+}
+
+function reportTimingConditionLists(
+  timingXml: string,
+  ranges: XmlElementRange[],
+  slideIndex: number,
+  degradedFeatures: DegradedFeature[]
+): void {
+  for (const range of ranges) {
+    if (range.localName !== "nextCondLst" && range.localName !== "endCondLst") continue;
+    const conds = childElementXml(timingXml, range, "cond");
+    const details = conds.map(describeTimingCondition).filter(Boolean).join("; ");
+    degradedFeatures.push({
+      code: `presentationml-${range.localName === "nextCondLst" ? "next-condition" : "end-condition"}`,
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint ${range.localName} timing semantics are not fully modeled${details ? ` (${details})` : ""}.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/${xmlAncestorPath(range).join("/")}`,
+      fallback:
+        range.localName === "nextCondLst"
+          ? "Import supported effect order and explicit start conditions; omit next-condition seeking behavior."
+          : "Import supported effect durations and omit end-condition termination behavior."
+    });
+  }
 }
 
 function readTimingSequenceContext(
@@ -971,6 +1130,187 @@ function resolveTimingTarget(
     });
   }
   return targetId;
+}
+
+function readTimingNodeSemantics(
+  node: string,
+  fallbackDurationMs: number,
+  slideIndex: number,
+  tagName: string,
+  degradedFeatures: DegradedFeature[]
+): { durationMs: number; fill: AnimationEvent["fill"]; metadata: Record<string, string | number | boolean> } {
+  const cTnAttrs = readBehaviorCTnAttributes(node);
+  const durationMs = parseTimingMs(cTnAttrs.get("dur"), fallbackDurationMs);
+  const fillValue = cTnAttrs.get("fill");
+  const fill = mapTimingFill(fillValue);
+  const metadata: Record<string, string | number | boolean> = {
+    ...(fillValue ? { pptxFill: fillValue } : {}),
+    ...(cTnAttrs.get("restart") ? { pptxRestart: cTnAttrs.get("restart") ?? "" } : {})
+  };
+
+  const repeatCount = cTnAttrs.get("repeatCount");
+  const repeatDuration = cTnAttrs.get("repeatDur");
+  const autoReverse = cTnAttrs.get("autoRev");
+  if (repeatCount) metadata.pptxRepeatCount = repeatCount;
+  if (repeatDuration) metadata.pptxRepeatDurationMs = parseTimingMs(repeatDuration, 0);
+  if (autoReverse) metadata.pptxAutoReverse = isXmlTrue(autoReverse);
+
+  if (fillValue && fillValue !== "hold" && fillValue !== "freeze" && fillValue !== "remove") {
+    degradedFeatures.push({
+      code: "presentationml-fill-behavior",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint timing fill="${fillValue}" was approximated as IR fill="${fill}".`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:${tagName}/p:cBhvr/p:cTn`,
+      fallback: "Import the supported keyframes and use the closest IR fill behavior."
+    });
+  }
+
+  if (repeatCount && repeatCount !== "1" && repeatCount !== "1000") {
+    degradedFeatures.push({
+      code: "presentationml-repeat-behavior",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint repeatCount="${repeatCount}" is preserved in metadata but not expanded into repeated IR keyframes.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:${tagName}/p:cBhvr/p:cTn`,
+      fallback: "Import a single iteration of the supported animation."
+    });
+  }
+
+  if (repeatDuration) {
+    degradedFeatures.push({
+      code: "presentationml-repeat-behavior",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint repeatDur="${repeatDuration}" is preserved in metadata but not represented as repeated IR playback.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:${tagName}/p:cBhvr/p:cTn`,
+      fallback: "Import a single iteration of the supported animation."
+    });
+  }
+
+  if (autoReverse && isXmlTrue(autoReverse)) {
+    degradedFeatures.push({
+      code: "presentationml-autoreverse-behavior",
+      severity: "warning",
+      area: "animation",
+      description: "PowerPoint autoRev behavior is preserved in metadata but not expanded into reversed IR keyframes.",
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:${tagName}/p:cBhvr/p:cTn`,
+      fallback: "Import the forward pass of the supported animation."
+    });
+  }
+
+  return { durationMs, fill, metadata };
+}
+
+function readBehaviorCTnAttributes(node: string): Map<string, string> {
+  const cBhvr = extractXmlElements(node, "cBhvr")[0] ?? node;
+  return readXmlAttributes(cBhvr, "cTn");
+}
+
+function mapTimingFill(value: string | undefined): AnimationEvent["fill"] {
+  if (value === "hold" || value === "freeze") return "forwards";
+  if (value === "remove") return "none";
+  if (value === "transition") return "both";
+  return "both";
+}
+
+function isXmlTrue(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return normalized === "1" || normalized === "true";
+}
+
+function describeAnimEffectMetadata(node: string): string {
+  const attrs = readXmlAttributes(node, "animEffect");
+  const items = [
+    attrs.get("filter") ? `filter="${attrs.get("filter")}"` : undefined,
+    attrs.get("transition") ? `transition="${attrs.get("transition")}"` : undefined,
+    attrs.get("presetClass") ? `presetClass="${attrs.get("presetClass")}"` : undefined,
+    attrs.get("presetID") ? `presetID="${attrs.get("presetID")}"` : undefined,
+    attrs.get("presetSubtype") ? `presetSubtype="${attrs.get("presetSubtype")}"` : undefined
+  ].filter((item): item is string => Boolean(item));
+  return items.join(", ") || "no effect metadata";
+}
+
+function readTimingAttrNames(node: string): string[] {
+  return Array.from(node.matchAll(/<p:attrName>([\s\S]*?)<\/p:attrName>/g)).map((match) => unescapeXml(match[1]));
+}
+
+function firstMappedAnimProperty(attrNames: string[]): string | undefined {
+  for (const attrName of attrNames) {
+    const normalized = attrName.toLowerCase();
+    if (normalized === "opacity" || normalized === "style.opacity" || normalized.endsWith(".opacity")) return "opacity";
+  }
+  return undefined;
+}
+
+function readPropertyAnimationKeyframes(node: string, property: string | undefined): { offset: number; value: number }[] {
+  if (!property) return [];
+  const tavs = Array.from(node.matchAll(/<p:tav\b[\s\S]*?<\/p:tav>/g)).map((match) => match[0]);
+  const values = tavs
+    .map((tav, index) => {
+      const attrs = readXmlAttributes(tav, "tav");
+      const rawValue = readNumericAnimationValue(tav);
+      if (rawValue === undefined) return undefined;
+      return {
+        offset: parseAnimationOffset(attrs.get("tm"), index, tavs.length),
+        value: normalizePropertyAnimationValue(property, rawValue)
+      };
+    })
+    .filter((value): value is { offset: number; value: number } => Boolean(value));
+  if (values.length >= 2) return values.sort((left, right) => left.offset - right.offset);
+
+  const from = readNumericAnimationValue(extractXmlElements(node, "from")[0] ?? "");
+  const to = readNumericAnimationValue(extractXmlElements(node, "to")[0] ?? "");
+  if (from === undefined || to === undefined) return [];
+  return [
+    { offset: 0, value: normalizePropertyAnimationValue(property, from) },
+    { offset: 1, value: normalizePropertyAnimationValue(property, to) }
+  ];
+}
+
+function readNumericAnimationValue(node: string): number | undefined {
+  const value =
+    readXmlAttributes(node, "fltVal").get("val") ??
+    readXmlAttributes(node, "intVal").get("val") ??
+    readXmlAttributes(node, "strVal").get("val");
+  if (value === undefined) return undefined;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function parseAnimationOffset(value: string | undefined, index: number, count: number): number {
+  if (!value) return count > 1 ? index / (count - 1) : 0;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return count > 1 ? index / (count - 1) : 0;
+  const normalized = Math.abs(numeric) > 1 ? numeric / 100000 : numeric;
+  return Math.min(1, Math.max(0, Math.round(normalized * 10000) / 10000));
+}
+
+function normalizePropertyAnimationValue(property: string, value: number): number {
+  if (property === "opacity") return normalizeOpacityValue(value);
+  return value;
+}
+
+function normalizeOpacityValue(value: number): number {
+  const normalized = Math.abs(value) > 100 ? value / 100000 : Math.abs(value) > 1 ? value / 100 : value;
+  return Math.min(1, Math.max(0, Math.round(normalized * 10000) / 10000));
+}
+
+function childElementXml(source: string, parent: XmlElementRange, localName: string): string[] {
+  return parent.children.filter((child) => child.localName === localName).map((child) => source.slice(child.start, child.end));
+}
+
+function describeTimingCondition(node: string): string {
+  const attrs = readXmlAttributes(node, "cond");
+  const details = [
+    attrs.get("evt") ? `evt="${attrs.get("evt")}"` : undefined,
+    attrs.get("delay") ? `delay="${attrs.get("delay")}"` : undefined,
+    attrs.get("rtn") ? `rtn="${attrs.get("rtn")}"` : undefined,
+    node.match(/<p:spTgt\b[^>]*spid="([^"]+)"/)?.[1]
+      ? `targetSpid="${node.match(/<p:spTgt\b[^>]*spid="([^"]+)"/)?.[1]}"`
+      : undefined
+  ].filter((detail): detail is string => Boolean(detail));
+  return details.join(", ");
 }
 
 function readTimingDuration(node: string, fallbackMs: number): number {

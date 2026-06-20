@@ -151,7 +151,104 @@ describe("PPTX export", () => {
 
     const parsed = await parsePptxToIr(out);
     assert.equal(parsed.deck.slides[0].timeline?.events.length, 5);
-    assert.ok(parsed.conversion?.degradedFeatures.some((feature) => feature.code === "presentationml-timing-conditions"));
+    assert.ok(parsed.conversion?.degradedFeatures.some((feature) => feature.code === "presentationml-next-condition"));
+    assert.ok(parsed.conversion?.degradedFeatures.some((feature) => feature.description.includes('evt="onNext"')));
+  });
+
+  test("imports numeric p:anim opacity and preserves repeat/autoreverse/fill metadata", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-test-"));
+    const out = path.join(dir, "property-anim.pptx");
+
+    await exportIrToPptx(createAnimatedDeck(), out);
+    await patchPptxXml(out, "ppt/slides/slide1.xml", (source) =>
+      source.replace(
+        /<p:animEffect transition="in" filter="fade">[\s\S]*?<\/p:animEffect>/,
+        `<p:anim calcmode="lin" valueType="num">
+  <p:cBhvr>
+    <p:cTn id="4" dur="800" fill="remove" repeatCount="2" autoRev="1">
+      <p:stCondLst><p:cond delay="300"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="2"/></p:tgtEl>
+    <p:attrNameLst><p:attrName>style.opacity</p:attrName></p:attrNameLst>
+  </p:cBhvr>
+  <p:tavLst>
+    <p:tav tm="0"><p:val><p:fltVal val="0"/></p:val></p:tav>
+    <p:tav tm="50000"><p:val><p:fltVal val="50000"/></p:val></p:tav>
+    <p:tav tm="100000"><p:val><p:fltVal val="100000"/></p:val></p:tav>
+  </p:tavLst>
+</p:anim>`
+      )
+    );
+
+    const parsed = await parsePptxToIr(out);
+    const opacity = (parsed.deck.slides[0].timeline?.events ?? []).find(
+      (event) => event.kind === "keyframes" && event.metadata?.pptxTag === "anim"
+    );
+
+    assert.equal(opacity?.kind, "keyframes");
+    if (opacity?.kind !== "keyframes") throw new Error("Expected imported p:anim opacity keyframes.");
+    assert.equal(opacity.durationMs, 800);
+    assert.equal(opacity.fill, "none");
+    assert.equal(opacity.metadata?.pptxRepeatCount, "2");
+    assert.equal(opacity.metadata?.pptxAutoReverse, true);
+    assert.deepEqual(opacity.tracks.find((track) => track.property === "opacity")?.keyframes, [
+      { offset: 0, value: 0 },
+      { offset: 0.5, value: 0.5 },
+      { offset: 1, value: 1 }
+    ]);
+    assert.ok(parsed.conversion?.degradedFeatures.some((feature) => feature.code === "presentationml-repeat-behavior"));
+    assert.ok(parsed.conversion?.degradedFeatures.some((feature) => feature.code === "presentationml-autoreverse-behavior"));
+  });
+
+  test("reports unsupported command and effect metadata without dropping supported effects", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-test-"));
+    const out = path.join(dir, "unsupported-metadata.pptx");
+
+    await exportIrToPptx(createAnimatedDeck(), out);
+    await patchPptxXml(out, "ppt/slides/slide1.xml", (source) =>
+      source.replace(
+        "</p:cTn>\n          </p:seq>",
+        `<p:par>
+  <p:cTn id="99" fill="hold">
+    <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+    <p:childTnLst>
+      <p:animEffect transition="in" filter="checkerboard(across)" presetClass="entr" presetID="10" presetSubtype="5">
+        <p:cBhvr>
+          <p:cTn id="100" dur="400" fill="hold"/>
+          <p:tgtEl><p:spTgt spid="2"/></p:tgtEl>
+        </p:cBhvr>
+      </p:animEffect>
+      <p:cmd type="call" cmd="playFrom(0.0)">
+        <p:cBhvr>
+          <p:cTn id="101" dur="1"/>
+          <p:tgtEl><p:spTgt spid="2"/></p:tgtEl>
+        </p:cBhvr>
+      </p:cmd>
+    </p:childTnLst>
+  </p:cTn>
+</p:par></p:cTn>\n          </p:seq>`
+      )
+    );
+
+    const parsed = await parsePptxToIr(out);
+    const unsupported = parsed.conversion?.unsupportedFeatures ?? [];
+    assert.equal(parsed.deck.slides[0].timeline?.events.length, 5);
+    assert.ok(
+      unsupported.some(
+        (feature) =>
+          feature.code === "presentationml-animation-effect" &&
+          feature.description.includes('filter="checkerboard(across)"') &&
+          feature.description.includes('presetID="10"')
+      )
+    );
+    assert.ok(
+      unsupported.some(
+        (feature) =>
+          feature.code === "presentationml-cmd" &&
+          feature.description.includes('type "call"') &&
+          feature.description.includes("playFrom(0.0)")
+      )
+    );
   });
 });
 

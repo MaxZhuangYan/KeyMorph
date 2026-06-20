@@ -1,5 +1,5 @@
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,16 +7,15 @@ import { randomUUID } from "node:crypto";
 
 import { createDemoDeck } from "../src/demo/createDemoDeck.ts";
 import { parsePptxToIr, exportIrToPptx } from "../src/pptx/index.ts";
-import { exportIrToKeynote, parseKeynoteToIr } from "../src/keynote/index.ts";
-import { createLossReport, scoreConversion } from "../src/report/index.ts";
+import { scoreConversion } from "../src/report/index.ts";
 import { renderHtmlDocument } from "../src/runtime/index.ts";
 import {
-  createVideoExportPlan,
-  createVideoFrameFidelityReport,
-  describeVideoDependencies,
-  exportIrToVideo,
-  VideoExportDependencyError
-} from "../src/video/index.ts";
+  createProductApiResponse,
+  createProductBundle,
+  exportProductBundleKeynote,
+  exportProductBundleVideo
+} from "../src/cli.ts";
+import { VideoExportDependencyError } from "../src/video/index.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const host = "127.0.0.1";
@@ -83,64 +82,24 @@ async function handleConvert(request, response) {
   const sourcePath = path.join(jobDir, safeName);
   await writeFile(sourcePath, upload.data);
 
-  const deck = await inputToIr(sourcePath, safeName, upload.data);
-  const importedIrPath = path.join(jobDir, "deck.ir.json");
-  const htmlPath = path.join(jobDir, "runtime.html");
-  const pptxPath = path.join(jobDir, "rebuilt.pptx");
-  const reportPath = path.join(jobDir, "loss-report.json");
-
-  await writeJson(importedIrPath, deck);
-  await writeFile(htmlPath, renderHtmlDocument(deck), "utf8");
-  await exportIrToPptx(deck, pptxPath);
-
-  const report = createLossReport(deck.conversion ?? { status: "success", messages: [] });
-  const videoPlan = summarizeVideoPlan(createVideoExportPlan(deck));
-  const videoDependencies = await describeVideoDependencies();
-  await writeJson(reportPath, report);
+  const bundle = await createProductBundle(sourcePath, jobDir, { sourceName: safeName, jobId });
   send(
     response,
     200,
-    JSON.stringify({
-      jobId,
-      sourceName: safeName,
-      slideCount: deck.deck.slides.length,
-      objectCount: deck.conversion?.statistics?.objectCount ?? deck.deck.slides.reduce((sum, slide) => sum + slide.objects.length, 0),
-      fidelityScore: report.fidelityScore,
-      animationLostCount: report.animationLostCount,
-      degradedAnimationCount: report.degradedAnimationCount,
-      uncertainMappingCount: report.uncertainMappingCount,
-      recommendedFixes: report.recommendedFixes,
-      previewUrl: `/demo/out/jobs/${jobId}/runtime.html`,
-      videoPlan,
-      videoDependencies,
-      videoEndpoint: `/api/jobs/${jobId}/video`,
-      keynoteEndpoint: `/api/jobs/${jobId}/keynote`,
-      downloads: {
-        html: `/demo/out/jobs/${jobId}/runtime.html`,
-        ir: `/demo/out/jobs/${jobId}/deck.ir.json`,
-        pptx: `/demo/out/jobs/${jobId}/rebuilt.pptx`,
-        key: null,
-        report: `/demo/out/jobs/${jobId}/loss-report.json`,
-        video: null
-      },
-      keynoteAvailable: null,
-      keynoteMessage: "Keynote export is available on demand and may ask macOS for Keynote automation permission."
-    }),
+    JSON.stringify(createProductApiResponse(bundle, `/demo/out/jobs/${jobId}`)),
     "application/json; charset=utf-8"
   );
 }
 
 async function handleKeynoteExport(jobId, response) {
   const jobDir = safeJobDir(jobId);
-  const deck = await readJson(path.join(jobDir, "deck.ir.json"));
-  const keynotePath = path.join(jobDir, "rebuilt.key");
-  const result = await tryExportKeynote(deck, keynotePath, path.join(jobDir, "rebuilt.key-bridge.pptx"));
+  const result = await exportProductBundleKeynote(jobDir);
   send(
     response,
-    result.available ? 200 : 424,
+    result.status === "ready" ? 200 : 424,
     JSON.stringify({
-      status: result.available ? "ready" : "dependency-missing",
-      keyUrl: result.available ? `/demo/out/jobs/${jobId}/rebuilt.key` : null,
+      status: result.status,
+      keyUrl: result.status === "ready" ? `/demo/out/jobs/${jobId}/rebuilt.key` : null,
       message: result.message
     }),
     "application/json; charset=utf-8"
@@ -149,49 +108,26 @@ async function handleKeynoteExport(jobId, response) {
 
 async function handleVideoExport(jobId, url, response) {
   const jobDir = safeJobDir(jobId);
-  const deck = await readJson(path.join(jobDir, "deck.ir.json"));
-  const outputPath = path.join(jobDir, "render.mp4");
   const options = {
     fps: parsePositiveNumber(url.searchParams.get("fps")) ?? 30,
-    scale: parsePositiveNumber(url.searchParams.get("scale")) ?? 4,
-    keepFrames: true,
-    framesDir: path.join(jobDir, "frames", "rendering")
+    scale: parsePositiveNumber(url.searchParams.get("scale")) ?? 4
   };
-  const plan = createVideoExportPlan(deck, options);
-  const previousFramesDir = path.join(jobDir, "frames", "previous");
-  const latestFramesDir = path.join(jobDir, "frames", "latest");
-  const renderingFramesDir = options.framesDir;
-  const diffDir = path.join(jobDir, "frame-diffs");
-  const fidelityReportPath = path.join(jobDir, "frame-fidelity.json");
 
   try {
-    await rm(renderingFramesDir, { recursive: true, force: true });
-    await rm(diffDir, { recursive: true, force: true });
-    await rm(previousFramesDir, { recursive: true, force: true });
-    await renameIfExists(latestFramesDir, previousFramesDir);
-    await exportIrToVideo(deck, outputPath, options);
-    await rename(renderingFramesDir, latestFramesDir);
-    const frameFidelity = (await directoryExists(previousFramesDir))
-      ? await createVideoFrameFidelityReport(deck, previousFramesDir, latestFramesDir, {
-          fps: options.fps,
-          scale: options.scale,
-          diffDir,
-          reportPath: fidelityReportPath
-        })
-      : null;
+    const result = await exportProductBundleVideo(jobDir, options);
     send(
       response,
       200,
       JSON.stringify({
         status: "ready",
         videoUrl: `/demo/out/jobs/${jobId}/render.mp4`,
-        plan: summarizeVideoPlan(plan),
+        plan: result.plan,
         framesUrl: `/demo/out/jobs/${jobId}/frames/latest/`,
-        frameFidelity: frameFidelity
+        frameFidelity: result.frameFidelity
           ? {
               reportUrl: `/demo/out/jobs/${jobId}/frame-fidelity.json`,
               diffUrl: `/demo/out/jobs/${jobId}/frame-diffs/`,
-              summary: frameFidelity.summary
+              summary: result.frameFidelity.summary
             }
           : null
       }),
@@ -207,7 +143,7 @@ async function handleVideoExport(jobId, url, response) {
           missing: error.missing,
           message: error.message,
           guidance: error.guidance,
-          plan: summarizeVideoPlan(plan)
+          plan: null
         }),
         "application/json; charset=utf-8"
       );
@@ -240,31 +176,6 @@ function listenWithFallback(server, startPort) {
     };
     tryListen(startPort);
   });
-}
-
-async function inputToIr(sourcePath, fileName, data) {
-  const lowerName = fileName.toLowerCase();
-  if (lowerName.endsWith(".pptx")) return parsePptxToIr(sourcePath);
-  if (lowerName.endsWith(".json") || lowerName.endsWith(".ir.json")) {
-    return JSON.parse(new TextDecoder().decode(data));
-  }
-  if (lowerName.endsWith(".key")) {
-    return parseKeynoteToIr(sourcePath, { workDir: path.dirname(sourcePath) });
-  }
-  throw new Error("Unsupported file type. Drop a .pptx, .key, or .ir.json file.");
-}
-
-async function tryExportKeynote(deck, keynotePath, intermediatePptxPath) {
-  try {
-    await exportIrToKeynote(deck, keynotePath, { intermediatePptxPath });
-    return { available: true, message: "Keynote file generated." };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      available: false,
-      message: `Keynote export unavailable: ${message}`
-    };
-  }
 }
 
 async function readUpload(request) {
@@ -554,25 +465,6 @@ async function writeJson(filePath, value) {
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
-async function readJson(filePath) {
-  return JSON.parse(await readFile(filePath, "utf8"));
-}
-
-async function directoryExists(dirPath) {
-  try {
-    return (await stat(dirPath)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-async function renameIfExists(from, to) {
-  if (!(await directoryExists(from))) return false;
-  await mkdir(path.dirname(to), { recursive: true });
-  await rename(from, to);
-  return true;
-}
-
 function sanitizeFileName(fileName) {
   return path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, "_");
 }
@@ -589,19 +481,6 @@ function parsePositiveNumber(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) return undefined;
   return number;
-}
-
-function summarizeVideoPlan(plan) {
-  return {
-    width: plan.width,
-    height: plan.height,
-    scale: plan.scale,
-    fps: plan.fps,
-    durationMs: plan.durationMs,
-    totalFrames: plan.totalFrames,
-    outputWidth: plan.outputWidth,
-    outputHeight: plan.outputHeight
-  };
 }
 
 function send(response, status, body, type) {

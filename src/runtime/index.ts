@@ -74,6 +74,59 @@ export interface MorphTransitionStateResolution {
   states: Map<string, ObjectStateProperties>;
 }
 
+export type RuntimeTimelineEventPhase = "before" | "active" | "after" | "instant";
+
+export interface RuntimeTimelineEventDiagnostic {
+  eventId: string;
+  kind: AnimationEvent["kind"];
+  label?: string;
+  targetId?: string;
+  property?: string;
+  transitionType?: string;
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+  phase: RuntimeTimelineEventPhase;
+  active: boolean;
+  applied: boolean;
+  fill?: AnimationEvent["fill"];
+  rawProgress?: number;
+  easedProgress?: number;
+  appliedProgress?: number;
+}
+
+export interface RuntimeSlideObjectStateSnapshot {
+  slideIndex: number;
+  slideId: string;
+  phase: "current" | "previous" | "inactive";
+  timeMs: number;
+  states: Record<string, ObjectStateProperties>;
+  events: RuntimeTimelineEventDiagnostic[];
+  timingPlan: SlideTimingPlan;
+}
+
+export interface RuntimeFrameSnapshotOptions extends SlideObjectStateResolutionOptions {
+  includeInactiveSlides?: boolean;
+}
+
+export interface RuntimeFrameSnapshot {
+  deckId: string;
+  globalTimeMs: number;
+  resolution: DeckTimeResolution;
+  objects: Record<string, ObjectStateProperties>;
+  slides: RuntimeSlideObjectStateSnapshot[];
+  transition?: {
+    previousSlideIndex?: number;
+    previousSlideId?: string;
+    currentSlideIndex: number;
+    currentSlideId: string;
+    progress: number;
+    pairs: { fromObjectId: string; toObjectId: string; morphKey?: string }[];
+    states: Record<string, ObjectStateProperties>;
+  };
+  warnings: RuntimeTimingWarning[];
+}
+
 type NormalizedRuntimeProperty =
   | "bounds"
   | "transform"
@@ -338,6 +391,135 @@ export function resolveMorphTransitionObjectStates(
   return { pairs, states };
 }
 
+export function resolveTimelineEventDiagnostics(slide: Slide | undefined, timeMs: number): RuntimeTimelineEventDiagnostic[] {
+  const timingPlan = createSlideTimingPlan(slide);
+  const starts = timingPlan.starts;
+  return (slide?.timeline?.events ?? []).map((event) => {
+    const startMs = starts[event.id] ?? 0;
+    const durationMs = eventDuration(event);
+    const endMs = startMs + durationMs;
+    const appliedProgress = eventProgress(event, startMs, timeMs);
+    const rawProgress =
+      durationMs === 0
+        ? timeMs >= startMs
+          ? 1
+          : undefined
+        : timeMs >= startMs && timeMs <= endMs
+          ? clamp((timeMs - startMs) / durationMs, 0, 1)
+          : undefined;
+    const phase: RuntimeTimelineEventPhase =
+      durationMs === 0 && timeMs >= startMs
+        ? "instant"
+        : timeMs < startMs
+          ? "before"
+          : timeMs > endMs
+            ? "after"
+            : "active";
+    const targetId = "targetId" in event ? event.targetId : undefined;
+    const property = event.kind === "property" ? event.property : undefined;
+    const transitionType = event.kind === "transition" ? event.transition.type : undefined;
+
+    return {
+      eventId: event.id,
+      kind: event.kind,
+      label: event.label,
+      targetId,
+      property,
+      transitionType,
+      startMs,
+      endMs,
+      durationMs,
+      phase,
+      active: phase === "active" || phase === "instant",
+      applied: appliedProgress !== undefined,
+      fill: event.fill,
+      rawProgress,
+      easedProgress: rawProgress === undefined ? undefined : easeProgressValue(event.easing, rawProgress),
+      appliedProgress
+    };
+  });
+}
+
+export function createRuntimeFrameSnapshot(
+  deck: DeckIR,
+  timeMs: number,
+  options: RuntimeFrameSnapshotOptions = {}
+): RuntimeFrameSnapshot {
+  const resolution = resolveDeckTime(deck, timeMs);
+  const includeInactiveSlides = options.includeInactiveSlides ?? false;
+  const stateOptions = { effectiveGroupStates: options.effectiveGroupStates ?? true };
+  const activeSlideIndexes = new Set<number>([resolution.slideIndex]);
+  if (resolution.previousSlideIndex !== undefined) activeSlideIndexes.add(resolution.previousSlideIndex);
+  const slideIndexes = includeInactiveSlides
+    ? deck.deck.slides.map((_, slideIndex) => slideIndex)
+    : Array.from(activeSlideIndexes).sort((a, b) => a - b);
+
+  const slides = slideIndexes
+    .map((slideIndex) => {
+      const slide = deck.deck.slides[slideIndex];
+      if (!slide) return undefined;
+      const phase =
+        slideIndex === resolution.slideIndex
+          ? "current"
+          : slideIndex === resolution.previousSlideIndex
+            ? "previous"
+            : "inactive";
+      const slideTimeMs =
+        phase === "current"
+          ? resolution.slideTimeMs
+          : phase === "previous"
+            ? getSlideDurationMs(slide)
+            : 0;
+      return {
+        slideIndex,
+        slideId: slide.id,
+        phase,
+        timeMs: slideTimeMs,
+        states: serializeObjectStates(resolveSlideObjectStates(deck, slide, slideTimeMs, stateOptions)),
+        events: resolveTimelineEventDiagnostics(slide, slideTimeMs),
+        timingPlan: createSlideTimingPlan(slide)
+      } satisfies RuntimeSlideObjectStateSnapshot;
+    })
+    .filter((slide): slide is RuntimeSlideObjectStateSnapshot => Boolean(slide));
+
+  const objects: Record<string, ObjectStateProperties> = {};
+  for (const slide of slides) {
+    if (slide.phase === "inactive") continue;
+    for (const [objectId, state] of Object.entries(slide.states)) {
+      objects[objects[objectId] ? `${slide.slideId}:${objectId}` : objectId] = state;
+    }
+  }
+
+  const currentSlide = deck.deck.slides[resolution.slideIndex];
+  const previousSlide =
+    resolution.previousSlideIndex === undefined ? undefined : deck.deck.slides[resolution.previousSlideIndex];
+  const transitionStates =
+    resolution.inTransition && currentSlide
+      ? resolveMorphTransitionObjectStates(deck, previousSlide, currentSlide, currentSlide.transition, resolution.transitionProgress)
+      : undefined;
+
+  return {
+    deckId: deck.deck.id,
+    globalTimeMs: resolution.globalTimeMs,
+    resolution,
+    objects,
+    slides,
+    transition:
+      resolution.inTransition && currentSlide
+        ? {
+            previousSlideIndex: resolution.previousSlideIndex,
+            previousSlideId: previousSlide?.id,
+            currentSlideIndex: resolution.slideIndex,
+            currentSlideId: currentSlide.id,
+            progress: resolution.transitionProgress,
+            pairs: transitionStates?.pairs ?? [],
+            states: serializeObjectStates(transitionStates?.states ?? new Map<string, ObjectStateProperties>())
+          }
+        : undefined,
+    warnings: slides.flatMap((slide) => slide.timingPlan.warnings)
+  };
+}
+
 function runtimeScript(): string {
   return `
 (() => {
@@ -363,10 +545,19 @@ function runtimeScript(): string {
     startedAt: 0,
     renderedKey: ""
   };
+  const runtimeEvents = [];
 
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
   const isNumber = (value) => typeof value === "number" && Number.isFinite(value);
+  const clone = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  const emitRuntimeEvent = (type, detail = {}) => {
+    const entry = { type, detail: clone(detail), globalTimeMs: state.globalTimeMs, atMs: performance.now() };
+    runtimeEvents.push(entry);
+    if (runtimeEvents.length > 500) runtimeEvents.shift();
+    window.dispatchEvent(new CustomEvent("keymorph:runtime", { detail: entry }));
+    return entry;
+  };
   const slideDuration = (slide) => Math.max(1, Number(slide?.timeline?.durationMs ?? DEFAULT_SLIDE_DURATION_MS));
   const transitionDuration = (transition) => {
     if (!transition || transition.type === "none" || transition.type === "cut") return 0;
@@ -1241,6 +1432,37 @@ function runtimeScript(): string {
     }
     return active;
   };
+  const timelineEventDiagnostics = (slide, timeMs) => {
+    const timingPlan = createTimingPlan(slide);
+    return (slide?.timeline?.events || []).map((event) => {
+      const startMs = timingPlan.starts.get(event.id) || 0;
+      const durationMs = eventDuration(event);
+      const endMs = startMs + durationMs;
+      const appliedProgress = eventProgress(event, startMs, timeMs);
+      const rawProgress = durationMs === 0
+        ? timeMs >= startMs ? 1 : undefined
+        : timeMs >= startMs && timeMs <= endMs ? clamp((timeMs - startMs) / durationMs, 0, 1) : undefined;
+      const phase = durationMs === 0 && timeMs >= startMs ? "instant" : timeMs < startMs ? "before" : timeMs > endMs ? "after" : "active";
+      return {
+        eventId: event.id,
+        kind: event.kind,
+        label: event.label,
+        targetId: event.targetId,
+        property: event.kind === "property" ? event.property : undefined,
+        transitionType: event.kind === "transition" ? event.transition?.type : undefined,
+        startMs,
+        endMs,
+        durationMs,
+        phase,
+        active: phase === "active" || phase === "instant",
+        applied: appliedProgress !== undefined,
+        fill: event.fill,
+        rawProgress,
+        easedProgress: rawProgress === undefined ? undefined : easeProgress(event.easing, rawProgress),
+        appliedProgress
+      };
+    });
+  };
   const applyTimelineTransition = (layer, transition, progress) => {
     const type = transition?.type || "cut";
     const direction = transition?.direction || "left";
@@ -1378,17 +1600,25 @@ function runtimeScript(): string {
     state.slideTimeMs = resolution.slideTimeMs;
     renderFrame(resolution);
     updateControls(resolution);
+    emitRuntimeEvent("seek", { resolution });
     return resolution;
   };
   const seekSlide = (slideIndex, timeMs = 0) => {
     const span = timeline.slides[Math.max(0, Math.min(timeline.slides.length - 1, Number(slideIndex) || 0))];
     return seekGlobal((span?.contentStartMs || 0) + Number(timeMs || 0));
   };
+  const seekFrame = (frame, fps = 30) => {
+    const frameIndex = Math.max(0, Math.floor(Number(frame) || 0));
+    const frameRate = Math.max(1, Number(fps) || 30);
+    return seekGlobal((frameIndex / frameRate) * 1000);
+  };
   const step = (frames = 1, fps = 30) => {
     pause();
     const frameCount = Number.isFinite(Number(frames)) ? Number(frames) : 1;
     const frameRate = Math.max(1, Number(fps) || 30);
-    return seekGlobal(state.globalTimeMs + (1000 / frameRate) * frameCount);
+    const resolution = seekGlobal(state.globalTimeMs + (1000 / frameRate) * frameCount);
+    emitRuntimeEvent("step", { frames: frameCount, fps: frameRate, resolution });
+    return resolution;
   };
   const setPlaybackRate = (rate) => {
     const next = Math.max(0.01, Number(rate) || 1);
@@ -1431,18 +1661,25 @@ function runtimeScript(): string {
   const previousSlide = () => seekSlide(Math.max(0, state.slideIndex - 1), 0);
   const nextSlide = () => seekSlide(Math.min(timeline.slides.length - 1, state.slideIndex + 1), 0);
   const serializeStates = (states) => Object.fromEntries(Array.from(states.entries()).map(([id, value]) => [id, JSON.parse(JSON.stringify(value || {}))]));
+  const getTimelineEventDiagnostics = (slideIndex = state.slideIndex, timeMs) => {
+    const index = Math.max(0, Math.min((deck.deck.slides || []).length - 1, Number(slideIndex) || 0));
+    const slide = deck.deck.slides[index];
+    const resolvedTime = timeMs === undefined ? (index === state.slideIndex ? state.slideTimeMs : 0) : Number(timeMs || 0);
+    return timelineEventDiagnostics(slide, resolvedTime);
+  };
   const getSlideStates = (slideIndex = state.slideIndex, timeMs, options = {}) => {
     const slide = deck.deck.slides[Math.max(0, Math.min((deck.deck.slides || []).length - 1, Number(slideIndex) || 0))];
     const resolvedTime = timeMs === undefined ? (slideIndex === state.slideIndex ? state.slideTimeMs : 0) : Number(timeMs || 0);
     const states = options.effectiveGroupStates ? computeEffectiveSlideObjectStates(slide, resolvedTime) : computeSlideObjectStates(slide, resolvedTime);
     return serializeStates(states);
   };
-  const getCurrentFrameState = () => {
+  const getCurrentFrameState = (options = {}) => {
     const resolution = resolveTime(state.globalTimeMs);
     const slide = deck.deck.slides[resolution.slideIndex];
     const frame = {
       resolution,
       states: getSlideStates(resolution.slideIndex, resolution.slideTimeMs, { effectiveGroupStates: true }),
+      events: getTimelineEventDiagnostics(resolution.slideIndex, resolution.slideTimeMs),
       transition: undefined
     };
     if (resolution.inTransition) {
@@ -1453,7 +1690,97 @@ function runtimeScript(): string {
         states: serializeStates(morph.states)
       };
     }
+    if (options.includeDom) frame.dom = getDomSnapshot();
     return frame;
+  };
+  const getGlobalSnapshot = (timeMs = state.globalTimeMs, options = {}) => {
+    const resolution = resolveTime(timeMs);
+    const includeInactiveSlides = options.includeInactiveSlides === true;
+    const activeIndexes = new Set([resolution.slideIndex]);
+    if (resolution.previousSlideIndex !== undefined) activeIndexes.add(resolution.previousSlideIndex);
+    const slideIndexes = includeInactiveSlides ? (deck.deck.slides || []).map((_, index) => index) : Array.from(activeIndexes).sort((a, b) => a - b);
+    const slides = slideIndexes.map((slideIndex) => {
+      const slide = deck.deck.slides[slideIndex];
+      const phase = slideIndex === resolution.slideIndex ? "current" : slideIndex === resolution.previousSlideIndex ? "previous" : "inactive";
+      const slideTimeMs = phase === "current" ? resolution.slideTimeMs : phase === "previous" ? slideDuration(slide) : 0;
+      const timingPlan = createTimingPlan(slide);
+      return {
+        slideIndex,
+        slideId: slide?.id || "",
+        phase,
+        timeMs: slideTimeMs,
+        states: getSlideStates(slideIndex, slideTimeMs, { effectiveGroupStates: options.effectiveGroupStates !== false }),
+        events: timelineEventDiagnostics(slide, slideTimeMs),
+        timingPlan: {
+          starts: Object.fromEntries(timingPlan.starts),
+          order: timingPlan.order,
+          warnings: timingPlan.warnings
+        }
+      };
+    });
+    const objects = {};
+    for (const slide of slides) {
+      if (slide.phase === "inactive") continue;
+      for (const [objectId, objectState] of Object.entries(slide.states)) {
+        objects[objects[objectId] ? slide.slideId + ":" + objectId : objectId] = objectState;
+      }
+    }
+    const currentSlide = deck.deck.slides[resolution.slideIndex];
+    const previousSlide = resolution.previousSlideIndex === undefined ? undefined : deck.deck.slides[resolution.previousSlideIndex];
+    const morph = resolution.inTransition && currentSlide ? resolveMorphTransitionStates(previousSlide, currentSlide, currentSlide.transition, resolution.transitionProgress) : undefined;
+    return {
+      deckId: deck.deck.id,
+      globalTimeMs: resolution.globalTimeMs,
+      resolution,
+      objects,
+      slides,
+      transition: resolution.inTransition && currentSlide ? {
+        previousSlideIndex: resolution.previousSlideIndex,
+        previousSlideId: previousSlide?.id,
+        currentSlideIndex: resolution.slideIndex,
+        currentSlideId: currentSlide.id,
+        progress: resolution.transitionProgress,
+        pairs: morph?.pairs || [],
+        states: serializeStates(morph?.states || new Map())
+      } : undefined,
+      warnings: slides.flatMap((slide) => slide.timingPlan.warnings),
+      runtimeEvents: runtimeEvents.slice()
+    };
+  };
+  const getDomSnapshot = () => ({
+    stage: {
+      width: stage.style.width,
+      height: stage.style.height,
+      transform: stage.style.transform,
+      renderedKey: state.renderedKey
+    },
+    layers: Array.from(stage.querySelectorAll(".km-slide-layer")).map((layer) => ({
+      layer: layer.getAttribute("data-layer") || "",
+      opacity: layer.style.opacity,
+      transform: layer.style.transform,
+      clipPath: layer.style.clipPath,
+      objects: Array.from(layer.querySelectorAll("[data-object-id]")).map((el) => ({
+        objectId: el.getAttribute("data-object-id") || "",
+        left: el.style.left,
+        top: el.style.top,
+        width: el.style.width,
+        height: el.style.height,
+        opacity: el.style.opacity,
+        visibility: el.style.visibility,
+        transform: el.style.transform
+      }))
+    }))
+  });
+  const captureFrame = async (timeMs = state.globalTimeMs, options = {}) => {
+    const resolution = seekGlobal(timeMs);
+    if (document.fonts?.ready) await document.fonts.ready;
+    const settles = Math.max(1, Math.floor(Number(options.animationFrames ?? 2) || 2));
+    for (let index = 0; index < settles; index += 1) {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    }
+    const snapshot = getGlobalSnapshot(resolution.globalTimeMs, options);
+    emitRuntimeEvent("captureFrame", { resolution });
+    return snapshot;
   };
   playButton?.addEventListener("click", () => state.playing ? pause() : play());
   prevButton?.addEventListener("click", previousSlide);
@@ -1467,6 +1794,7 @@ function runtimeScript(): string {
     seek: seekGlobal,
     seekGlobal,
     seekSlide,
+    seekFrame,
     step,
     setPlaybackRate,
     play,
@@ -1476,8 +1804,13 @@ function runtimeScript(): string {
     resolveTime,
     createTimeline,
     createTimingPlan,
+    getTimelineEventDiagnostics,
     getSlideStates,
     getCurrentFrameState,
+    getGlobalSnapshot,
+    getDomSnapshot,
+    captureFrame,
+    runtimeEvents,
     state,
     deck,
     debug: {
@@ -1485,8 +1818,12 @@ function runtimeScript(): string {
       computeEffectiveSlideObjectStates,
       createTimingPlan,
       resolveMorphTransitionStates,
+      getTimelineEventDiagnostics,
       getSlideStates,
       getCurrentFrameState,
+      getGlobalSnapshot,
+      getDomSnapshot,
+      captureFrame,
       easeProgress
     }
   };
@@ -1873,6 +2210,12 @@ export function createSlideTimingPlan(slide: Slide | undefined): SlideTimingPlan
 
 function computeEventStarts(slide: Slide | undefined): Map<string, number> {
   return new Map(Object.entries(createSlideTimingPlan(slide).starts));
+}
+
+function serializeObjectStates(states: Map<string, ObjectStateProperties>): Record<string, ObjectStateProperties> {
+  return Object.fromEntries(
+    Array.from(states.entries()).map(([objectId, state]) => [objectId, JSON.parse(JSON.stringify(state || {})) as ObjectStateProperties])
+  );
 }
 
 function eventDuration(event: AnimationEvent | undefined): number {

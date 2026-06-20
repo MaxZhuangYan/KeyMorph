@@ -188,6 +188,63 @@ describe("Keynote bridge", () => {
     assert.equal(deck.conversion?.metadata?.unrecoveredAssetCount, 1);
   });
 
+  test("extracts numeric geometry, grouping, image dimensions, QuickLook metadata, and animation uncertainty", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-geometry-"));
+    const keyPath = path.join(dir, "geometry.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await mkdir(path.join(keyPath, "QuickLook"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero.png"), pngBytes(320, 180));
+    await writeFile(path.join(keyPath, "QuickLook", "Thumbnail.jpg"), jpegBytes(640, 360));
+
+    const objectGroup = concat([
+      protoString("Hero title", 1),
+      protoString("Data/hero.png", 2),
+      protoFixed32(3, 100),
+      protoFixed32(4, 120),
+      protoFixed32(5, 320),
+      protoFixed32(6, 180),
+      protoString("Magic Move morph transition", 7)
+    ]);
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoBytes(objectGroup, 9));
+
+    const detection = await detectNativeKeynotePackage(keyPath);
+    assert.equal(detection.quickLookPreviews[0]?.path, "QuickLook/Thumbnail.jpg");
+    assert.equal(detection.quickLookPreviews[0]?.width, 640);
+    assert.equal(detection.quickLookPreviews[0]?.height, 360);
+    const stream = detection.iwaStreams?.[0];
+    assert.ok((stream?.numericCandidateCount ?? 0) >= 4);
+    assert.ok((stream?.geometryCandidateCount ?? 0) >= 1);
+    assert.ok((stream?.groupingHintCount ?? 0) >= 1);
+    assert.ok((stream?.animationHintCount ?? 0) >= 2);
+    assert.equal(stream?.magicMoveHintCount, 1);
+    assert.equal(stream?.morphHintCount, 1);
+    assert.deepEqual(stream?.geometryCandidates[0]?.bounds, { x: 100, y: 120, width: 320, height: 180 });
+    assert.equal(stream?.groupingHints[0]?.groupPath, "9");
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const imageAsset = deck.deck.assets?.find((asset) => asset.name === "hero.png");
+    assert.equal(imageAsset?.width, 320);
+    assert.equal(imageAsset?.height, 180);
+    assert.equal(imageAsset?.metadata?.nativeImageDimensionSource, "png-ihdr");
+    const textObject = deck.deck.slides[0]?.objects.find((object) => object.type === "text");
+    assert.deepEqual(textObject?.metadata?.nativeGeometryCandidate?.bounds, { x: 100, y: 120, width: 320, height: 180 });
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeGeometryCandidateCount, 1);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeGroupingHintCount, 1);
+    assert.ok((deck.deck.slides[0]?.metadata?.nativeAnimationHintCount as number) >= 2);
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-geometry-candidates-detected"), true);
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-animation-hints-detected"), true);
+    assert.equal(deck.conversion?.uncertainMappings?.some((mapping) => mapping.code === "keynote-native-geometry-candidate-scan"), true);
+    assert.equal(deck.conversion?.uncertainMappings?.some((mapping) => mapping.code === "keynote-native-object-grouping-hints"), true);
+    assert.equal(deck.conversion?.uncertainMappings?.some((mapping) => mapping.code === "keynote-native-magic-move-morph-hints"), true);
+    assert.equal(deck.conversion?.metadata?.quickLookPreviewWithDimensionsCount, 1);
+    assert.equal(deck.conversion?.metadata?.imageAssetWithDimensionsCount, 1);
+    assert.equal(deck.conversion?.metadata?.lossReport?.automationUsed, false);
+    assert.equal(deck.conversion?.metadata?.lossReport?.evidenceCounts?.geometryCandidateCount, 1);
+    assert.equal(deck.conversion?.metadata?.lossReport?.evidenceCounts?.quickLookPreviewWithDimensionsCount, 1);
+  });
+
   test("parses a ZIP-backed .key package with loose Index IWA entries", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-zip-"));
     const keyPath = path.join(dir, "sample.key");
@@ -270,6 +327,12 @@ function protoVarint(fieldNumber: number, value: number): Uint8Array {
   return concat([varint(fieldNumber << 3), varint(value)]);
 }
 
+function protoFixed32(fieldNumber: number, value: number): Uint8Array {
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setFloat32(0, value, true);
+  return concat([varint((fieldNumber << 3) | 5), out]);
+}
+
 function plist(values: Record<string, string | number>): Uint8Array {
   const body = Object.entries(values)
     .map(([key, value]) => {
@@ -333,13 +396,44 @@ function snappyLiteralBlock(payload: Uint8Array): Uint8Array {
   return concat(chunks);
 }
 
-function pngBytes(): Uint8Array {
-  return new Uint8Array([
+function pngBytes(width = 1, height = 1): Uint8Array {
+  const bytes = new Uint8Array([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
     0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
     0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
     0x42, 0x60, 0x82
+  ]);
+  new DataView(bytes.buffer).setUint32(16, width, false);
+  new DataView(bytes.buffer).setUint32(20, height, false);
+  return bytes;
+}
+
+function jpegBytes(width: number, height: number): Uint8Array {
+  return new Uint8Array([
+    0xff,
+    0xd8,
+    0xff,
+    0xc0,
+    0x00,
+    0x11,
+    0x08,
+    (height >> 8) & 0xff,
+    height & 0xff,
+    (width >> 8) & 0xff,
+    width & 0xff,
+    0x03,
+    0x01,
+    0x11,
+    0x00,
+    0x02,
+    0x11,
+    0x00,
+    0x03,
+    0x11,
+    0x00,
+    0xff,
+    0xd9
   ]);
 }
 

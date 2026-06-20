@@ -31,6 +31,34 @@ export interface PixelFidelityResult {
   diffPath?: string;
 }
 
+export interface PixelFidelityAggregateOptions {
+  passThreshold?: number;
+}
+
+export interface PixelFidelityAggregateResult {
+  count: number;
+  totalPixels: number;
+  comparedPixels: number;
+  mismatchedPixels: number;
+  missingPixels: number;
+  matchedItems: number;
+  mismatchedItems: number;
+  passingItems: number;
+  failingItems: number;
+  mismatchRatio: number;
+  meanMismatchRatio: number;
+  maxMismatchRatio: number;
+  meanAbsoluteError: number;
+  rootMeanSquareError: number;
+  maxDelta: number;
+  meanPixelFidelityScore: number;
+  minPixelFidelityScore: number;
+  maxPixelFidelityScore: number;
+  passThreshold: number;
+  worstIndex?: number;
+  bestIndex?: number;
+}
+
 export interface RgbaDiffOptions extends PixelFidelityOptions {
   matchOpacity?: number;
 }
@@ -119,6 +147,68 @@ export async function comparePngFiles(
     return { ...result, diffPath: options.diffPath };
   }
   return result;
+}
+
+export function aggregatePixelFidelityResults(
+  results: PixelFidelityResult[],
+  options: PixelFidelityAggregateOptions = {}
+): PixelFidelityAggregateResult {
+  const count = results.length;
+  const passThreshold = normalizePassThreshold(options.passThreshold);
+  const totalPixels = results.reduce((sum, result) => sum + result.totalPixels, 0);
+  const comparedPixels = results.reduce((sum, result) => sum + result.comparedPixels, 0);
+  const mismatchedPixels = results.reduce((sum, result) => sum + result.mismatchedPixels, 0);
+  const missingPixels = results.reduce((sum, result) => sum + result.missingPixels, 0);
+  const matchedItems = results.filter((result) => result.mismatchedPixels === 0 && result.missingPixels === 0).length;
+  const mismatchedItems = count - matchedItems;
+  const passingItems = results.filter((result) => result.pixelFidelityScore >= passThreshold).length;
+  const failingItems = count - passingItems;
+  const meanMismatchRatio = count ? results.reduce((sum, result) => sum + result.mismatchRatio, 0) / count : 0;
+  const meanAbsoluteError = count ? results.reduce((sum, result) => sum + result.meanAbsoluteError, 0) / count : 0;
+  const rootMeanSquareError = count
+    ? Math.sqrt(results.reduce((sum, result) => sum + result.rootMeanSquareError ** 2, 0) / count)
+    : 0;
+  const meanPixelFidelityScore = count ? results.reduce((sum, result) => sum + result.pixelFidelityScore, 0) / count : 1;
+  const worstIndex = results.reduce<number | undefined>((worst, result, index) => {
+    if (worst === undefined) return index;
+    const candidate = results[worst];
+    if (!candidate) return index;
+    if (result.pixelFidelityScore < candidate.pixelFidelityScore) return index;
+    if (result.pixelFidelityScore === candidate.pixelFidelityScore && result.mismatchRatio > candidate.mismatchRatio) return index;
+    return worst;
+  }, undefined);
+  const bestIndex = results.reduce<number | undefined>((best, result, index) => {
+    if (best === undefined) return index;
+    const candidate = results[best];
+    if (!candidate) return index;
+    if (result.pixelFidelityScore > candidate.pixelFidelityScore) return index;
+    if (result.pixelFidelityScore === candidate.pixelFidelityScore && result.mismatchRatio < candidate.mismatchRatio) return index;
+    return best;
+  }, undefined);
+
+  return {
+    count,
+    totalPixels,
+    comparedPixels,
+    mismatchedPixels,
+    missingPixels,
+    matchedItems,
+    mismatchedItems,
+    passingItems,
+    failingItems,
+    mismatchRatio: Number((mismatchedPixels / Math.max(1, totalPixels)).toFixed(6)),
+    meanMismatchRatio: Number(meanMismatchRatio.toFixed(6)),
+    maxMismatchRatio: Number(results.reduce((max, result) => Math.max(max, result.mismatchRatio), 0).toFixed(6)),
+    meanAbsoluteError: Number(meanAbsoluteError.toFixed(6)),
+    rootMeanSquareError: Number(rootMeanSquareError.toFixed(6)),
+    maxDelta: Number(results.reduce((max, result) => Math.max(max, result.maxDelta), 0).toFixed(6)),
+    meanPixelFidelityScore: Number(meanPixelFidelityScore.toFixed(4)),
+    minPixelFidelityScore: Number(results.reduce((min, result) => Math.min(min, result.pixelFidelityScore), count ? 1 : 1).toFixed(4)),
+    maxPixelFidelityScore: Number(results.reduce((max, result) => Math.max(max, result.pixelFidelityScore), count ? 0 : 1).toFixed(4)),
+    passThreshold,
+    worstIndex,
+    bestIndex
+  };
 }
 
 export async function readPngFile(filePath: string): Promise<RgbaImage> {
@@ -372,6 +462,12 @@ function assertPngSignature(data: Buffer): void {
 function normalizeThreshold(value: number | undefined): number {
   if (value === undefined) return 0.04;
   if (!Number.isFinite(value)) return 0.04;
+  return Math.max(0, Math.min(1, value));
+}
+
+function normalizePassThreshold(value: number | undefined): number {
+  if (value === undefined) return 0.995;
+  if (!Number.isFinite(value)) return 0.995;
   return Math.max(0, Math.min(1, value));
 }
 

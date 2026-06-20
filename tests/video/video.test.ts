@@ -9,6 +9,7 @@ import { decodePng, encodePng, type RgbaImage } from "../../src/report/fidelity.
 import {
   captureVideoFrames,
   comparePixelFrames,
+  createVideoFrameDiagnostics,
   createVideoFrameFidelityReport,
   createVideoExportPlan,
   createVideoFramePlan,
@@ -48,6 +49,18 @@ describe("video export planning", () => {
     assert.equal(Number(transitionFrame?.resolution.transitionProgress.toFixed(3)), 0.444);
   });
 
+  test("creates deterministic runtime diagnostics for planned frames", () => {
+    const diagnostics = createVideoFrameDiagnostics(createDemoDeck(), { fps: 10, totalFrames: 36, includeInactiveSlides: true });
+    const transitionFrame = diagnostics.find((frame) => frame.resolution.inTransition);
+
+    assert.equal(diagnostics.length, 36);
+    assert.equal(diagnostics[0]?.snapshot.globalTimeMs, 0);
+    assert.equal(diagnostics[0]?.snapshot.slides.some((slide) => slide.phase === "inactive"), true);
+    assert.equal(transitionFrame?.snapshot.resolution.inTransition, true);
+    assert.equal(transitionFrame?.snapshot.transition?.currentSlideIndex, 1);
+    assert.equal(transitionFrame?.snapshot.slides.some((slide) => slide.phase === "previous"), true);
+  });
+
   test("exposes clear dependency error details", () => {
     const error = new VideoExportDependencyError(["playwright", "ffmpeg"]);
 
@@ -70,6 +83,8 @@ describe("video export planning", () => {
 
     assert.equal(status.available.ffmpeg, false);
     assert.equal(status.available.pngFidelity, true);
+    assert.equal(status.canExportVideo, false);
+    assert.equal(status.canComparePng, true);
     assert.equal(status.missing.includes("ffmpeg"), true);
     assert.ok(status.guidance.some((item) => item.includes("ffmpegPath")));
   });
@@ -121,9 +136,21 @@ describe("video export planning", () => {
     assert.equal(report.frames.length, framePlan.length);
     assert.equal(report.summary.frameCount, framePlan.length);
     assert.equal(report.summary.mismatchedPixels, 1);
+    assert.equal(report.summary.mismatchedFrames, 1);
+    assert.equal(report.summary.matchedFrames, framePlan.length - 1);
+    assert.equal(report.summary.failingFrames, 1);
+    assert.equal(report.summary.passingFrames, framePlan.length - 1);
     assert.equal(report.summary.mismatchRatio, Number((1 / framePlan.length).toFixed(6)));
+    assert.equal(report.summary.meanMismatchRatio, Number((1 / framePlan.length).toFixed(6)));
+    assert.equal(report.summary.maxMismatchRatio, 1);
+    assert.equal(report.summary.minPixelFidelityScore, report.summary.worstFrame?.pixelFidelityScore);
+    assert.equal(report.summary.maxPixelFidelityScore, 1);
     assert.equal(report.summary.worstFrame?.frame, 1);
+    assert.equal(report.summary.bestFrame?.frame, 0);
+    assert.equal(report.summary.bySlide.length, 2);
+    assert.equal(report.summary.bySlide[0]?.mismatchedPixels, 1);
     assert.equal(persisted.summary.mismatchedPixels, 1);
+    assert.equal(persisted.summary.bySlide[0].worstFrame, 1);
     assert.equal(decodePng(await readFile(path.join(diffDir, framePlan[1]?.outputPath ?? ""))).width, 1);
   });
 

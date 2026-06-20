@@ -4,12 +4,14 @@ import assert from "node:assert/strict";
 import { createDemoDeck } from "../../src/demo/createDemoDeck.ts";
 import {
   createDeckTimeline,
+  createRuntimeFrameSnapshot,
   createSlideTimingPlan,
   easeProgressValue,
   keyframeEventToCssFrames,
   renderHtmlDocument,
   renderSlideMarkup,
   resolveMorphTransitionObjectStates,
+  resolveTimelineEventDiagnostics,
   resolveSlideObjectStates,
   resolveDeckTime
 } from "../../src/runtime/index.ts";
@@ -26,6 +28,10 @@ describe("HTML runtime rendering", () => {
     assert.match(html, /nextSlide/);
     assert.match(html, /activeTimelineTransition/);
     assert.match(html, /getCurrentFrameState/);
+    assert.match(html, /getGlobalSnapshot/);
+    assert.match(html, /getTimelineEventDiagnostics/);
+    assert.match(html, /captureFrame/);
+    assert.match(html, /seekFrame/);
     assert.match(html, /createTimingPlan/);
     assert.match(html, /setPlaybackRate/);
   });
@@ -193,6 +199,42 @@ describe("HTML runtime rendering", () => {
       pickResolution(resolveDeckTime(deck, 3600)),
       { slideIndex: 1, slideTimeMs: 100, inTransition: false, transitionProgress: 1 }
     );
+  });
+
+  test("reports timeline event diagnostics with active, filled, and future phases", () => {
+    const deck = createRuntimeEvalDeck();
+    const diagnostics = resolveTimelineEventDiagnostics(deck.deck.slides[0], 500);
+    const rotate = diagnostics.find((event) => event.eventId === "rotate");
+    const scale = diagnostics.find((event) => event.eventId === "scale");
+
+    assert.equal(rotate?.phase, "active");
+    assert.equal(rotate?.active, true);
+    assert.equal(rotate?.applied, true);
+    assert.equal(rotate?.targetId, "box");
+    assert.equal(rotate?.property, "transform.rotation");
+    assert.equal(rotate?.rawProgress, 0.5);
+    assert.equal(rotate?.appliedProgress, 0.5);
+    assert.equal(scale?.kind, "keyframes");
+    assert.equal(scale?.durationMs, 1000);
+  });
+
+  test("creates a global runtime snapshot for transition and object state debugging", () => {
+    const deck = createMorphTransitionDeck();
+    const snapshot = createRuntimeFrameSnapshot(deck, 1500, { includeInactiveSlides: true });
+
+    assert.equal(snapshot.deckId, "morph-transition");
+    assert.equal(snapshot.resolution.inTransition, true);
+    assert.equal(snapshot.resolution.slideIndex, 1);
+    assert.equal(snapshot.transition?.previousSlideId, "a");
+    assert.equal(snapshot.transition?.currentSlideId, "b");
+    assert.deepEqual(snapshot.transition?.pairs, [{ fromObjectId: "shape-a", toObjectId: "shape-b", morphKey: "shared" }]);
+    assert.equal(snapshot.slides.length, 2);
+    assert.equal(snapshot.slides[0]?.phase, "previous");
+    assert.equal(snapshot.slides[1]?.phase, "current");
+    assert.equal(snapshot.slides[0]?.timeMs, 1000);
+    assert.equal(snapshot.objects["shape-a"]?.bounds?.x, 10);
+    assert.equal(snapshot.objects["shape-b"]?.bounds?.x, 110);
+    assert.equal(snapshot.transition?.states["shape-b"]?.bounds?.x, 60);
   });
 });
 

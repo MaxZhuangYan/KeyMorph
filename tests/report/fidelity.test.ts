@@ -6,7 +6,14 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import { comparePngFiles, compareRgbaImages, decodePng, encodePng, type RgbaImage } from "../../src/report/fidelity.ts";
+import {
+  aggregatePixelFidelityResults,
+  comparePngFiles,
+  compareRgbaImages,
+  decodePng,
+  encodePng,
+  type RgbaImage
+} from "../../src/report/fidelity.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -77,6 +84,28 @@ describe("pixel fidelity scoring", () => {
     assert.equal(diff.width, 2);
     assert.equal(diff.height, 1);
     assert.deepEqual(Array.from(diff.data.slice(4, 8)), [255, 40, 40, 255]);
+  });
+
+  test("aggregates frame fidelity results with pass and worst-item metrics", () => {
+    const perfect = compareRgbaImages(image(1, 1, [255, 255, 255, 255]), image(1, 1, [255, 255, 255, 255]));
+    const changed = compareRgbaImages(image(1, 1, [255, 255, 255, 255]), image(1, 1, [0, 0, 0, 255]), {
+      threshold: 0
+    });
+
+    const aggregate = aggregatePixelFidelityResults([perfect, changed], { passThreshold: 0.9 });
+
+    assert.equal(aggregate.count, 2);
+    assert.equal(aggregate.totalPixels, 2);
+    assert.equal(aggregate.mismatchedPixels, 1);
+    assert.equal(aggregate.matchedItems, 1);
+    assert.equal(aggregate.mismatchedItems, 1);
+    assert.equal(aggregate.passingItems, 1);
+    assert.equal(aggregate.failingItems, 1);
+    assert.equal(aggregate.mismatchRatio, 0.5);
+    assert.equal(aggregate.meanMismatchRatio, 0.5);
+    assert.equal(aggregate.maxMismatchRatio, 1);
+    assert.equal(aggregate.bestIndex, 0);
+    assert.equal(aggregate.worstIndex, 1);
   });
 });
 
