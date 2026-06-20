@@ -480,6 +480,83 @@ describe("Keynote bridge", () => {
     assert.equal(event?.metadata?.nativeBuildEffect, "apple:movie-start");
   });
 
+  test("recovers native 2011 text drawable build targets and simple motion paths", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-text-drawable-"));
+    const keyPath = path.join(dir, "text-drawable.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(1200, [{ type: 2001, payload: nativeTextContentPayload("不,这些还是你的!*") }]),
+        iwaArchiveRecord(1100, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1200,
+              bounds: { x: 240, y: 180, width: 420, height: 96 }
+            })
+          }
+        ]),
+        iwaArchiveRecord(1300, [
+          {
+            type: 8,
+            payload: nativeBuildPayload({
+              targetId: 1100,
+              direction: "In",
+              effect: "apple:bc-appear",
+              durationSeconds: 0.5
+            })
+          }
+        ]),
+        iwaArchiveRecord(1301, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 1300, durationSeconds: 0.5 }) }]),
+        iwaArchiveRecord(1400, [
+          {
+            type: 8,
+            payload: nativeBuildPayload({
+              targetId: 1100,
+              direction: "Action",
+              effect: "apple:action-motion-path",
+              durationSeconds: 1,
+              motionPath: { x: 50, y: -252 }
+            })
+          }
+        ]),
+        iwaArchiveRecord(1401, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 1400, durationSeconds: 1 }) }])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.metadata?.nativeExtraction === "typed-iwa-text-drawable");
+    assert.equal(object?.type, "text");
+    if (object?.type !== "text") throw new Error("Expected native text drawable.");
+    assert.equal(object.text.plainText, "不,这些还是你的!");
+    assert.deepEqual(object.bounds, { x: 240, y: 180, width: 420, height: 96 });
+    assert.equal(object.metadata?.nativeArchiveIdentifier, "1100");
+    assert.equal(object.metadata?.nativeTextArchiveIdentifier, "1200");
+
+    const events = deck.deck.slides[0]?.timeline?.events ?? [];
+    const appear = events.find((event) => event.metadata?.nativeBuildId === "1300");
+    assert.equal(appear?.kind, "keyframes");
+    assert.equal(appear?.targetId, object.id);
+    const motion = events.find((event) => event.metadata?.nativeBuildId === "1400");
+    assert.equal(motion?.kind, "keyframes");
+    assert.equal(motion?.targetId, object.id);
+    if (motion?.kind !== "keyframes") throw new Error("Expected motion path keyframes.");
+    assert.deepEqual(motion.tracks.find((track) => track.property === "transform.translateX")?.keyframes, [
+      { offset: 0, value: 0 },
+      { offset: 1, value: 50 }
+    ]);
+    assert.deepEqual(motion.tracks.find((track) => track.property === "transform.translateY")?.keyframes, [
+      { offset: 0, value: 0 },
+      { offset: 1, value: -252 }
+    ]);
+    assert.equal(motion.metadata?.nativeMotionPathRelative, true);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationUnresolvedCount, 0);
+  });
+
   test("parses a ZIP-backed .key package with loose Index IWA entries", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-zip-"));
     const keyPath = path.join(dir, "sample.key");
@@ -601,6 +678,7 @@ function nativeBuildPayload(values: {
   effect: string;
   durationSeconds: number;
   delaySeconds?: number;
+  motionPath?: { x: number; y: number };
 }): Uint8Array {
   return concat([
     protoBytes(protoVarint(1, values.targetId), 1),
@@ -617,11 +695,66 @@ function nativeBuildPayload(values: {
             protoFixed64(5, values.delaySeconds ?? 0)
           ]),
           18
-        )
+        ),
+        ...(values.motionPath ? [protoBytes(nativeMotionPathPayload(values.motionPath), 22)] : [])
       ]),
       4
     )
   ]);
+}
+
+function nativeTextContentPayload(text: string): Uint8Array {
+  return protoString(text, 3);
+}
+
+function nativeTextDrawablePayload(values: {
+  slideId: number;
+  textId: number;
+  bounds: { x: number; y: number; width: number; height: number };
+}): Uint8Array {
+  return concat([
+    protoBytes(
+      concat([
+        protoBytes(
+          concat([
+            protoBytes(
+              concat([
+                protoBytes(concat([protoFixed32(1, values.bounds.x), protoFixed32(2, values.bounds.y)]), 1)
+              ]),
+              1
+            ),
+            protoBytes(protoVarint(1, values.slideId), 2)
+          ]),
+          1
+        ),
+        protoBytes(
+          protoBytes(
+            protoBytes(concat([protoFixed32(1, values.bounds.width), protoFixed32(2, values.bounds.height)]), 2),
+            5
+          ),
+          3
+        )
+      ]),
+      1
+    ),
+    protoBytes(protoVarint(1, values.textId), 2),
+    protoBytes(protoVarint(1, values.textId), 4)
+  ]);
+}
+
+function nativeMotionPathPayload(point: { x: number; y: number }): Uint8Array {
+  const zero = nativeMotionPathPointCluster({ x: 0, y: 0 });
+  const end = nativeMotionPathPointCluster(point);
+  return protoBytes(protoBytes(concat([zero, end]), 1), 8);
+}
+
+function nativeMotionPathPointCluster(point: { x: number; y: number }): Uint8Array {
+  const control = nativeMotionPathPoint(point);
+  return protoBytes(concat([protoBytes(control, 1), protoBytes(control, 2), protoBytes(control, 3)]), 1);
+}
+
+function nativeMotionPathPoint(point: { x: number; y: number }): Uint8Array {
+  return concat([protoFixed32(1, point.x), protoFixed32(2, point.y)]);
 }
 
 function nativeBuildTimingPayload(values: { buildId: number; durationSeconds: number; delaySeconds?: number }): Uint8Array {

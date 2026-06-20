@@ -133,6 +133,8 @@ export interface NativeIwaArchiveMessageEvidence {
   fieldSummaries: NativeIwaFieldSummary[];
   build?: NativeIwaBuildEvidence;
   buildTiming?: NativeIwaBuildTimingEvidence;
+  textContent?: NativeIwaTextContentEvidence;
+  textDrawable?: NativeIwaTextDrawableEvidence;
 }
 
 export interface NativeIwaBuildEvidence {
@@ -146,6 +148,7 @@ export interface NativeIwaBuildEvidence {
   durationMs?: number;
   delayMs?: number;
   timingBase?: number;
+  motionPath?: NativeIwaMotionPathEvidence;
   confidence: number;
   sourceFieldPaths: string[];
 }
@@ -159,6 +162,30 @@ export interface NativeIwaBuildTimingEvidence {
   group?: number;
   startsWithPrevious?: boolean;
   afterPrevious?: boolean;
+  confidence: number;
+  sourceFieldPaths: string[];
+}
+
+export interface NativeIwaMotionPathEvidence {
+  kind: "motionPath";
+  relative: boolean;
+  points: Array<{ x: number; y: number }>;
+  confidence: number;
+  sourceFieldPaths: string[];
+}
+
+export interface NativeIwaTextContentEvidence {
+  kind: "textContent";
+  text: string;
+  confidence: number;
+  sourceFieldPaths: string[];
+}
+
+export interface NativeIwaTextDrawableEvidence {
+  kind: "textDrawable";
+  textArchiveIds: string[];
+  slideArchiveId?: string;
+  bounds?: { x: number; y: number; width: number; height: number };
   confidence: number;
   sourceFieldPaths: string[];
 }
@@ -1290,11 +1317,13 @@ function buildNativeSlides(
         match.geometryCandidate ?? scan.geometryCandidates[textObjects.length + assetIndex]
       )
     );
+    const nativeTextObjects = createNativeTextDrawableObjects(slideId, scan.archiveMessages, entry.path, deckSize);
+    const textObjectsToKeep = suppressDuplicateFallbackTextObjects(textObjects, nativeTextObjects);
     const objects =
       usePreviewFallback && previewFallback
         ? [createPreviewImageObject(slideId, previewFallback, entry.path, deckSize, textCandidates)]
-        : textObjects.length > 0 || assetObjects.length > 0
-        ? [...textObjects, ...assetObjects]
+      : textObjects.length > 0 || nativeTextObjects.length > 0 || assetObjects.length > 0
+        ? [...textObjectsToKeep, ...nativeTextObjects, ...assetObjects]
         : [createPlaceholderObject(slideId, entry.path, deckSize)];
     const buildAnimationRecovery = recoverNativeBuildAnimations(slideId, objects, scan.archiveMessages);
 
@@ -1584,6 +1613,153 @@ function createTextObject(
         : {})
     }
   };
+}
+
+function createNativeTextDrawableObjects(
+  slideId: string,
+  messages: NativeIwaArchiveMessageEvidence[],
+  sourcePath: string,
+  deckSize: { width: number; height: number }
+): IRObject[] {
+  const targetIds = nativeBuildTargetIds(messages);
+  if (targetIds.size === 0) {
+    return [];
+  }
+
+  const textByArchiveId = new Map<string, NativeIwaTextContentEvidence>();
+  for (const message of messages) {
+    if (message.archiveIdentifier && message.textContent) {
+      textByArchiveId.set(message.archiveIdentifier, message.textContent);
+    }
+  }
+
+  const objects: IRObject[] = [];
+  const seenDrawableIds = new Set<string>();
+  for (const message of messages) {
+    const drawable = message.textDrawable;
+    const drawableId = message.archiveIdentifier;
+    if (!drawable || !drawableId || !targetIds.has(drawableId) || seenDrawableIds.has(drawableId)) {
+      continue;
+    }
+    const textEntry = drawable.textArchiveIds.map((id) => textByArchiveId.get(id)).find((entry) => entry?.text);
+    if (!textEntry) {
+      continue;
+    }
+    const object = createNativeTextDrawableObject(slideId, message, drawable, textEntry, objects.length, sourcePath, deckSize);
+    if (object) {
+      seenDrawableIds.add(drawableId);
+      objects.push(object);
+    }
+  }
+  return objects;
+}
+
+function nativeBuildTargetIds(messages: NativeIwaArchiveMessageEvidence[]): Set<string> {
+  return new Set(
+    messages
+      .map((message) => message.build?.targetNativeId)
+      .filter((targetId): targetId is string => Boolean(targetId))
+  );
+}
+
+function createNativeTextDrawableObject(
+  slideId: string,
+  message: NativeIwaArchiveMessageEvidence,
+  drawable: NativeIwaTextDrawableEvidence,
+  textEntry: NativeIwaTextContentEvidence,
+  objectIndex: number,
+  sourcePath: string,
+  deckSize: { width: number; height: number }
+): IRObject | undefined {
+  const text = cleanTextCandidate(textEntry.text);
+  if (!text || !message.archiveIdentifier) {
+    return undefined;
+  }
+  const bounds = drawable.bounds
+    ? normalizeNativeTextDrawableBounds(drawable.bounds, deckSize)
+    : {
+        x: Math.round(deckSize.width * 0.1),
+        y: Math.round(deckSize.height * 0.1) + objectIndex * 64,
+        width: Math.round(deckSize.width * 0.72),
+        height: 64
+      };
+  const fontSize = Math.max(14, Math.min(48, Math.round((bounds.height || 64) * 0.42)));
+  return {
+    id: `${slideId}-native-text-${objectIndex + 1}`,
+    type: "text",
+    name: `Native text drawable ${objectIndex + 1}`,
+    bounds,
+    opacity: 1,
+    text: {
+      plainText: text,
+      runs: [
+        {
+          text,
+          style: {
+            fontFamily: "Helvetica Neue",
+            fontSize,
+            color: "#111827"
+          }
+        }
+      ]
+    },
+    metadata: {
+      nativeSourcePath: sourcePath,
+      nativeExtraction: "typed-iwa-text-drawable",
+      nativeArchiveMessageType: message.type,
+      nativeArchiveIdentifier: message.archiveIdentifier,
+      nativeArchiveMessageIndex: message.messageIndex,
+      nativeArchivePayloadOffset: message.payloadOffset,
+      nativeArchivePayloadLength: message.payloadLength,
+      nativeArchiveObjectReferences: message.objectReferences,
+      nativeTextArchiveIdentifier: drawable.textArchiveIds[0],
+      nativeTextArchiveIdentifiers: drawable.textArchiveIds,
+      nativeTextDrawableConfidence: drawable.confidence,
+      nativeTextContentConfidence: textEntry.confidence,
+      nativeTextDrawableFieldPaths: drawable.sourceFieldPaths,
+      nativeTextContentFieldPaths: textEntry.sourceFieldPaths,
+      ...(drawable.slideArchiveId ? { nativeTextDrawableSlideArchiveId: drawable.slideArchiveId } : {}),
+      ...(drawable.bounds ? { nativeTextDrawableRawBounds: drawable.bounds } : {})
+    }
+  };
+}
+
+function normalizeNativeTextDrawableBounds(
+  bounds: { x: number; y: number; width: number; height: number },
+  deckSize: { width: number; height: number }
+): { x: number; y: number; width: number; height: number } {
+  const width = Math.max(8, Math.min(MAX_VISUAL_NUMERIC_VALUE, bounds.width));
+  const height = Math.max(8, Math.min(MAX_VISUAL_NUMERIC_VALUE, bounds.height));
+  return {
+    x: roundGeometryNumber(Math.max(-deckSize.width, Math.min(deckSize.width * 2, bounds.x))),
+    y: roundGeometryNumber(Math.max(-deckSize.height, Math.min(deckSize.height * 2, bounds.y))),
+    width: roundGeometryNumber(width),
+    height: roundGeometryNumber(height)
+  };
+}
+
+function suppressDuplicateFallbackTextObjects(textObjects: IRObject[], nativeTextObjects: IRObject[]): IRObject[] {
+  const nativeText = new Set(
+    nativeTextObjects
+      .filter((object): object is Extract<IRObject, { type: "text" }> => object.type === "text")
+      .map((object) => normalizeTextForDuplicateCheck(object.text.plainText))
+      .filter((text): text is string => Boolean(text))
+  );
+  if (nativeText.size === 0) {
+    return textObjects;
+  }
+  return textObjects.filter((object) => {
+    if (object.type !== "text") {
+      return true;
+    }
+    const normalized = normalizeTextForDuplicateCheck(object.text.plainText);
+    return !normalized || !nativeText.has(normalized);
+  });
+}
+
+function normalizeTextForDuplicateCheck(text: string | undefined): string | undefined {
+  const cleaned = text?.replace(/\s+/g, "").trim().toLowerCase();
+  return cleaned || undefined;
 }
 
 function createPlaceholderObject(
@@ -2039,6 +2215,41 @@ function nativeBuildEventFromEvidence(
       metadata: nativeBuildEventMetadata(build, timing, resolution, "media-play")
     };
   }
+  if (build.effect && /motion-path/i.test(build.effect) && build.motionPath) {
+    const startPoint = build.motionPath.points[0];
+    const endPoint = build.motionPath.points[build.motionPath.points.length - 1];
+    if (startPoint && endPoint) {
+      return {
+        id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, "motion-path"),
+        kind: "keyframes",
+        label: "Keynote motion path",
+        targetId: resolution.object.id,
+        start: { type: "absolute", atMs: startMs },
+        durationMs,
+        fill: "both",
+        easing: "easeInOut",
+        tracks: [
+          {
+            property: "transform.translateX",
+            interpolation: "number",
+            keyframes: [
+              { offset: 0, value: startPoint.x },
+              { offset: 1, value: endPoint.x }
+            ]
+          },
+          {
+            property: "transform.translateY",
+            interpolation: "number",
+            keyframes: [
+              { offset: 0, value: startPoint.y },
+              { offset: 1, value: endPoint.y }
+            ]
+          }
+        ],
+        metadata: nativeBuildEventMetadata(build, timing, resolution, "motion-path")
+      };
+    }
+  }
   if (direction !== "in" && direction !== "out") {
     return undefined;
   }
@@ -2090,6 +2301,14 @@ function nativeBuildEventMetadata(
     ...(build.direction ? { nativeBuildDirection: build.direction } : {}),
     ...(build.effect ? { nativeBuildEffect: build.effect } : {}),
     nativeBuildConfidence: build.confidence,
+    ...(build.motionPath
+      ? {
+          nativeMotionPathRelative: build.motionPath.relative,
+          nativeMotionPathPoints: build.motionPath.points,
+          nativeMotionPathConfidence: build.motionPath.confidence,
+          nativeMotionPathFieldPaths: build.motionPath.sourceFieldPaths
+        }
+      : {}),
     ...(timing ? { nativeBuildTimingConfidence: timing.confidence } : {}),
     ...(timing?.group !== undefined ? { nativeBuildTimingGroup: timing.group } : {}),
     ...(timing?.startsWithPrevious !== undefined ? { nativeBuildStartsWithPrevious: timing.startsWithPrevious } : {}),
@@ -2678,6 +2897,33 @@ function stringValuesAtFieldPath(data: Uint8Array, fieldPath: number[]): string[
   return uniqueStrings(values);
 }
 
+function bytesValueAtFieldPath(data: Uint8Array, fieldPath: number[]): Uint8Array | undefined {
+  return bytesValuesAtFieldPath(data, fieldPath)[0];
+}
+
+function bytesValuesAtFieldPath(data: Uint8Array, fieldPath: number[]): Uint8Array[] {
+  if (fieldPath.length === 0) {
+    return [];
+  }
+  const fields = readSequentialProtobufFields(data);
+  if (!fields) {
+    return [];
+  }
+  const [fieldNumber, ...rest] = fieldPath;
+  const values: Uint8Array[] = [];
+  for (const field of fields.filter((candidate) => candidate.fieldNumber === fieldNumber)) {
+    if (!field.value) {
+      continue;
+    }
+    if (rest.length === 0) {
+      values.push(field.value);
+      continue;
+    }
+    values.push(...bytesValuesAtFieldPath(field.value, rest));
+  }
+  return values;
+}
+
 function cleanNativeBuildString(value: Uint8Array): string | undefined {
   const text = decodeUtf8(value)?.replace(/\u0000/g, "").replace(/\s+/g, " ").trim();
   if (!text || text.includes("\ufffd") || text.length > 256) {
@@ -2701,6 +2947,7 @@ function nativeBuildEvidenceFromPayload(
   const durationMs = nativeSecondsToMs(numericValueAtFieldPath(payload, [4, 18, 3]));
   const delayMs = nativeSecondsToMs(numericValueAtFieldPath(payload, [4, 18, 5]) ?? numericValueAtFieldPath(payload, [3]));
   const timingBase = numericValueAtFieldPath(payload, [4, 17]);
+  const motionPath = nativeMotionPathEvidenceFromPayload(payload);
   const sourceFieldPaths = [
     ...(targetNativeId ? ["1.1"] : []),
     ...(delivery ? ["2"] : []),
@@ -2708,7 +2955,8 @@ function nativeBuildEvidenceFromPayload(
     ...(timingBase !== undefined ? ["4.17"] : []),
     ...(direction ? ["4.18.1"] : []),
     ...(effect ? ["4.18.2"] : []),
-    ...(durationMs !== undefined ? ["4.18.3"] : [])
+    ...(durationMs !== undefined ? ["4.18.3"] : []),
+    ...(motionPath ? motionPath.sourceFieldPaths : [])
   ];
   const confidence = roundConfidence(
     0.28 +
@@ -2716,6 +2964,7 @@ function nativeBuildEvidenceFromPayload(
       (effect ? 0.2 : 0) +
       (direction ? 0.12 : 0) +
       (durationMs !== undefined ? 0.1 : 0) +
+      (motionPath ? 0.08 : 0) +
       (record.identifier ? 0.06 : 0) +
       (messageInfo.objectReferences.length > 0 ? 0.04 : 0)
   );
@@ -2730,6 +2979,7 @@ function nativeBuildEvidenceFromPayload(
     ...(durationMs !== undefined ? { durationMs } : {}),
     ...(delayMs !== undefined ? { delayMs } : {}),
     ...(timingBase !== undefined ? { timingBase } : {}),
+    ...(motionPath ? { motionPath } : {}),
     confidence,
     sourceFieldPaths: uniqueStrings(sourceFieldPaths)
   };
@@ -2776,6 +3026,90 @@ function nativeBuildTimingEvidenceFromPayload(
     confidence,
     sourceFieldPaths: uniqueStrings(sourceFieldPaths)
   };
+}
+
+function nativeMotionPathEvidenceFromPayload(payload: Uint8Array): NativeIwaMotionPathEvidence | undefined {
+  const pathPayload = bytesValueAtFieldPath(payload, [4, 22]);
+  if (!pathPayload) {
+    return undefined;
+  }
+  const pointClusters = nativeMotionPathPointClusters(pathPayload);
+  if (pointClusters.length < 2) {
+    return undefined;
+  }
+  const first = pointClusters[0];
+  const last = pointClusters[pointClusters.length - 1];
+  if (!first || !last || !isZeroishPoint(first) || !isFiniteMotionPoint(last)) {
+    return undefined;
+  }
+  const points = [
+    { x: 0, y: 0 },
+    { x: roundGeometryNumber(last.x), y: roundGeometryNumber(last.y) }
+  ];
+  if (Math.abs(points[1]!.x) < 0.001 && Math.abs(points[1]!.y) < 0.001) {
+    return undefined;
+  }
+  return {
+    kind: "motionPath",
+    relative: true,
+    points,
+    confidence: pointClusters.length === 2 ? 0.86 : 0.78,
+    sourceFieldPaths: [
+      "4.22",
+      "4.22.8.1.1.1.1",
+      "4.22.8.1.1.1.2",
+      "4.22.8.1.1.2.1",
+      "4.22.8.1.1.2.2",
+      "4.22.8.1.1.3.1",
+      "4.22.8.1.1.3.2"
+    ]
+  };
+}
+
+function nativeMotionPathPointClusters(payload: Uint8Array): Array<{ x: number; y: number }> {
+  const containers = bytesValuesAtFieldPath(payload, [8, 1, 1]);
+  const clusters: Array<{ x: number; y: number }> = [];
+  for (const container of containers) {
+    const controls = [
+      nativeMotionPathPointAt(container, [1]),
+      nativeMotionPathPointAt(container, [2]),
+      nativeMotionPathPointAt(container, [3])
+    ].filter((point): point is { x: number; y: number } => Boolean(point));
+    if (controls.length === 0) {
+      continue;
+    }
+    const stable = controls.every((point) => pointsNearlyEqual(point, controls[0]!));
+    if (!stable) {
+      continue;
+    }
+    clusters.push(controls[0]!);
+  }
+  return clusters;
+}
+
+function nativeMotionPathPointAt(payload: Uint8Array, fieldPath: number[]): { x: number; y: number } | undefined {
+  const pointPayload = bytesValueAtFieldPath(payload, fieldPath);
+  if (!pointPayload) {
+    return undefined;
+  }
+  const x = numericValueAtFieldPath(pointPayload, [1]);
+  const y = numericValueAtFieldPath(pointPayload, [2]);
+  if (x === undefined || y === undefined || !Number.isFinite(x) || !Number.isFinite(y)) {
+    return undefined;
+  }
+  return { x, y };
+}
+
+function isZeroishPoint(point: { x: number; y: number }): boolean {
+  return Math.abs(point.x) <= 0.001 && Math.abs(point.y) <= 0.001;
+}
+
+function isFiniteMotionPoint(point: { x: number; y: number }): boolean {
+  return Number.isFinite(point.x) && Number.isFinite(point.y) && Math.abs(point.x) <= MAX_VISUAL_NUMERIC_VALUE && Math.abs(point.y) <= MAX_VISUAL_NUMERIC_VALUE;
+}
+
+function pointsNearlyEqual(left: { x: number; y: number }, right: { x: number; y: number }): boolean {
+  return Math.abs(left.x - right.x) <= 0.001 && Math.abs(left.y - right.y) <= 0.001;
 }
 
 function nativeBuildEffectFromStrings(values: string[]): string | undefined {
@@ -2845,6 +3179,8 @@ function createArchiveMessageEvidence(
   ]).slice(0, 24);
   const build = nativeBuildEvidenceFromPayload(record, messageInfo, payload);
   const buildTiming = nativeBuildTimingEvidenceFromPayload(record, messageInfo, payload);
+  const textContent = nativeTextContentEvidenceFromPayload(messageInfo, payload);
+  const textDrawable = nativeTextDrawableEvidenceFromPayload(messageInfo, payload);
   return {
     archiveOffset: record.archiveOffset,
     ...(record.identifier ? { archiveIdentifier: record.identifier } : {}),
@@ -2859,7 +3195,9 @@ function createArchiveMessageEvidence(
     geometryCandidates,
     fieldSummaries: scan.fieldSummaries.slice(0, 24),
     ...(build ? { build } : {}),
-    ...(buildTiming ? { buildTiming } : {})
+    ...(buildTiming ? { buildTiming } : {}),
+    ...(textContent ? { textContent } : {}),
+    ...(textDrawable ? { textDrawable } : {})
   };
 }
 
@@ -2992,6 +3330,100 @@ function inferTypedImageGeometryCandidates(
       reason: `typed Keynote image geometry from archive message type ${messageInfo.type}`
     }
   ];
+}
+
+function nativeTextContentEvidenceFromPayload(
+  messageInfo: IwaArchiveMessageInfo,
+  payload: Uint8Array
+): NativeIwaTextContentEvidence | undefined {
+  if (messageInfo.type !== 2001) {
+    return undefined;
+  }
+  const cleaned = [
+    ...stringValuesAtFieldPath(payload, [3]),
+    ...extractArchiveEvidenceStrings(payload)
+  ]
+    .map((text) => cleanTextCandidate(text))
+    .find((text): text is string => Boolean(text));
+  if (!cleaned) {
+    return undefined;
+  }
+  return {
+    kind: "textContent",
+    text: cleaned,
+    confidence: 0.9,
+    sourceFieldPaths: ["3"]
+  };
+}
+
+function nativeTextDrawableEvidenceFromPayload(
+  messageInfo: IwaArchiveMessageInfo,
+  payload: Uint8Array
+): NativeIwaTextDrawableEvidence | undefined {
+  if (messageInfo.type !== 2011) {
+    return undefined;
+  }
+
+  const textArchiveIds = uniqueStrings(
+    [
+      ...numericValuesAtFieldPath(payload, [2, 1]),
+      ...numericValuesAtFieldPath(payload, [4, 1])
+    ]
+      .map(nativeIdFromNumber)
+      .filter((value): value is string => Boolean(value))
+  );
+  const slideArchiveId = nativeIdFromNumber(numericValueAtFieldPath(payload, [1, 1, 2, 1]));
+  const x = numericValueAtFieldPath(payload, [1, 1, 1, 1, 1]);
+  const y = numericValueAtFieldPath(payload, [1, 1, 1, 1, 2]);
+  const width = numericValueAtFieldPath(payload, [1, 3, 5, 2, 1]);
+  const height = numericValueAtFieldPath(payload, [1, 3, 5, 2, 2]);
+  const bounds =
+    x !== undefined &&
+    y !== undefined &&
+    width !== undefined &&
+    height !== undefined &&
+    isPlausibleTypedTextDrawableGeometryTuple(x, y, width, height)
+      ? {
+          x: roundGeometryNumber(x),
+          y: roundGeometryNumber(y),
+          width: roundGeometryNumber(width),
+          height: roundGeometryNumber(height)
+        }
+      : undefined;
+  if (textArchiveIds.length === 0 && !bounds) {
+    return undefined;
+  }
+  const sourceFieldPaths = [
+    ...(slideArchiveId ? ["1.1.2.1"] : []),
+    ...(x !== undefined ? ["1.1.1.1.1"] : []),
+    ...(y !== undefined ? ["1.1.1.1.2"] : []),
+    ...(width !== undefined ? ["1.3.5.2.1"] : []),
+    ...(height !== undefined ? ["1.3.5.2.2"] : []),
+    ...(textArchiveIds.length > 0 ? ["2.1", "4.1"] : [])
+  ];
+  return {
+    kind: "textDrawable",
+    textArchiveIds,
+    ...(slideArchiveId ? { slideArchiveId } : {}),
+    ...(bounds ? { bounds } : {}),
+    confidence: roundConfidence(0.36 + (textArchiveIds.length > 0 ? 0.3 : 0) + (bounds ? 0.22 : 0) + (slideArchiveId ? 0.04 : 0)),
+    sourceFieldPaths: uniqueStrings(sourceFieldPaths)
+  };
+}
+
+function isPlausibleTypedTextDrawableGeometryTuple(x: number, y: number, width: number, height: number): boolean {
+  return (
+    Number.isFinite(x) &&
+    Number.isFinite(y) &&
+    Number.isFinite(width) &&
+    Number.isFinite(height) &&
+    Math.abs(x) <= MAX_VISUAL_NUMERIC_VALUE &&
+    Math.abs(y) <= MAX_VISUAL_NUMERIC_VALUE &&
+    width >= 1 &&
+    height >= 1 &&
+    width <= MAX_VISUAL_NUMERIC_VALUE &&
+    height <= MAX_VISUAL_NUMERIC_VALUE
+  );
 }
 
 function extractArchiveEvidenceStrings(data: Uint8Array): string[] {
@@ -4513,7 +4945,7 @@ function looksLikePresentationText(text: string): boolean {
   if (text.length <= 4 && !/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text)) {
     return false;
   }
-  if (text.length <= 8 && /[^A-Za-z0-9\s\p{L}\p{N}]/u.test(text)) {
+  if (text.length <= 8 && !/[\p{Script=Han}]/u.test(text) && /[^A-Za-z0-9\s\p{L}\p{N}]/u.test(text)) {
     return false;
   }
   if (text.length <= 10 && hasMixedLowSignalScripts(text)) {
@@ -4577,7 +5009,8 @@ function hasBinaryResidue(text: string): boolean {
   if (/^[\p{L}\p{N}\s"'.,:;!?%&()[\]{}<>/@#$*+\\_-]+$/u.test(text)) {
     const asciiSymbols = Array.from(text).filter((char) => /["'.,:;!?%&()[\]{}<>/@#$*+\\_-]/.test(char)).length;
     const lettersAndNumbers = Array.from(text).filter((char) => /[\p{L}\p{N}]/u.test(char)).length;
-    if (lettersAndNumbers > 0 && asciiSymbols / lettersAndNumbers > 0.28) {
+    const threshold = /[\p{Script=Han}]/u.test(text) ? 0.45 : 0.28;
+    if (lettersAndNumbers > 0 && asciiSymbols / lettersAndNumbers > threshold) {
       return true;
     }
   }
