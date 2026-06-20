@@ -1,4 +1,4 @@
-import { access, mkdir, rm } from "node:fs/promises";
+import { access, mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -38,6 +38,23 @@ export interface KeynoteExportOptions {
 export interface KeynoteHtmlExportOptions {
   automationTimeoutMs?: number;
   allowAutomation?: boolean;
+}
+
+export type KeynoteMovieExportFormat = "360p" | "540p" | "720p" | "1080p" | "2160p" | "native";
+export type KeynoteMovieCodec =
+  | "h264"
+  | "hevc"
+  | "AppleProRes422"
+  | "AppleProRes4444"
+  | "AppleProRes422LT"
+  | "AppleProRes422HQ"
+  | "AppleProRes422Proxy";
+export type KeynoteMovieFrameRate = "FPS12" | "FPS2398" | "FPS24" | "FPS25" | "FPS2997" | "FPS30" | "FPS50" | "FPS5994" | "FPS60";
+
+export interface KeynoteMovieExportOptions extends KeynoteAutomationOptions {
+  format?: KeynoteMovieExportFormat;
+  codec?: KeynoteMovieCodec;
+  frameRate?: KeynoteMovieFrameRate;
 }
 
 export async function parseKeynoteToIr(
@@ -170,6 +187,34 @@ end tell
 `, options);
 }
 
+export async function exportKeynoteToMovie(keynotePath: string, moviePath: string, options: KeynoteMovieExportOptions = {}): Promise<void> {
+  await assertReadableFile(keynotePath, "Input Keynote file");
+  assertAutomationAllowed(options);
+  await mkdir(path.dirname(moviePath), { recursive: true });
+  const movieFormat = keynoteMovieFormatToken(options.format ?? "2160p");
+  const movieCodec = keynoteMovieCodecToken(options.codec ?? "h264");
+  const movieFrameRate = keynoteMovieFrameRateToken(options.frameRate ?? "FPS60");
+  const automationTimeoutMs = resolveMovieAutomationTimeoutMs(options.automationTimeoutMs);
+  const appleEventTimeoutSeconds = Math.max(1, Math.ceil(automationTimeoutMs / 1000));
+  try {
+    await runAppleScript(`
+set inputFile to POSIX file "${escapeAppleScriptString(path.resolve(keynotePath))}"
+set outputFile to POSIX file "${escapeAppleScriptString(path.resolve(moviePath))}"
+with timeout of ${appleEventTimeoutSeconds} seconds
+  tell application "Keynote"
+    activate
+    set theDocument to open inputFile
+    export theDocument to outputFile as QuickTime movie with properties {movie format:${movieFormat}, movie codec:${movieCodec}, movie framerate:${movieFrameRate}}
+    close theDocument saving no
+  end tell
+end timeout
+`, { ...options, automationTimeoutMs });
+  } catch (error) {
+    if (await fileExistsWithContent(moviePath)) return;
+    throw error;
+  }
+}
+
 export async function importPptxAndSaveKeynote(pptxPath: string, keynotePath: string, options: KeynoteAutomationOptions = {}): Promise<void> {
   await assertReadableFile(pptxPath, "Input PPTX file");
   assertAutomationAllowed(options);
@@ -222,6 +267,19 @@ function resolveAutomationTimeoutMs(optionTimeoutMs: number | undefined): number
   return validateAutomationTimeout(Number(envTimeout), "KEYMORPH_KEYNOTE_AUTOMATION_TIMEOUT_MS");
 }
 
+function resolveMovieAutomationTimeoutMs(optionTimeoutMs: number | undefined): number {
+  if (optionTimeoutMs !== undefined) {
+    return validateAutomationTimeout(optionTimeoutMs, "automationTimeoutMs");
+  }
+
+  const envTimeout = process.env.KEYMORPH_KEYNOTE_AUTOMATION_TIMEOUT_MS;
+  if (envTimeout !== undefined && envTimeout.trim() !== "") {
+    return validateAutomationTimeout(Number(envTimeout), "KEYMORPH_KEYNOTE_AUTOMATION_TIMEOUT_MS");
+  }
+
+  return 600000;
+}
+
 function validateAutomationTimeout(value: number, name: string): number {
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`${name} must be a positive timeout in milliseconds.`);
@@ -237,8 +295,42 @@ async function assertReadableFile(filePath: string, label: string): Promise<void
   }
 }
 
+async function fileExistsWithContent(filePath: string): Promise<boolean> {
+  try {
+    return (await stat(filePath)).size > 0;
+  } catch {
+    return false;
+  }
+}
+
 function escapeAppleScriptString(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+function keynoteMovieFormatToken(format: KeynoteMovieExportFormat): string {
+  switch (format) {
+    case "360p":
+      return "format360p";
+    case "540p":
+      return "format540p";
+    case "720p":
+      return "format720p";
+    case "1080p":
+      return "format1080p";
+    case "2160p":
+      return "format2160p";
+    case "native":
+      return "native size";
+  }
+}
+
+function keynoteMovieCodecToken(codec: KeynoteMovieCodec): string {
+  if (codec === "hevc") return "HEVC";
+  return codec;
+}
+
+function keynoteMovieFrameRateToken(frameRate: KeynoteMovieFrameRate): string {
+  return frameRate;
 }
 
 function errorMessage(error: unknown): string {

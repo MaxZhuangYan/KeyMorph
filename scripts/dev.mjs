@@ -692,5 +692,6 @@ function contentType(filePath) {
   }
   if (filePath.endsWith(".key")) return "application/vnd.apple.keynote";
   if (filePath.endsWith(".mp4")) return "video/mp4";
+  if (filePath.endsWith(".m4v")) return "video/mp4";
   return "application/octet-stream";
 }

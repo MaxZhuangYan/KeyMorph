@@ -103,17 +103,20 @@ describe("product bundle workflow", () => {
     assert.equal(manifest.keynote.available, false);
   });
 
-  test("uses Keynote native HTML export as the main runtime when automation is allowed", async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-keynote-html-"));
+  test("uses Keynote movie export as the main runtime when automation is allowed", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-keynote-movie-"));
     const inputPath = path.join(dir, "source.key");
     const bundleDir = path.join(dir, "bundle");
     await writeFile(inputPath, "stub keynote package", "utf8");
 
     const bundle = await createProductBundle(inputPath, bundleDir, {
-      jobId: "keynote-html-job",
+      jobId: "keynote-movie-job",
       allowKeynoteAutomation: true,
       keynoteBridgeExport: async (_keynotePath, pptxPath) => {
         await exportIrToPptx(createDemoDeck(), pptxPath);
+      },
+      keynoteMovieExport: async (_keynotePath, moviePath) => {
+        await writeFile(moviePath, "stub movie", "utf8");
       },
       keynoteHtmlExport: async (_keynotePath, outputDir) => {
         await mkdir(outputDir, { recursive: true });
@@ -124,16 +127,75 @@ describe("product bundle workflow", () => {
     const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
 
     assert.equal(bundle.sourceKind, "keynote");
-    assert.equal(manifest.runtime.mode, "keynote-html");
-    assert.equal(manifest.runtime.fidelity, "keynote-native");
+    assert.equal(manifest.runtime.mode, "keynote-movie");
+    assert.equal(manifest.runtime.fidelity, "keynote-rendered-video");
     assert.equal(manifest.artifacts.runtimeHtml, "runtime.html");
     assert.equal(manifest.artifacts.irRuntimeHtml, "runtime-ir.html");
-    assert.equal(manifest.artifacts.keynoteHtml, "keynote-html/index.html");
+    assert.equal(manifest.artifacts.keynoteHtml, null);
+    assert.equal(manifest.artifacts.keynoteMovie, "keynote-movie.m4v");
+    assert.equal(manifest.artifacts.renderVideo, "keynote-movie.m4v");
     const runtimeHtml = await readFile(path.join(bundleDir, "runtime.html"), "utf8");
-    assert.match(runtimeHtml, /location\.replace\("keynote-html\/index\.html"\)/);
-    assert.doesNotMatch(runtimeHtml, /<iframe/);
+    assert.match(runtimeHtml, /<video src="keynote-movie\.m4v"/);
     assert.match(await readFile(path.join(bundleDir, "runtime-ir.html"), "utf8"), /window\.__KEYMORPH_DECK__/);
+    assert.match(await readFile(path.join(bundleDir, "keynote-movie.m4v"), "utf8"), /stub movie/);
+  });
+
+  test("falls back to Keynote HTML runtime when movie export is unavailable", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-keynote-html-"));
+    const inputPath = path.join(dir, "source.key");
+    const bundleDir = path.join(dir, "bundle");
+    await writeFile(inputPath, "stub keynote package", "utf8");
+
+    await createProductBundle(inputPath, bundleDir, {
+      jobId: "keynote-html-job",
+      allowKeynoteAutomation: true,
+      keynoteBridgeExport: async (_keynotePath, pptxPath) => {
+        await exportIrToPptx(createDemoDeck(), pptxPath);
+      },
+      keynoteMovieExport: async () => {
+        throw new Error("Synthetic movie export failure");
+      },
+      keynoteHtmlExport: async (_keynotePath, outputDir) => {
+        await mkdir(outputDir, { recursive: true });
+        await writeFile(path.join(outputDir, "index.html"), "<!doctype html><title>Keynote Native Runtime</title>", "utf8");
+      }
+    });
+
+    const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
+    const runtimeHtml = await readFile(path.join(bundleDir, "runtime.html"), "utf8");
+
+    assert.equal(manifest.runtime.mode, "keynote-html");
+    assert.equal(manifest.artifacts.keynoteMovie, null);
+    assert.equal(manifest.artifacts.keynoteHtml, "keynote-html/index.html");
+    assert.match(runtimeHtml, /location\.replace\("keynote-html\/index\.html"\)/);
     assert.match(await readFile(path.join(bundleDir, "keynote-html", "index.html"), "utf8"), /Keynote Native Runtime/);
+  });
+
+  test("keeps movie runtime when exporter reports an error after writing a movie", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-keynote-movie-late-error-"));
+    const inputPath = path.join(dir, "source.key");
+    const bundleDir = path.join(dir, "bundle");
+    await writeFile(inputPath, "stub keynote package", "utf8");
+
+    await createProductBundle(inputPath, bundleDir, {
+      jobId: "keynote-movie-late-error-job",
+      allowKeynoteAutomation: true,
+      keynoteBridgeExport: async (_keynotePath, pptxPath) => {
+        await exportIrToPptx(createDemoDeck(), pptxPath);
+      },
+      keynoteMovieExport: async (_keynotePath, moviePath) => {
+        await writeFile(moviePath, "movie completed before timeout", "utf8");
+        throw new Error("Synthetic late AppleEvent timeout");
+      },
+      keynoteHtmlExport: async () => {
+        throw new Error("HTML fallback should not run");
+      }
+    });
+
+    const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
+    assert.equal(manifest.runtime.mode, "keynote-movie");
+    assert.equal(manifest.artifacts.keynoteMovie, "keynote-movie.m4v");
+    assert.match(await readFile(path.join(bundleDir, "keynote-movie.m4v"), "utf8"), /movie completed/);
   });
 
   test("CLI convert writes the same bundle shape", async () => {

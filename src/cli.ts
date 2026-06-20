@@ -8,7 +8,7 @@ import { renderHtmlDocument } from "./runtime/index.ts";
 import { createLossReport, scoreConversion, type ConversionLossReport } from "./report/index.ts";
 import { comparePngFiles } from "./report/fidelity.ts";
 import { exportIrToPptx, parsePptxToIr } from "./pptx/index.ts";
-import { exportIrToKeynote, exportKeynoteToHtml, parseKeynoteToIr, type KeynoteAutomationOptions } from "./keynote/index.ts";
+import { exportIrToKeynote, exportKeynoteToHtml, exportKeynoteToMovie, parseKeynoteToIr, type KeynoteAutomationOptions } from "./keynote/index.ts";
 import {
   createVideoExportPlan,
   createVideoFrameFidelityReport,
@@ -30,6 +30,7 @@ export interface ProductBundleOptions {
   keynoteAutomationTimeoutMs?: number;
   keynoteBridgeExport?: (keynotePath: string, pptxPath: string, options: KeynoteAutomationOptions) => Promise<void>;
   keynoteHtmlExport?: (keynotePath: string, outputDir: string, options: KeynoteAutomationOptions) => Promise<void>;
+  keynoteMovieExport?: (keynotePath: string, moviePath: string, options: KeynoteAutomationOptions) => Promise<void>;
   video?: Pick<VideoExportOptions, "fps" | "scale" | "ffmpegPath">;
 }
 
@@ -41,6 +42,7 @@ export interface ProductBundlePaths {
   irRuntimeHtml: string;
   keynoteHtmlDir: string;
   keynoteHtmlIndex: string;
+  keynoteMovie: string;
   rebuiltPptx: string;
   lossReport: string;
   manifest: string;
@@ -66,6 +68,7 @@ export interface ProductBundleManifest {
     runtimeHtml: string;
     irRuntimeHtml: string | null;
     keynoteHtml: string | null;
+    keynoteMovie: string | null;
     rebuiltPptx: string;
     lossReport: string;
     videoPlan: string;
@@ -88,11 +91,13 @@ export interface ProductBundleManifest {
 }
 
 export interface ProductRuntimeSummary {
-  mode: "keymorph-ir" | "keynote-html";
-  fidelity: "ir-reconstructed" | "keynote-native";
+  mode: "keymorph-ir" | "keynote-html" | "keynote-movie";
+  fidelity: "ir-reconstructed" | "keynote-native" | "keynote-rendered-video";
   message: string;
   htmlPath: string;
   irHtmlPath: string | null;
+  moviePath: string | null;
+  keynoteHtmlPath: string | null;
 }
 
 export interface ProductVideoSummary {
@@ -198,12 +203,15 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
     paths,
     allowKeynoteAutomation: options.allowKeynoteAutomation,
     keynoteAutomationTimeoutMs: options.keynoteAutomationTimeoutMs,
-    keynoteHtmlExport: options.keynoteHtmlExport
+    keynoteHtmlExport: options.keynoteHtmlExport,
+    keynoteMovieExport: options.keynoteMovieExport
   });
   manifest.runtime = runtime;
   manifest.artifacts.runtimeHtml = "runtime.html";
   manifest.artifacts.irRuntimeHtml = runtime.irHtmlPath ? "runtime-ir.html" : null;
   manifest.artifacts.keynoteHtml = runtime.mode === "keynote-html" ? "keynote-html/index.html" : null;
+  manifest.artifacts.keynoteMovie = runtime.moviePath;
+  manifest.artifacts.renderVideo = runtime.mode === "keynote-movie" ? runtime.moviePath : manifest.artifacts.renderVideo;
   await exportIrToPptx(deck, paths.rebuiltPptx);
   await writeJson(paths.lossReport, lossReport);
   await writeJson(paths.videoPlan, {
@@ -408,7 +416,7 @@ export function createProductApiResponse(bundle: ProductBundleResult, basePath: 
       manifest: `${base}/manifest.json`,
       videoPlan: `${base}/video-plan.json`,
       videoStatus: `${base}/video-status.json`,
-      video: null
+      video: bundle.manifest.artifacts.renderVideo ? `${base}/${bundle.manifest.artifacts.renderVideo}` : null
     },
     keynoteAvailable: null,
     keynoteMessage: bundle.manifest.keynote.message
@@ -596,8 +604,26 @@ async function prepareBundleRuntime(input: {
   allowKeynoteAutomation?: boolean;
   keynoteAutomationTimeoutMs?: number;
   keynoteHtmlExport?: (keynotePath: string, outputDir: string, options: KeynoteAutomationOptions) => Promise<void>;
+  keynoteMovieExport?: (keynotePath: string, moviePath: string, options: KeynoteAutomationOptions) => Promise<void>;
 }): Promise<ProductRuntimeSummary> {
   if (input.sourceKind === "keynote" && input.allowKeynoteAutomation) {
+    try {
+      await (input.keynoteMovieExport ?? exportKeynoteToMovie)(input.sourcePath, input.paths.keynoteMovie, {
+        allowAutomation: input.allowKeynoteAutomation,
+        automationTimeoutMs: input.keynoteAutomationTimeoutMs
+      });
+      return writeMovieRuntime(input.paths);
+    } catch (error) {
+      if (await fileExistsWithContent(input.paths.keynoteMovie)) {
+        return writeMovieRuntime(input.paths);
+      }
+      input.deck.conversion?.messages.push({
+        severity: "warning",
+        code: "keynote-movie-export-unavailable",
+        message: `Keynote movie export failed, so Keynote HTML export was tried next. ${errorMessage(error)}`
+      });
+    }
+
     try {
       await (input.keynoteHtmlExport ?? exportKeynoteToHtml)(input.sourcePath, input.paths.keynoteHtmlDir, {
         allowAutomation: input.allowKeynoteAutomation,
@@ -609,7 +635,9 @@ async function prepareBundleRuntime(input: {
         fidelity: "keynote-native",
         message: "Runtime preview uses Keynote's native HTML export for high-resolution animated playback.",
         htmlPath: "runtime.html",
-        irHtmlPath: "runtime-ir.html"
+        irHtmlPath: "runtime-ir.html",
+        moviePath: null,
+        keynoteHtmlPath: "keynote-html/index.html"
       };
     } catch (error) {
       input.deck.conversion?.messages.push({
@@ -626,8 +654,43 @@ async function prepareBundleRuntime(input: {
     fidelity: "ir-reconstructed",
     message: "Runtime preview was rendered from the KeyMorph IR.",
     htmlPath: "runtime.html",
-    irHtmlPath: null
+    irHtmlPath: null,
+    moviePath: null,
+    keynoteHtmlPath: null
   };
+}
+
+async function writeMovieRuntime(paths: ProductBundlePaths): Promise<ProductRuntimeSummary> {
+  await writeFile(paths.runtimeHtml, renderMovieRuntimeHtml("keynote-movie.m4v"), "utf8");
+  return {
+    mode: "keynote-movie",
+    fidelity: "keynote-rendered-video",
+    message: "Runtime preview uses Keynote's rendered QuickTime movie export for high-fidelity animated playback.",
+    htmlPath: "runtime.html",
+    irHtmlPath: "runtime-ir.html",
+    moviePath: "keynote-movie.m4v",
+    keynoteHtmlPath: null
+  };
+}
+
+function renderMovieRuntimeHtml(moviePath: string): string {
+  const escapedPath = escapeHtmlAttr(moviePath);
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KeyMorph Keynote Movie Runtime</title>
+  <style>
+    html, body { width: 100%; height: 100%; margin: 0; background: #000; overflow: hidden; }
+    video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+  </style>
+</head>
+<body>
+  <video src="${escapedPath}" controls autoplay playsinline preload="metadata"></video>
+</body>
+</html>
+`;
 }
 
 function renderKeynoteHtmlRuntimeWrapper(entryPath: string): string {
@@ -678,6 +741,7 @@ function createBundlePaths(jobDir: string, sourceName: string): ProductBundlePat
     irRuntimeHtml: path.join(jobDir, "runtime-ir.html"),
     keynoteHtmlDir: path.join(jobDir, "keynote-html"),
     keynoteHtmlIndex: path.join(jobDir, "keynote-html", "index.html"),
+    keynoteMovie: path.join(jobDir, "keynote-movie.m4v"),
     rebuiltPptx: path.join(jobDir, "rebuilt.pptx"),
     lossReport: path.join(jobDir, "loss-report.json"),
     manifest: path.join(jobDir, "manifest.json"),
@@ -719,6 +783,7 @@ function createBundleManifest(input: {
       runtimeHtml: "runtime.html",
       irRuntimeHtml: null,
       keynoteHtml: null,
+      keynoteMovie: null,
       rebuiltPptx: "rebuilt.pptx",
       lossReport: "loss-report.json",
       videoPlan: "video-plan.json",
@@ -740,7 +805,9 @@ function createBundleManifest(input: {
       fidelity: "ir-reconstructed",
       message: "HTML runtime was rendered from the KeyMorph IR.",
       htmlPath: "runtime.html",
-      irHtmlPath: null
+      irHtmlPath: null,
+      moviePath: null,
+      keynoteHtmlPath: null
     },
     video: {
       plan: summarizeVideoPlan(input.videoPlan),
@@ -810,6 +877,14 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
 async function directoryExists(dirPath: string): Promise<boolean> {
   try {
     return (await stat(dirPath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function fileExistsWithContent(filePath: string): Promise<boolean> {
+  try {
+    return (await stat(filePath)).size > 0;
   } catch {
     return false;
   }
