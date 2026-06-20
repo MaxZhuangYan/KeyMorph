@@ -557,6 +557,52 @@ describe("Keynote bridge", () => {
     assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationUnresolvedCount, 0);
   });
 
+  test("starts native Keynote builds together when timing startsWithPrevious is set", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-timing-groups-"));
+    const keyPath = path.join(dir, "timing.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(111, [
+          { type: 3005, payload: nativeImagePlacementPayload(42, { x: 10, y: 20, width: 100, height: 80 }), dataReferences: [42] }
+        ]),
+        iwaArchiveRecord(222, [
+          { type: 3005, payload: nativeImagePlacementPayload(42, { x: 140, y: 20, width: 100, height: 80 }), dataReferences: [42] }
+        ]),
+        iwaArchiveRecord(9001, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9002, [
+          { type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 1, startsWithPrevious: false }) }
+        ]),
+        iwaArchiveRecord(9003, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 222, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9004, [
+          { type: 153, payload: nativeBuildTimingPayload({ buildId: 9003, durationSeconds: 1, startsWithPrevious: true }) }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const events = deck.deck.slides[0]?.timeline?.events ?? [];
+    assert.equal(events.length, 2);
+    assert.deepEqual(
+      events.map((event) => event.start),
+      [
+        { type: "absolute", atMs: 0 },
+        { type: "absolute", atMs: 0 }
+      ]
+    );
+    assert.equal(events[1]?.metadata?.nativeBuildStartsWithPrevious, true);
+    assert.equal(deck.deck.slides[0]?.timeline?.durationMs, 2500);
+  });
+
   test("parses a ZIP-backed .key package with loose Index IWA entries", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-zip-"));
     const keyPath = path.join(dir, "sample.key");
@@ -757,13 +803,19 @@ function nativeMotionPathPoint(point: { x: number; y: number }): Uint8Array {
   return concat([protoFixed32(1, point.x), protoFixed32(2, point.y)]);
 }
 
-function nativeBuildTimingPayload(values: { buildId: number; durationSeconds: number; delaySeconds?: number }): Uint8Array {
+function nativeBuildTimingPayload(values: {
+  buildId: number;
+  durationSeconds: number;
+  delaySeconds?: number;
+  startsWithPrevious?: boolean;
+  afterPrevious?: boolean;
+}): Uint8Array {
   return concat([
     protoBytes(protoVarint(1, values.buildId), 1),
     protoFixed64(3, values.delaySeconds ?? 0),
     protoFixed64(4, values.durationSeconds),
-    protoVarint(5, 0),
-    protoVarint(6, 1),
+    protoVarint(5, values.startsWithPrevious ? 1 : 0),
+    protoVarint(6, values.afterPrevious === false ? 0 : 1),
     protoBytes(protoVarint(2, 1), 7)
   ]);
 }

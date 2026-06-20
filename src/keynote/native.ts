@@ -2049,13 +2049,15 @@ function recoverNativeBuildAnimations(
 
   const events: AnimationEvent[] = [];
   let cursorMs = 0;
+  let groupStartMs = 0;
   let unresolvedBuildCount = 0;
   for (const [index, build] of sequencedBuilds.entries()) {
     const timing = build.buildId ? timingByBuildId.get(build.buildId) : undefined;
     const resolutions = resolveNativeBuildTargets(build, objectLookup);
     const durationMs = clampNativeBuildDuration(timing?.durationMs ?? build.durationMs);
     const delayMs = clampNativeBuildDelay(timing?.delayMs ?? build.delayMs);
-    const startMs = cursorMs + delayMs;
+    const baseStartMs = timing?.startsWithPrevious ? groupStartMs : cursorMs;
+    const startMs = baseStartMs + delayMs;
     let generatedEventCount = 0;
     for (const [targetIndex, resolution] of resolutions.entries()) {
       const event = nativeBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs);
@@ -2065,6 +2067,9 @@ function recoverNativeBuildAnimations(
       }
     }
     if (generatedEventCount > 0) {
+      if (!timing?.startsWithPrevious) {
+        groupStartMs = startMs;
+      }
       cursorMs = Math.max(cursorMs, startMs + durationMs);
     } else {
       unresolvedBuildCount += 1;
