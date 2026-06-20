@@ -18,6 +18,7 @@ const MAX_NESTED_PROTOBUF_DEPTH = 3;
 const MAX_NESTED_PROTOBUF_BYTES = 256 * 1024;
 const MAX_FIELD_SUMMARIES_PER_STREAM = 48;
 const MAX_ARCHIVE_RECORD_EVIDENCE_PER_STREAM = 48;
+const MAX_TYPED_ARCHIVE_MESSAGE_EVIDENCE_PER_STREAM = 96;
 const MAX_SNAPPY_OUTPUT_BYTES = 64 * 1024 * 1024;
 const MAX_VISUAL_NUMERIC_VALUE = 100000;
 const MAX_EMBEDDED_ASSET_BYTES = 2 * 1024 * 1024;
@@ -87,6 +88,8 @@ export interface NativeIwaStreamMetadata {
   archiveRecordCount: number;
   archivePayloadCount: number;
   archiveRecords: NativeIwaArchiveRecordEvidence[];
+  typedArchiveMessageCount: number;
+  typedArchiveMessages: NativeIwaArchiveMessageEvidence[];
   protobufFieldCount: number;
   protobufFieldPathCount: number;
   nestedMessageCount: number;
@@ -111,6 +114,21 @@ export interface NativeIwaArchiveRecordEvidence {
   objectReferences: string[];
   identifier?: string;
   shouldMerge?: boolean;
+}
+
+export interface NativeIwaArchiveMessageEvidence {
+  archiveOffset: number;
+  archiveIdentifier?: string;
+  messageIndex: number;
+  type?: number;
+  payloadOffset: number;
+  payloadLength: number;
+  version: number[];
+  objectReferences: string[];
+  dataReferences: string[];
+  textCandidates: string[];
+  geometryCandidates: NativeIwaGeometryCandidate[];
+  fieldSummaries: NativeIwaFieldSummary[];
 }
 
 export interface NativeIwaFieldSummary {
@@ -209,6 +227,8 @@ interface NativeAssetMatch {
   confidence: number;
   fieldPath?: string;
   source: "protobuf" | "raw" | "archive";
+  geometryCandidate?: NativeIwaGeometryCandidate;
+  archiveMessage?: NativeIwaArchiveMessageEvidence;
 }
 
 interface NativeSlideOrderEvidence {
@@ -272,6 +292,8 @@ interface IwaScanResult {
   animationHints: NativeIwaAnimationHint[];
   fieldSummaries: NativeIwaFieldSummary[];
   archiveRecords: NativeIwaArchiveRecordEvidence[];
+  archiveMessages: NativeIwaArchiveMessageEvidence[];
+  typedArchiveMessageCount: number;
   protobufFieldCount: number;
   nestedMessageCount: number;
   rawStringCount: number;
@@ -368,6 +390,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
   const totalMorphHintCount = iwaStreams.reduce((total, stream) => total + stream.morphHintCount, 0);
   const totalArchiveRecordCount = iwaStreams.reduce((total, stream) => total + stream.archiveRecordCount, 0);
   const totalArchivePayloadCount = iwaStreams.reduce((total, stream) => total + stream.archivePayloadCount, 0);
+  const totalTypedArchiveMessageCount = iwaStreams.reduce((total, stream) => total + stream.typedArchiveMessageCount, 0);
   const quickLookPreviewCount = parts.quickLookPreviews.length;
   const quickLookPreviewWithDimensionsCount = parts.quickLookPreviews.filter((preview) => preview.width !== undefined && preview.height !== undefined).length;
   const imageAssetCount = assets.assets.filter((asset) => asset.kind === "image").length;
@@ -390,6 +413,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       iwaStreamCount: parts.iwaEntries.length,
       archiveRecordCount: totalArchiveRecordCount,
       archivePayloadCount: totalArchivePayloadCount,
+      typedArchiveMessageCount: totalTypedArchiveMessageCount,
       protobufFieldCount: totalProtobufFieldCount,
       nestedMessageCount: totalNestedMessageCount,
       numericCandidateCount: totalNumericCandidateCount,
@@ -568,6 +592,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         nativeIwaStreamCount: parts.iwaEntries.length,
         nativeIwaArchiveRecordCount: totalArchiveRecordCount,
         nativeIwaArchivePayloadCount: totalArchivePayloadCount,
+        nativeIwaTypedArchiveMessageCount: totalTypedArchiveMessageCount,
         ...(slideOrderEvidence
           ? {
               nativeSlideOrderEvidence: {
@@ -707,6 +732,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         totalMorphHintCount,
         totalArchiveRecordCount,
         totalArchivePayloadCount,
+        totalTypedArchiveMessageCount,
         slideOrderEvidence: slideOrderEvidence
           ? {
               sourcePath: slideOrderEvidence.sourcePath,
@@ -745,6 +771,8 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
           archiveRecordCount: stream.archiveRecordCount,
           archivePayloadCount: stream.archivePayloadCount,
           archiveRecords: stream.archiveRecords,
+          typedArchiveMessageCount: stream.typedArchiveMessageCount,
+          typedArchiveMessages: stream.typedArchiveMessages,
           protobufFieldCount: stream.protobufFieldCount,
           protobufFieldPathCount: stream.protobufFieldPathCount,
           nestedMessageCount: stream.nestedMessageCount,
@@ -1060,6 +1088,8 @@ function classifyIwaStreams(
       archiveRecordCount: scan.archiveRecords.length,
       archivePayloadCount: scan.archiveRecords.reduce((total, record) => total + record.messageCount, 0),
       archiveRecords: scan.archiveRecords,
+      typedArchiveMessageCount: scan.typedArchiveMessageCount,
+      typedArchiveMessages: scan.archiveMessages,
       protobufFieldCount: scan.protobufFieldCount,
       protobufFieldPathCount: scan.fieldSummaries.length,
       nestedMessageCount: scan.nestedMessageCount,
@@ -1152,7 +1182,14 @@ function buildNativeSlides(
       createTextObject(slideId, candidate, objectIndex, entry.path, deckSize, scan.geometryCandidates[objectIndex])
     );
     const assetObjects = assetMatches.map((match, assetIndex) =>
-      createAssetObject(slideId, match, textObjects.length + assetIndex, entry.path, deckSize, scan.geometryCandidates[textObjects.length + assetIndex])
+      createAssetObject(
+        slideId,
+        match,
+        textObjects.length + assetIndex,
+        entry.path,
+        deckSize,
+        match.geometryCandidate ?? scan.geometryCandidates[textObjects.length + assetIndex]
+      )
     );
     const objects =
       usePreviewFallback && previewFallback
@@ -1182,6 +1219,8 @@ function buildNativeSlides(
         nativeArchiveRecordCount: scan.archiveRecords.length,
         nativeArchivePayloadCount: scan.archiveRecords.reduce((total, record) => total + record.messageCount, 0),
         ...(scan.archiveRecords.length > 0 ? { nativeArchiveRecords: scan.archiveRecords.slice(0, 12) } : {}),
+        nativeTypedArchiveMessageCount: scan.typedArchiveMessageCount,
+        ...(scan.archiveMessages.length > 0 ? { nativeTypedArchiveMessages: scan.archiveMessages.slice(0, 24) } : {}),
         ...(slideOrderEvidence
           ? {
               nativeSlideOrderSourcePath: slideOrderEvidence.sourcePath,
@@ -1562,7 +1601,9 @@ function createAssetObject(
   const column = objectIndex % 2;
   const row = Math.floor(objectIndex / 2);
   const bounds = geometryCandidate
-    ? clampGeometryCandidateBounds(geometryCandidate.bounds, deckSize)
+    ? match.geometryCandidate === geometryCandidate
+      ? geometryCandidate.bounds
+      : clampGeometryCandidateBounds(geometryCandidate.bounds, deckSize)
     : {
         x: marginX + column * Math.round(deckSize.width * 0.42),
         y: Math.round(deckSize.height * 0.48) + row * Math.round(deckSize.height * 0.12),
@@ -1582,6 +1623,17 @@ function createAssetObject(
     nativeAssetEvidence: match.evidence,
     nativeAssetMatchConfidence: match.confidence,
     nativeAssetFieldPath: match.fieldPath,
+    ...(match.archiveMessage
+      ? {
+          nativeArchiveMessageType: match.archiveMessage.type,
+          nativeArchiveIdentifier: match.archiveMessage.archiveIdentifier,
+          nativeArchiveMessageIndex: match.archiveMessage.messageIndex,
+          nativeArchivePayloadOffset: match.archiveMessage.payloadOffset,
+          nativeArchivePayloadLength: match.archiveMessage.payloadLength,
+          nativeArchiveObjectReferences: match.archiveMessage.objectReferences,
+          nativeArchiveDataReferences: match.archiveMessage.dataReferences
+        }
+      : {}),
     nativeExtraction:
       match.source === "protobuf"
         ? "asset-protobuf-field-string-scan"
@@ -1670,9 +1722,11 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
   const animationHints = new Map<string, NativeIwaAnimationHint>();
   const fieldSummaries = new Map<string, NativeIwaFieldSummary>();
   const archiveRecords = new Map<string, NativeIwaArchiveRecordEvidence>();
+  const archiveMessages = new Map<string, NativeIwaArchiveMessageEvidence>();
   let protobufFieldCount = 0;
   let nestedMessageCount = 0;
   let rawStringCount = 0;
+  let typedArchiveMessageCount = 0;
   let orderBase = 0;
 
   for (const payload of payloads) {
@@ -1680,9 +1734,14 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
     for (const record of framedRecords) {
       addBestArchiveRecordEvidence(archiveRecords, archiveRecordEvidence(record));
     }
-    const scanData = framedRecords.length > 0 ? archivePayloadsFromRecords(payload.data, framedRecords) : [payload.data];
+    const scanData =
+      framedRecords.length > 0
+        ? archiveMessagePayloadsFromRecords(payload.data, framedRecords)
+        : [{ data: payload.data, archiveMessage: undefined }];
+    typedArchiveMessageCount += scanData.filter((item) => item.archiveMessage).length;
 
-    for (const data of scanData) {
+    for (const item of scanData) {
+      const data = item.data;
       const protobufScan = scanProtobufPayload(data, orderBase);
       protobufFieldCount += protobufScan.protobufFieldCount;
       nestedMessageCount += protobufScan.nestedMessageCount;
@@ -1700,6 +1759,16 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
       }
       for (const hint of protobufScan.animationHints) {
         addBestAnimationHint(animationHints, hint);
+      }
+      if (item.archiveMessage) {
+        const typedMessage = createArchiveMessageEvidence(
+          item.archiveMessage.record,
+          item.archiveMessage.messageInfo,
+          item.archiveMessage.messageIndex,
+          protobufScan,
+          data
+        );
+        addBestArchiveMessageEvidence(archiveMessages, typedMessage);
       }
 
       const rawScan = scanRawStrings(data, orderBase + data.byteLength + 1);
@@ -1741,6 +1810,10 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
     archiveRecords: Array.from(archiveRecords.values())
       .sort(compareArchiveRecordEvidence)
       .slice(0, MAX_ARCHIVE_RECORD_EVIDENCE_PER_STREAM),
+    archiveMessages: Array.from(archiveMessages.values())
+      .sort(compareArchiveMessageEvidence)
+      .slice(0, MAX_TYPED_ARCHIVE_MESSAGE_EVIDENCE_PER_STREAM),
+    typedArchiveMessageCount,
     protobufFieldCount,
     nestedMessageCount,
     rawStringCount,
@@ -1778,8 +1851,32 @@ function findIwaAssetMatchesFromScan(scan: IwaScanResult, assets: NativeAssetCat
       }
     }
   }
+  for (const message of scan.archiveMessages) {
+    for (const dataId of message.dataReferences) {
+      for (const asset of assets.byDataId.get(normalizeDataId(dataId)) ?? []) {
+        const existing = matches.get(asset.assetId);
+        const match: NativeAssetMatch = {
+          asset,
+          evidence: `typed-message:${message.type ?? "unknown"}:data-id:${dataId}`,
+          confidence: typedArchiveAssetMatchConfidence(message),
+          source: "archive",
+          geometryCandidate: message.geometryCandidates[0],
+          archiveMessage: message
+        };
+        if (!existing || match.confidence > existing.confidence || (!existing.geometryCandidate && match.geometryCandidate)) {
+          matches.set(asset.assetId, match);
+        }
+      }
+    }
+  }
 
   return Array.from(matches.values()).sort((left, right) => comparePartPaths(left.asset.path, right.asset.path));
+}
+
+function typedArchiveAssetMatchConfidence(message: NativeIwaArchiveMessageEvidence): number {
+  const typeScore = message.type === 3005 || message.type === 3006 ? 0.08 : 0;
+  const geometryScore = message.geometryCandidates.length > 0 ? 0.06 : 0;
+  return roundConfidence(Math.min(0.96, 0.84 + typeScore + geometryScore));
 }
 
 function parseIwaArchiveRecords(data: Uint8Array): IwaArchiveRecord[] {
@@ -1805,7 +1902,7 @@ function parseIwaArchiveRecords(data: Uint8Array): IwaArchiveRecord[] {
 
     let payloadOffset = archiveInfoEnd;
     for (const messageInfo of archiveInfo.messageInfos) {
-      if (messageInfo.length <= 0 || payloadOffset + messageInfo.length > data.byteLength) {
+      if (messageInfo.length < 0 || payloadOffset + messageInfo.length > data.byteLength) {
         return [];
       }
       messageInfo.payloadOffset = payloadOffset;
@@ -1907,7 +2004,7 @@ function parseArchiveMessageInfo(data: Uint8Array): IwaArchiveMessageInfo | unde
     }
   }
 
-  if (length === undefined || length <= 0 || length > MAX_NESTED_PROTOBUF_BYTES) {
+  if (length === undefined || length < 0 || length > MAX_NESTED_PROTOBUF_BYTES) {
     return undefined;
   }
   return {
@@ -1978,14 +2075,274 @@ function readReferenceIdentifiers(data: Uint8Array): string[] {
   return ids;
 }
 
-function archivePayloadsFromRecords(data: Uint8Array, records: IwaArchiveRecord[]): Uint8Array[] {
-  const payloads: Uint8Array[] = [];
+function numericValueAtFieldPath(data: Uint8Array, fieldPath: number[]): number | undefined {
+  return numericValuesAtFieldPath(data, fieldPath)[0];
+}
+
+function numericValuesAtFieldPath(data: Uint8Array, fieldPath: number[]): number[] {
+  if (fieldPath.length === 0) {
+    return [];
+  }
+  const fields = readSequentialProtobufFields(data);
+  if (!fields) {
+    return [];
+  }
+  const [fieldNumber, ...rest] = fieldPath;
+  const matches = fields.filter((field) => field.fieldNumber === fieldNumber);
+  const values: number[] = [];
+  for (const field of matches) {
+    if (rest.length === 0) {
+      const value = numericValueFromSequentialField(field);
+      if (value !== undefined) {
+        values.push(value);
+      }
+      continue;
+    }
+    if (field.value) {
+      values.push(...numericValuesAtFieldPath(field.value, rest));
+    }
+  }
+  return values;
+}
+
+function numericValueFromSequentialField(field: {
+  wireType: number;
+  numericValue?: number;
+  rawValue?: Uint8Array;
+}): number | undefined {
+  if (field.wireType === 0 && field.numericValue !== undefined) {
+    return field.numericValue;
+  }
+  if (field.wireType === 5 && field.rawValue?.byteLength === 4) {
+    const view = new DataView(field.rawValue.buffer, field.rawValue.byteOffset, field.rawValue.byteLength);
+    const floatValue = view.getFloat32(0, true);
+    if (Number.isFinite(floatValue) && Math.abs(floatValue) <= MAX_VISUAL_NUMERIC_VALUE) {
+      return roundGeometryNumber(floatValue);
+    }
+    const intValue = view.getUint32(0, true);
+    return intValue <= MAX_VISUAL_NUMERIC_VALUE ? intValue : undefined;
+  }
+  if (field.wireType === 1 && field.rawValue?.byteLength === 8) {
+    const view = new DataView(field.rawValue.buffer, field.rawValue.byteOffset, field.rawValue.byteLength);
+    const doubleValue = view.getFloat64(0, true);
+    return Number.isFinite(doubleValue) && Math.abs(doubleValue) <= MAX_VISUAL_NUMERIC_VALUE ? roundGeometryNumber(doubleValue) : undefined;
+  }
+  return undefined;
+}
+
+function archiveMessagePayloadsFromRecords(
+  data: Uint8Array,
+  records: IwaArchiveRecord[]
+): Array<{
+  data: Uint8Array;
+  archiveMessage: {
+    record: IwaArchiveRecord;
+    messageInfo: IwaArchiveMessageInfo;
+    messageIndex: number;
+  };
+}> {
+  const payloads: Array<{
+    data: Uint8Array;
+    archiveMessage: {
+      record: IwaArchiveRecord;
+      messageInfo: IwaArchiveMessageInfo;
+      messageIndex: number;
+    };
+  }> = [];
   for (const record of records) {
-    for (const messageInfo of record.messageInfos) {
-      payloads.push(data.subarray(messageInfo.payloadOffset, messageInfo.payloadOffset + messageInfo.payloadLength));
+    for (const [messageIndex, messageInfo] of record.messageInfos.entries()) {
+      payloads.push({
+        data: data.subarray(messageInfo.payloadOffset, messageInfo.payloadOffset + messageInfo.payloadLength),
+        archiveMessage: { record, messageInfo, messageIndex }
+      });
     }
   }
   return payloads;
+}
+
+function createArchiveMessageEvidence(
+  record: IwaArchiveRecord,
+  messageInfo: IwaArchiveMessageInfo,
+  messageIndex: number,
+  scan: Pick<IwaScanResult, "textCandidates" | "numericCandidates" | "fieldSummaries">,
+  payload: Uint8Array
+): NativeIwaArchiveMessageEvidence {
+  const geometryCandidates = inferArchiveMessageGeometryCandidates(messageInfo, scan.numericCandidates, payload);
+  const dataReferences = uniqueStrings([
+    ...messageInfo.dataReferences.map(normalizeDataId),
+    ...typedDataReferencesFromPayload(messageInfo, payload),
+    ...typedDataReferencesFromNumericFields(messageInfo, scan.numericCandidates)
+  ]).slice(0, 24);
+  const textCandidates = uniqueStrings([
+    ...scan.textCandidates.map((candidate) => candidate.text),
+    ...extractArchiveEvidenceStrings(payload)
+  ]).slice(0, 24);
+  return {
+    archiveOffset: record.archiveOffset,
+    ...(record.identifier ? { archiveIdentifier: record.identifier } : {}),
+    messageIndex,
+    ...(messageInfo.type !== undefined ? { type: messageInfo.type } : {}),
+    payloadOffset: messageInfo.payloadOffset,
+    payloadLength: messageInfo.payloadLength,
+    version: messageInfo.version.slice(0, 8),
+    objectReferences: messageInfo.objectReferences.slice(0, 24),
+    dataReferences,
+    textCandidates,
+    geometryCandidates,
+    fieldSummaries: scan.fieldSummaries.slice(0, 24)
+  };
+}
+
+function typedDataReferencesFromNumericFields(messageInfo: IwaArchiveMessageInfo, numericCandidates: IwaNumericCandidate[]): string[] {
+  if (messageInfo.type !== 3005 && messageInfo.type !== 3006) {
+    return [];
+  }
+  const dataReferenceFieldPaths = new Set(["11.1", "12.1", "13.1", "15.1"]);
+  return uniqueStrings(
+    numericCandidates
+      .filter(
+        (candidate) =>
+          dataReferenceFieldPaths.has(candidate.fieldPath) &&
+          candidate.encoding === "varint" &&
+          Number.isInteger(candidate.value) &&
+          candidate.value > 0
+      )
+      .map((candidate) => normalizeDataId(String(candidate.value)))
+  );
+}
+
+function typedDataReferencesFromPayload(messageInfo: IwaArchiveMessageInfo, payload: Uint8Array): string[] {
+  if (messageInfo.type !== 3005 && messageInfo.type !== 3006) {
+    return [];
+  }
+  const dataReferenceFieldPaths = [
+    [11, 1],
+    [12, 1],
+    [13, 1],
+    [15, 1]
+  ];
+  return uniqueStrings(
+    dataReferenceFieldPaths
+      .map((fieldPath) => numericValueAtFieldPath(payload, fieldPath))
+      .filter((value): value is number => value !== undefined && Number.isInteger(value) && value > 0)
+      .map((value) => normalizeDataId(String(value)))
+  );
+}
+
+function inferArchiveMessageGeometryCandidates(
+  messageInfo: IwaArchiveMessageInfo,
+  numericCandidates: IwaNumericCandidate[],
+  payload: Uint8Array
+): NativeIwaGeometryCandidate[] {
+  const candidates = [
+    ...inferTypedImageGeometryCandidatesFromPayload(messageInfo, payload),
+    ...inferTypedImageGeometryCandidates(messageInfo, numericCandidates),
+    ...inferGeometryCandidates(numericCandidates)
+  ];
+  return dedupeGeometryCandidates(candidates)
+    .sort((left, right) => right.confidence - left.confidence || compareFieldPaths(left.fieldPaths[0] ?? "", right.fieldPaths[0] ?? ""))
+    .slice(0, MAX_GEOMETRY_CANDIDATES_PER_STREAM);
+}
+
+function inferTypedImageGeometryCandidatesFromPayload(
+  messageInfo: IwaArchiveMessageInfo,
+  payload: Uint8Array
+): NativeIwaGeometryCandidate[] {
+  if (messageInfo.type !== 3005 && messageInfo.type !== 3006) {
+    return [];
+  }
+
+  const xValues = numericValuesAtFieldPath(payload, [1, 1, 1, 1]);
+  const yValues = numericValuesAtFieldPath(payload, [1, 1, 1, 2]);
+  const widthValues = numericValuesAtFieldPath(payload, [1, 1, 2, 1]);
+  const heightValues = numericValuesAtFieldPath(payload, [1, 1, 2, 2]);
+  const tupleCount = Math.min(xValues.length, yValues.length, widthValues.length, heightValues.length);
+  const tuples = Array.from({ length: tupleCount }, (_, index) => ({
+    x: xValues[index]!,
+    y: yValues[index]!,
+    width: widthValues[index]!,
+    height: heightValues[index]!
+  }))
+    .filter((tuple) => isPlausibleTypedImageGeometryTuple(tuple.x, tuple.y, tuple.width, tuple.height))
+    .sort((left, right) => right.width * right.height - left.width * left.height);
+  const best = tuples[0];
+  if (!best) {
+    return [];
+  }
+
+  return [
+    {
+      bounds: {
+        x: roundGeometryNumber(best.x),
+        y: roundGeometryNumber(best.y),
+        width: roundGeometryNumber(best.width),
+        height: roundGeometryNumber(best.height)
+      },
+      fieldPaths: ["1.1.1.1", "1.1.1.2", "1.1.2.1", "1.1.2.2"],
+      values: [best.x, best.y, best.width, best.height].map(roundGeometryNumber),
+      source: "protobuf",
+      confidence: 0.97,
+      groupPath: "1.1",
+      reason: `typed Keynote image geometry from archive message type ${messageInfo.type}`
+    }
+  ];
+}
+
+function inferTypedImageGeometryCandidates(
+  messageInfo: IwaArchiveMessageInfo,
+  numericCandidates: IwaNumericCandidate[]
+): NativeIwaGeometryCandidate[] {
+  if (messageInfo.type !== 3005 && messageInfo.type !== 3006) {
+    return [];
+  }
+
+  const byPath = new Map(numericCandidates.map((candidate) => [candidate.fieldPath, candidate]));
+  const x = byPath.get("1.1.1.1");
+  const y = byPath.get("1.1.1.2");
+  const width = byPath.get("1.1.2.1");
+  const height = byPath.get("1.1.2.2");
+  if (!x || !y || !width || !height || !isPlausibleGeometryTuple(x.value, y.value, width.value, height.value)) {
+    return [];
+  }
+
+  const tuple = [x, y, width, height];
+  return [
+    {
+      bounds: {
+        x: roundGeometryNumber(x.value),
+        y: roundGeometryNumber(y.value),
+        width: roundGeometryNumber(width.value),
+        height: roundGeometryNumber(height.value)
+      },
+      fieldPaths: tuple.map((candidate) => candidate.fieldPath),
+      values: tuple.map((candidate) => roundGeometryNumber(candidate.value)),
+      source: "protobuf",
+      confidence: 0.94,
+      groupPath: "1.1",
+      reason: `typed Keynote image geometry from archive message type ${messageInfo.type}`
+    }
+  ];
+}
+
+function extractArchiveEvidenceStrings(data: Uint8Array): string[] {
+  const strings = new Set<string>();
+  let start = -1;
+  for (let index = 0; index <= data.length; index += 1) {
+    const byte = data[index];
+    const printable = byte !== undefined && (byte === 0x09 || byte === 0x0a || byte === 0x0d || byte >= 0x20);
+    if (printable) {
+      if (start < 0) start = index;
+      continue;
+    }
+    if (start >= 0 && index - start >= 3) {
+      const decoded = decodeUtf8(data.subarray(start, index))?.replace(/\u0000/g, "").replace(/\s+/g, " ").trim();
+      if (decoded && !decoded.includes("\ufffd") && decoded.length >= 3 && decoded.length <= 200) {
+        strings.add(decoded);
+      }
+    }
+    start = -1;
+  }
+  return Array.from(strings).slice(0, 24);
 }
 
 function archiveRecordEvidence(record: IwaArchiveRecord): NativeIwaArchiveRecordEvidence {
@@ -2017,11 +2374,36 @@ function addBestArchiveRecordEvidence(
   }
 }
 
+function addBestArchiveMessageEvidence(
+  messages: Map<string, NativeIwaArchiveMessageEvidence>,
+  message: NativeIwaArchiveMessageEvidence
+): void {
+  const key = `${message.archiveOffset}:${message.messageIndex}:${message.type ?? "unknown"}:${message.payloadOffset}`;
+  const existing = messages.get(key);
+  if (!existing || messageEvidenceScore(message) > messageEvidenceScore(existing)) {
+    messages.set(key, message);
+  }
+}
+
 function compareArchiveRecordEvidence(left: NativeIwaArchiveRecordEvidence, right: NativeIwaArchiveRecordEvidence): number {
   if (left.archiveOffset !== right.archiveOffset) {
     return left.archiveOffset - right.archiveOffset;
   }
   return right.messageCount - left.messageCount;
+}
+
+function compareArchiveMessageEvidence(left: NativeIwaArchiveMessageEvidence, right: NativeIwaArchiveMessageEvidence): number {
+  if (left.archiveOffset !== right.archiveOffset) {
+    return left.archiveOffset - right.archiveOffset;
+  }
+  if (left.messageIndex !== right.messageIndex) {
+    return left.messageIndex - right.messageIndex;
+  }
+  return (left.type ?? 0) - (right.type ?? 0);
+}
+
+function messageEvidenceScore(message: NativeIwaArchiveMessageEvidence): number {
+  return message.dataReferences.length * 4 + message.geometryCandidates.length * 3 + message.textCandidates.length * 2 + message.fieldSummaries.length;
 }
 
 function scanProtobufPayload(
@@ -2456,6 +2838,16 @@ function isPlausibleGeometryTuple(x: number, y: number, width: number, height: n
   return width >= 2 || height >= 2;
 }
 
+function isPlausibleTypedImageGeometryTuple(x: number, y: number, width: number, height: number): boolean {
+  if (![x, y, width, height].every((value) => Number.isFinite(value))) {
+    return false;
+  }
+  if (width < 1 || height < 1 || width > MAX_VISUAL_NUMERIC_VALUE || height > MAX_VISUAL_NUMERIC_VALUE) {
+    return false;
+  }
+  return Math.abs(x) <= MAX_VISUAL_NUMERIC_VALUE && Math.abs(y) <= MAX_VISUAL_NUMERIC_VALUE;
+}
+
 function geometryTupleConfidence(group: IwaNumericCandidate[], groupPath: string | undefined): number {
   const encodingScore = group.reduce((total, candidate) => total + candidate.confidence, 0) / group.length;
   const pathScore = groupPath ? 0.12 : 0;
@@ -2847,6 +3239,24 @@ function dataIdFromReference(value: string): string | undefined {
 function normalizeDataId(value: string): string {
   const digits = value.trim().replace(/^0+(?=\d)/, "");
   return digits || "0";
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized) {
+      continue;
+    }
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
 }
 
 function countUniqueReferencedAssets(slides: Slide[]): number {

@@ -325,12 +325,72 @@ describe("Keynote bridge", () => {
 
     const deck = await parseNativeKeynoteToIr(keyPath);
     assert.equal(validateIR(deck).valid, true);
-    const object = deck.deck.slides[0]?.objects[0];
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.type === "image");
     assert.equal(object?.type, "image");
     assert.equal(object?.metadata?.nativeFallback, "full-slide-preview");
     assert.equal(object?.type === "image" ? object.source.assetId : undefined, deck.deck.assets?.[0]?.id);
     assert.match(deck.deck.assets?.[0]?.uri ?? "", /^data:image\/png;base64,/);
     assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-preview-fallback-used"), true);
+  });
+
+  test("uses typed IWA archive message data-id and geometry evidence for native image placement", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-typed-iwa-"));
+    const keyPath = path.join(dir, "typed.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    const imagePayload = concat([
+      protoBytes(
+        concat([
+          protoBytes(
+            concat([
+              protoBytes(concat([protoFixed32(1, 100), protoFixed32(2, 120)]), 1),
+              protoBytes(concat([protoFixed32(1, 320), protoFixed32(2, 180)]), 2)
+            ]),
+            1
+          )
+        ]),
+        1
+      ),
+      protoBytes(protoVarint(1, 42), 11)
+    ]);
+    const buildPayload = concat([protoVarint(1, 1234), protoString("apple:bc-appear", 4)]);
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      iwaArchiveRecord(9001, [
+        { type: 3005, payload: imagePayload, dataReferences: [42], objectReferences: [777] },
+        { type: 8, payload: buildPayload, objectReferences: [777] },
+        { type: 3097, payload: new Uint8Array() }
+      ])
+    );
+
+    const detection = await detectNativeKeynotePackage(keyPath);
+    const stream = detection.iwaStreams?.[0];
+    assert.equal(stream?.archiveRecordCount, 1);
+    assert.deepEqual(stream?.archiveRecords[0]?.messageTypes, [3005, 8, 3097]);
+    assert.equal(stream?.typedArchiveMessageCount, 3);
+    assert.equal(stream?.typedArchiveMessages.some((message) => message.type === 3005 && message.dataReferences.includes("42")), true);
+    assert.equal(stream?.typedArchiveMessages.some((message) => message.type === 3097 && message.payloadLength === 0), true);
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects[0];
+    assert.equal(object?.type, "image");
+    assert.deepEqual(object?.bounds, { x: 100, y: 120, width: 320, height: 180 });
+    assert.equal(object?.metadata?.nativeExtraction, "asset-archive-info-data-reference");
+    assert.equal(object?.metadata?.nativeArchiveMessageType, 3005);
+    assert.equal(object?.metadata?.nativeAssetDataId, "42");
+    assert.deepEqual(object?.metadata?.nativeArchiveObjectReferences, ["777"]);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessageCount, 3);
+    assert.equal(
+      deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessages?.some(
+        (message) => message.type === 8 && message.textCandidates.includes("apple:bc-appear")
+      ),
+      true
+    );
+    assert.equal(deck.deck.slides[0]?.timeline?.events.length, 0);
+    assert.equal(deck.conversion?.metadata?.totalTypedArchiveMessageCount, 3);
   });
 
   test("parses a ZIP-backed .key package with loose Index IWA entries", async () => {
@@ -419,6 +479,27 @@ function protoFixed32(fieldNumber: number, value: number): Uint8Array {
   const out = new Uint8Array(4);
   new DataView(out.buffer).setFloat32(0, value, true);
   return concat([varint((fieldNumber << 3) | 5), out]);
+}
+
+function iwaArchiveRecord(
+  identifier: number,
+  messages: Array<{ type: number; payload: Uint8Array; dataReferences?: number[]; objectReferences?: number[] }>
+): Uint8Array {
+  const archiveInfo = concat([
+    protoVarint(1, identifier),
+    ...messages.map((message) =>
+      protoBytes(
+        concat([
+          protoVarint(1, message.type),
+          protoVarint(3, message.payload.byteLength),
+          ...(message.objectReferences ?? []).map((reference) => protoVarint(5, reference)),
+          ...(message.dataReferences ?? []).map((reference) => protoVarint(6, reference))
+        ]),
+        2
+      )
+    )
+  ]);
+  return concat([varint(archiveInfo.byteLength), archiveInfo, ...messages.map((message) => message.payload)]);
 }
 
 function plist(values: Record<string, string | number>): Uint8Array {
