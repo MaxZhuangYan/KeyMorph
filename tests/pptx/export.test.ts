@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 
 import { createDemoDeck } from "../../src/demo/createDemoDeck.ts";
 import { exportIrToPptx, parsePptxToIr } from "../../src/pptx/index.ts";
-import { IR_VERSION, type DeckIR } from "../../src/ir/index.ts";
+import { IR_VERSION, validateIR, type DeckIR } from "../../src/ir/index.ts";
 
 describe("PPTX export", () => {
   test("writes a PPTX file for the demo deck", async () => {
@@ -173,6 +173,30 @@ describe("PPTX export", () => {
     assert.ok(edges.some((edge) => edge.relation === "after" && edge.from === events[0]?.id && edge.to === events[1]?.id));
     assert.ok(edges.every((edge) => edge.from !== edge.to));
     assert.ok(parsed.conversion?.degradedFeatures.some((feature) => feature.code === "presentationml-build-list"));
+  });
+
+  test("skips cyclic imported timing dependency edges while preserving events", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-test-"));
+    const out = path.join(dir, "cyclic-build.pptx");
+
+    await exportIrToPptx(createGroupedBuildDeck(), out);
+    await patchPptxXml(out, "ppt/slides/slide1.xml", (source) =>
+      source.replace(
+        /<p:bldP spid="2" grpId="1"><p:bld spid="2"\/><\/p:bldP><p:bldP spid="3" grpId="2"><p:bld spid="3"\/><\/p:bldP>/,
+        `<p:bldP spid="3" grpId="1"><p:bld spid="3"/></p:bldP><p:bldP spid="2" grpId="2"><p:bld spid="2"/></p:bldP>`
+      )
+    );
+
+    const parsed = await parsePptxToIr(out);
+    const events = parsed.deck.slides[0].timeline?.events ?? [];
+    const edges = parsed.deck.slides[0].timeline?.dependencyGraph?.edges ?? [];
+    const validation = validateIR(parsed);
+
+    assert.equal(events.length, 2);
+    assert.equal(validation.valid, true, JSON.stringify(validation.errors));
+    assert.ok(edges.some((edge) => edge.relation === "after" && edge.from === events[0]?.id && edge.to === events[1]?.id));
+    assert.equal(edges.some((edge) => edge.from === events[1]?.id && edge.to === events[0]?.id), false);
+    assert.ok(parsed.conversion?.degradedFeatures.some((feature) => feature.code === "presentationml-dependency-cycle"));
   });
 
   test("reports unsupported timing condition semantics while importing supported effects", async () => {

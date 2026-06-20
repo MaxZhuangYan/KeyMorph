@@ -8,7 +8,7 @@ import { renderHtmlDocument } from "./runtime/index.ts";
 import { createLossReport, scoreConversion, type ConversionLossReport } from "./report/index.ts";
 import { comparePngFiles } from "./report/fidelity.ts";
 import { exportIrToPptx, parsePptxToIr } from "./pptx/index.ts";
-import { exportIrToKeynote, parseKeynoteToIr } from "./keynote/index.ts";
+import { exportIrToKeynote, exportKeynoteToHtml, parseKeynoteToIr, type KeynoteAutomationOptions } from "./keynote/index.ts";
 import {
   createVideoExportPlan,
   createVideoFrameFidelityReport,
@@ -28,6 +28,8 @@ export interface ProductBundleOptions {
   jobId?: string;
   allowKeynoteAutomation?: boolean;
   keynoteAutomationTimeoutMs?: number;
+  keynoteBridgeExport?: (keynotePath: string, pptxPath: string, options: KeynoteAutomationOptions) => Promise<void>;
+  keynoteHtmlExport?: (keynotePath: string, outputDir: string, options: KeynoteAutomationOptions) => Promise<void>;
   video?: Pick<VideoExportOptions, "fps" | "scale" | "ffmpegPath">;
 }
 
@@ -36,6 +38,9 @@ export interface ProductBundlePaths {
   source: string;
   deckIr: string;
   runtimeHtml: string;
+  irRuntimeHtml: string;
+  keynoteHtmlDir: string;
+  keynoteHtmlIndex: string;
   rebuiltPptx: string;
   lossReport: string;
   manifest: string;
@@ -59,6 +64,8 @@ export interface ProductBundleManifest {
     source: string;
     deckIr: string;
     runtimeHtml: string;
+    irRuntimeHtml: string | null;
+    keynoteHtml: string | null;
     rebuiltPptx: string;
     lossReport: string;
     videoPlan: string;
@@ -75,8 +82,17 @@ export interface ProductBundleManifest {
     uncertainMappingCount: number;
     recommendedFixes: string[];
   };
+  runtime: ProductRuntimeSummary;
   video: ProductVideoSummary;
   keynote: ProductDeferredExportSummary;
+}
+
+export interface ProductRuntimeSummary {
+  mode: "keymorph-ir" | "keynote-html";
+  fidelity: "ir-reconstructed" | "keynote-native";
+  message: string;
+  htmlPath: string;
+  irHtmlPath: string | null;
 }
 
 export interface ProductVideoSummary {
@@ -144,11 +160,16 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
   await mkdir(jobDir, { recursive: true });
   await copySource(resolvedInput, paths.source);
 
-  const deck = await inputToIr(paths.source, sourceName, sourceKind, {
+  let deck = await inputToIr(paths.source, sourceName, sourceKind, {
     allowKeynoteAutomation: options.allowKeynoteAutomation,
-    keynoteAutomationTimeoutMs: options.keynoteAutomationTimeoutMs
+    keynoteAutomationTimeoutMs: options.keynoteAutomationTimeoutMs,
+    keynoteBridgeExport: options.keynoteBridgeExport
   });
-  const validation = validateIR(deck);
+  let validation = validateIR(deck);
+  if (!validation.valid && sourceKind === "keynote" && options.allowKeynoteAutomation) {
+    deck = await fallbackKeynoteBridgeIr(paths.source, validation);
+    validation = validateIR(deck);
+  }
   if (!validation.valid) {
     throw new Error(`Converted IR is invalid: ${validation.errors.map((error) => `${error.path} ${error.message}`).join("; ")}`);
   }
@@ -169,7 +190,20 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
   });
 
   await writeJson(paths.deckIr, deck);
-  await writeFile(paths.runtimeHtml, renderHtmlDocument(deck), "utf8");
+  await writeFile(paths.irRuntimeHtml, renderHtmlDocument(deck), "utf8");
+  const runtime = await prepareBundleRuntime({
+    sourcePath: paths.source,
+    sourceKind,
+    deck,
+    paths,
+    allowKeynoteAutomation: options.allowKeynoteAutomation,
+    keynoteAutomationTimeoutMs: options.keynoteAutomationTimeoutMs,
+    keynoteHtmlExport: options.keynoteHtmlExport
+  });
+  manifest.runtime = runtime;
+  manifest.artifacts.runtimeHtml = "runtime.html";
+  manifest.artifacts.irRuntimeHtml = runtime.irHtmlPath ? "runtime-ir.html" : null;
+  manifest.artifacts.keynoteHtml = runtime.mode === "keynote-html" ? "keynote-html/index.html" : null;
   await exportIrToPptx(deck, paths.rebuiltPptx);
   await writeJson(paths.lossReport, lossReport);
   await writeJson(paths.videoPlan, {
@@ -518,7 +552,7 @@ async function inputToIr(
   sourcePath: string,
   fileName: string,
   sourceKind = detectInputKind(fileName),
-  options: Pick<ProductBundleOptions, "allowKeynoteAutomation" | "keynoteAutomationTimeoutMs"> = {}
+  options: Pick<ProductBundleOptions, "allowKeynoteAutomation" | "keynoteAutomationTimeoutMs" | "keynoteBridgeExport"> = {}
 ): Promise<DeckIR> {
   if (sourceKind === "pptx") return parsePptxToIr(sourcePath);
   if (sourceKind === "ir") return readJson<DeckIR>(sourcePath);
@@ -526,10 +560,105 @@ async function inputToIr(
     return parseKeynoteToIr(sourcePath, {
       workDir: path.dirname(sourcePath),
       allowAutomation: options.allowKeynoteAutomation,
-      automationTimeoutMs: options.keynoteAutomationTimeoutMs
+      automationTimeoutMs: options.keynoteAutomationTimeoutMs,
+      bridgeExport: options.keynoteBridgeExport
     });
   }
   throw new Error("Unsupported file type. Use .pptx, .key, or .ir.json.");
+}
+
+async function fallbackKeynoteBridgeIr(sourcePath: string, validation: ReturnType<typeof validateIR>): Promise<DeckIR> {
+  const deck = await parseKeynoteToIr(sourcePath, { preferNative: true });
+  deck.conversion ??= { status: "partial", messages: [] };
+  deck.conversion.status = "partial";
+  deck.conversion.messages.unshift({
+    severity: "warning",
+    code: "keynote-bridge-ir-validation-fallback",
+    message:
+      "Keynote PPTX bridge produced unsupported timing dependency semantics, so native IR probing was used for analysis while Keynote HTML remains the preferred runtime."
+  });
+  deck.conversion.degradedFeatures ??= [];
+  deck.conversion.degradedFeatures.push({
+    code: "keynote-bridge-timing-cycle",
+    severity: "warning",
+    area: "animation",
+    description: `Keynote-exported PPTX timing graph did not validate: ${validation.errors.map((error) => error.message).join(" ")}`,
+    fallback: "Use Keynote native HTML export for animated playback and keep native IR probing for analysis artifacts."
+  });
+  return deck;
+}
+
+async function prepareBundleRuntime(input: {
+  sourcePath: string;
+  sourceKind: ProductInputKind;
+  deck: DeckIR;
+  paths: ProductBundlePaths;
+  allowKeynoteAutomation?: boolean;
+  keynoteAutomationTimeoutMs?: number;
+  keynoteHtmlExport?: (keynotePath: string, outputDir: string, options: KeynoteAutomationOptions) => Promise<void>;
+}): Promise<ProductRuntimeSummary> {
+  if (input.sourceKind === "keynote" && input.allowKeynoteAutomation) {
+    try {
+      await (input.keynoteHtmlExport ?? exportKeynoteToHtml)(input.sourcePath, input.paths.keynoteHtmlDir, {
+        allowAutomation: input.allowKeynoteAutomation,
+        automationTimeoutMs: input.keynoteAutomationTimeoutMs
+      });
+      await writeFile(input.paths.runtimeHtml, renderKeynoteHtmlRuntimeWrapper("keynote-html/index.html"), "utf8");
+      return {
+        mode: "keynote-html",
+        fidelity: "keynote-native",
+        message: "Runtime preview uses Keynote's native HTML export for high-resolution animated playback.",
+        htmlPath: "runtime.html",
+        irHtmlPath: "runtime-ir.html"
+      };
+    } catch (error) {
+      input.deck.conversion?.messages.push({
+        severity: "warning",
+        code: "keynote-html-export-unavailable",
+        message: `Keynote HTML export failed, so KeyMorph IR runtime was used instead. ${errorMessage(error)}`
+      });
+    }
+  }
+
+  await copyFile(input.paths.irRuntimeHtml, input.paths.runtimeHtml);
+  return {
+    mode: "keymorph-ir",
+    fidelity: "ir-reconstructed",
+    message: "Runtime preview was rendered from the KeyMorph IR.",
+    htmlPath: "runtime.html",
+    irHtmlPath: null
+  };
+}
+
+function renderKeynoteHtmlRuntimeWrapper(entryPath: string): string {
+  const escapedPath = escapeHtmlAttr(entryPath);
+  const escapedScriptPath = escapeJsString(entryPath);
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="0; url=${escapedPath}">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KeyMorph Keynote Runtime</title>
+  <style>
+    html, body { width: 100%; height: 100%; margin: 0; background: #000; color: #fff; font-family: system-ui, sans-serif; }
+    a { color: #fff; }
+  </style>
+  <script>location.replace("${escapedScriptPath}");</script>
+</head>
+<body>
+  <a href="${escapedPath}">Open Keynote runtime</a>
+</body>
+</html>
+`;
+}
+
+function escapeHtmlAttr(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char);
+}
+
+function escapeJsString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/</g, "\\x3c");
 }
 
 function detectInputKind(fileName: string): ProductInputKind {
@@ -546,6 +675,9 @@ function createBundlePaths(jobDir: string, sourceName: string): ProductBundlePat
     source: path.join(jobDir, sourceName),
     deckIr: path.join(jobDir, "deck.ir.json"),
     runtimeHtml: path.join(jobDir, "runtime.html"),
+    irRuntimeHtml: path.join(jobDir, "runtime-ir.html"),
+    keynoteHtmlDir: path.join(jobDir, "keynote-html"),
+    keynoteHtmlIndex: path.join(jobDir, "keynote-html", "index.html"),
     rebuiltPptx: path.join(jobDir, "rebuilt.pptx"),
     lossReport: path.join(jobDir, "loss-report.json"),
     manifest: path.join(jobDir, "manifest.json"),
@@ -585,6 +717,8 @@ function createBundleManifest(input: {
       source: input.sourceName,
       deckIr: "deck.ir.json",
       runtimeHtml: "runtime.html",
+      irRuntimeHtml: null,
+      keynoteHtml: null,
       rebuiltPptx: "rebuilt.pptx",
       lossReport: "loss-report.json",
       videoPlan: "video-plan.json",
@@ -600,6 +734,13 @@ function createBundleManifest(input: {
       degradedAnimationCount: input.lossReport.degradedAnimationCount,
       uncertainMappingCount: input.lossReport.uncertainMappingCount,
       recommendedFixes: input.lossReport.recommendedFixes
+    },
+    runtime: {
+      mode: "keymorph-ir",
+      fidelity: "ir-reconstructed",
+      message: "HTML runtime was rendered from the KeyMorph IR.",
+      htmlPath: "runtime.html",
+      irHtmlPath: null
     },
     video: {
       plan: summarizeVideoPlan(input.videoPlan),

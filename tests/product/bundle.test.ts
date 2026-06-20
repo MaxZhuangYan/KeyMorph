@@ -1,13 +1,14 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
 import { createDemoDeck } from "../../src/demo/createDemoDeck.ts";
 import { validateIR } from "../../src/ir/index.ts";
+import { exportIrToPptx } from "../../src/pptx/index.ts";
 import {
   createProductApiResponse,
   createProductBundle,
@@ -100,6 +101,39 @@ describe("product bundle workflow", () => {
     assert.equal(result.status, "dependency-missing");
     assert.match(result.message, /Keynote GUI automation is disabled by default|Keynote conversion requires macOS/);
     assert.equal(manifest.keynote.available, false);
+  });
+
+  test("uses Keynote native HTML export as the main runtime when automation is allowed", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-keynote-html-"));
+    const inputPath = path.join(dir, "source.key");
+    const bundleDir = path.join(dir, "bundle");
+    await writeFile(inputPath, "stub keynote package", "utf8");
+
+    const bundle = await createProductBundle(inputPath, bundleDir, {
+      jobId: "keynote-html-job",
+      allowKeynoteAutomation: true,
+      keynoteBridgeExport: async (_keynotePath, pptxPath) => {
+        await exportIrToPptx(createDemoDeck(), pptxPath);
+      },
+      keynoteHtmlExport: async (_keynotePath, outputDir) => {
+        await mkdir(outputDir, { recursive: true });
+        await writeFile(path.join(outputDir, "index.html"), "<!doctype html><title>Keynote Native Runtime</title>", "utf8");
+      }
+    });
+
+    const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
+
+    assert.equal(bundle.sourceKind, "keynote");
+    assert.equal(manifest.runtime.mode, "keynote-html");
+    assert.equal(manifest.runtime.fidelity, "keynote-native");
+    assert.equal(manifest.artifacts.runtimeHtml, "runtime.html");
+    assert.equal(manifest.artifacts.irRuntimeHtml, "runtime-ir.html");
+    assert.equal(manifest.artifacts.keynoteHtml, "keynote-html/index.html");
+    const runtimeHtml = await readFile(path.join(bundleDir, "runtime.html"), "utf8");
+    assert.match(runtimeHtml, /location\.replace\("keynote-html\/index\.html"\)/);
+    assert.doesNotMatch(runtimeHtml, /<iframe/);
+    assert.match(await readFile(path.join(bundleDir, "runtime-ir.html"), "utf8"), /window\.__KEYMORPH_DECK__/);
+    assert.match(await readFile(path.join(bundleDir, "keynote-html", "index.html"), "utf8"), /Keynote Native Runtime/);
   });
 
   test("CLI convert writes the same bundle shape", async () => {

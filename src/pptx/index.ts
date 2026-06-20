@@ -524,6 +524,7 @@ function parseSlideTiming(
   const buildList = parseBuildListSequencing(timingXml, slideIndex, shapeIdToObjectId, result.events);
   result.degradedFeatures.push(...buildList.degradedFeatures);
   addDependencyEdges(result.dependencyEdges, buildList.dependencyEdges);
+  sanitizeTimingDependencyCycles(slideIndex, result);
   return result;
 }
 
@@ -1235,6 +1236,50 @@ function addDependencyEdges(target: TimingDependencyEdge[], edges: TimingDepende
     seen.add(key);
     target.push(edge);
   }
+}
+
+function sanitizeTimingDependencyCycles(slideIndex: number, result: TimingParseResult): void {
+  const kept: TimingDependencyEdge[] = [];
+  const skipped: TimingDependencyEdge[] = [];
+
+  for (const edge of result.dependencyEdges) {
+    if (edge.from === edge.to || hasDependencyPath(edge.to, edge.from, kept)) {
+      skipped.push(edge);
+    } else {
+      kept.push(edge);
+    }
+  }
+
+  if (skipped.length === 0) return;
+
+  result.dependencyEdges = kept;
+  const skippedEdges = skipped.map((edge) => `${edge.from} -> ${edge.to} (${edge.relation})`).join(", ");
+  result.degradedFeatures.push({
+    code: "presentationml-dependency-cycle",
+    severity: "warning",
+    area: "animation",
+    description: `PowerPoint timing dependencies contained ${skipped.length} cyclic edge${skipped.length === 1 ? "" : "s"}; omitted ${skippedEdges}.`,
+    sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing`,
+    fallback: "Import all supported animation events and retain only acyclic dependency edges."
+  });
+}
+
+function hasDependencyPath(from: string, to: string, edges: TimingDependencyEdge[]): boolean {
+  const graph = new Map<string, string[]>();
+  for (const edge of edges) {
+    graph.set(edge.from, [...(graph.get(edge.from) ?? []), edge.to]);
+  }
+
+  const stack = [from];
+  const visited = new Set<string>();
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || visited.has(node)) continue;
+    if (node === to) return true;
+    visited.add(node);
+    stack.push(...(graph.get(node) ?? []));
+  }
+  return false;
 }
 
 function uniqueById<T extends { id: string }>(items: T[]): T[] {

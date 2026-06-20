@@ -1,4 +1,4 @@
-import { access, mkdir } from "node:fs/promises";
+import { access, mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -31,6 +31,11 @@ export interface KeynoteImportOptions {
 
 export interface KeynoteExportOptions {
   intermediatePptxPath?: string;
+  automationTimeoutMs?: number;
+  allowAutomation?: boolean;
+}
+
+export interface KeynoteHtmlExportOptions {
   automationTimeoutMs?: number;
   allowAutomation?: boolean;
 }
@@ -142,6 +147,24 @@ tell application "Keynote"
   activate
   set theDocument to open inputFile
   export theDocument to outputFile as Microsoft PowerPoint
+  close theDocument saving no
+end tell
+`, options);
+}
+
+export async function exportKeynoteToHtml(keynotePath: string, outputDir: string, options: KeynoteHtmlExportOptions = {}): Promise<void> {
+  await assertReadableFile(keynotePath, "Input Keynote file");
+  assertAutomationAllowed(options);
+  const resolvedOutputDir = path.resolve(outputDir);
+  await rm(resolvedOutputDir, { recursive: true, force: true });
+  await mkdir(resolvedOutputDir, { recursive: true });
+  await runAppleScript(`
+set inputFile to POSIX file "${escapeAppleScriptString(path.resolve(keynotePath))}"
+set outputFolder to POSIX file "${escapeAppleScriptString(resolvedOutputDir)}"
+tell application "Keynote"
+  activate
+  set theDocument to open inputFile
+  export theDocument to outputFolder as HTML
   close theDocument saving no
 end tell
 `, options);
