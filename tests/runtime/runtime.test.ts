@@ -4,9 +4,12 @@ import assert from "node:assert/strict";
 import { createDemoDeck } from "../../src/demo/createDemoDeck.ts";
 import {
   createDeckTimeline,
+  createSlideTimingPlan,
+  easeProgressValue,
   keyframeEventToCssFrames,
   renderHtmlDocument,
   renderSlideMarkup,
+  resolveMorphTransitionObjectStates,
   resolveSlideObjectStates,
   resolveDeckTime
 } from "../../src/runtime/index.ts";
@@ -22,6 +25,9 @@ describe("HTML runtime rendering", () => {
     assert.match(html, /seekGlobal/);
     assert.match(html, /nextSlide/);
     assert.match(html, /activeTimelineTransition/);
+    assert.match(html, /getCurrentFrameState/);
+    assert.match(html, /createTimingPlan/);
+    assert.match(html, /setPlaybackRate/);
   });
 
   test("renders slide objects as positioned markup", () => {
@@ -81,6 +87,80 @@ describe("HTML runtime rendering", () => {
     assert.equal(transform?.rotateDeg, 45);
     assert.equal(transform?.scaleX, 1.25);
     assert.equal(transform?.scaleY, 1.25);
+  });
+
+  test("interpolates structured bounds, fills, strokes, crops, and alpha colors", () => {
+    const deck = createInterpolationDeck();
+    const state = resolveSlideObjectStates(deck, deck.deck.slides[0], 500).get("box");
+
+    assert.deepEqual(state?.bounds, { x: 50, y: 25, width: 150, height: 75 });
+    assert.deepEqual(state?.crop, { x: 0.1, y: 0.2, width: 0.65, height: 0.75, unit: "ratio" });
+    assert.deepEqual(state?.style?.fill, { type: "solid", color: "#808000" });
+    assert.deepEqual(state?.style?.stroke, { color: "#808080", width: 6 });
+  });
+
+  test("supports cubic-bezier, steps, and named easing during evaluation", () => {
+    assert.equal(easeProgressValue({ type: "steps", count: 4, position: "end" }, 0.49), 0.25);
+    assert.equal(easeProgressValue({ type: "steps", count: 4, position: "start" }, 0.01), 0.25);
+    assert.ok(easeProgressValue("backOut", 0.5) > 0.5);
+    assert.ok(easeProgressValue({ type: "cubicBezier", x1: 0.42, y1: 0, x2: 1, y2: 1 }, 0.5) < 0.5);
+  });
+
+  test("resolves effective child state through animated group opacity, bounds, and transform", () => {
+    const deck = createGroupDeck();
+    const raw = resolveSlideObjectStates(deck, deck.deck.slides[0], 500);
+    const effective = resolveSlideObjectStates(deck, deck.deck.slides[0], 500, { effectiveGroupStates: true });
+
+    assert.equal(raw.get("child")?.bounds?.x, 5);
+    assert.equal(effective.get("child")?.bounds?.x, 105);
+    assert.equal(effective.get("child")?.bounds?.y, 55);
+    assert.equal(effective.get("child")?.opacity, 0.25);
+    assert.equal(effective.get("child")?.visible, true);
+    assert.equal(effective.get("child")?.transform?.translateX, 10);
+    assert.equal(effective.get("child")?.transform?.scaleX, 2);
+  });
+
+  test("resolves timing dependency graph by graph nodes and reports cycles", () => {
+    const deck = createDependencyDeck();
+    const slide = deck.deck.slides[0];
+    const plan = createSlideTimingPlan(slide);
+
+    assert.equal(plan.starts.intro, 100);
+    assert.equal(plan.starts.follow, 450);
+    assert.equal(plan.starts.before, 350);
+    assert.deepEqual(plan.warnings, []);
+
+    const cyclicPlan = createSlideTimingPlan({
+      ...slide,
+      timeline: {
+        events: slide.timeline?.events ?? [],
+        dependencyGraph: {
+          nodes: [],
+          edges: [
+            { from: "intro", to: "follow", relation: "after" },
+            { from: "follow", to: "intro", relation: "after" }
+          ]
+        }
+      }
+    });
+
+    assert.equal(cyclicPlan.warnings[0]?.code, "cycle");
+    assert.ok(cyclicPlan.order.includes("intro"));
+    assert.ok(cyclicPlan.order.includes("follow"));
+  });
+
+  test("resolves morph transition states with matching and interpolated compatible properties", () => {
+    const deck = createMorphTransitionDeck();
+    const previousSlide = deck.deck.slides[0];
+    const currentSlide = deck.deck.slides[1];
+    const resolved = resolveMorphTransitionObjectStates(deck, previousSlide, currentSlide, currentSlide.transition, 0.5);
+    const state = resolved.states.get("shape-b");
+
+    assert.deepEqual(resolved.pairs, [{ fromObjectId: "shape-a", toObjectId: "shape-b", morphKey: "shared" }]);
+    assert.deepEqual(state?.bounds, { x: 60, y: 70, width: 150, height: 100 });
+    assert.equal(state?.transform?.rotateDeg, 45);
+    assert.ok(Math.abs((state?.opacity ?? 0) - 0.6) < 0.000001);
+    assert.deepEqual(state?.style?.fill, { type: "solid", color: "#800080" });
   });
 
   test("builds a deck-level timeline that includes incoming slide transitions", () => {
@@ -165,6 +245,229 @@ function createRuntimeEvalDeck(): DeckIR {
               }
             ]
           }
+        }
+      ]
+    }
+  };
+}
+
+function createInterpolationDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "interpolation",
+      size: { width: 200, height: 200, unit: "px" },
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "box",
+              type: "image",
+              source: { dataUri: "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" },
+              bounds: { x: 0, y: 0, width: 100, height: 50 },
+              crop: { x: 0, y: 0, width: 1, height: 1, unit: "ratio" },
+              style: {
+                fill: { type: "solid", color: "#ff0000" },
+                stroke: { color: "#000000", width: 2 }
+              }
+            }
+          ],
+          timeline: {
+            durationMs: 1000,
+            events: [
+              {
+                id: "bounds",
+                kind: "property",
+                targetId: "box",
+                property: "bounds",
+                to: { x: 100, y: 50, width: 200, height: 100 },
+                durationMs: 1000,
+                fill: "both"
+              },
+              {
+                id: "fill",
+                kind: "property",
+                targetId: "box",
+                property: "style.fill",
+                to: { type: "solid", color: "#00ff00" },
+                durationMs: 1000,
+                fill: "both"
+              },
+              {
+                id: "stroke",
+                kind: "property",
+                targetId: "box",
+                property: "style.stroke",
+                to: { color: "#ffffff", width: 10 },
+                durationMs: 1000,
+                fill: "both"
+              },
+              {
+                id: "crop",
+                kind: "property",
+                targetId: "box",
+                property: "crop",
+                to: { x: 0.2, y: 0.4, width: 0.3, height: 0.5, unit: "ratio" },
+                durationMs: 1000,
+                fill: "both"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  };
+}
+
+function createGroupDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "groups",
+      size: { width: 200, height: 200, unit: "px" },
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "group",
+              type: "group",
+              bounds: { x: 20, y: 20, width: 120, height: 120 },
+              opacity: 0.5,
+              transform: { translateX: 0, scaleX: 1, scaleY: 1 },
+              children: [
+                {
+                  id: "child",
+                  type: "shape",
+                  shape: "rect",
+                  bounds: { x: 5, y: 5, width: 20, height: 20 },
+                  opacity: 0.5,
+                  transform: { translateX: 0, scaleX: 1, scaleY: 1 }
+                }
+              ]
+            }
+          ],
+          timeline: {
+            durationMs: 1000,
+            events: [
+              {
+                id: "move-group",
+                kind: "property",
+                targetId: "group",
+                property: "bounds",
+                from: { x: 20, y: 20, width: 120, height: 120 },
+                to: { x: 100, y: 50, width: 120, height: 120 },
+                durationMs: 500,
+                fill: "forwards"
+              },
+              {
+                id: "transform-group",
+                kind: "property",
+                targetId: "group",
+                property: "transform",
+                from: { translateX: 0, scaleX: 1, scaleY: 1 },
+                to: { translateX: 10, scaleX: 2, scaleY: 2 },
+                durationMs: 500,
+                fill: "forwards"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  };
+}
+
+function createDependencyDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "dependency",
+      size: { width: 100, height: 100, unit: "px" },
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "box",
+              type: "shape",
+              shape: "rect",
+              bounds: { x: 0, y: 0, width: 10, height: 10 }
+            }
+          ],
+          timeline: {
+            durationMs: 1000,
+            events: [
+              { id: "intro", kind: "visibility", targetId: "box", visible: true, start: { type: "absolute", atMs: 100 }, durationMs: 200 },
+              { id: "follow", kind: "visibility", targetId: "box", visible: false, durationMs: 100 },
+              { id: "before", kind: "visibility", targetId: "box", visible: true, durationMs: 50 }
+            ],
+            dependencyGraph: {
+              nodes: [
+                { id: "n-intro", eventId: "intro" },
+                { id: "n-follow", eventId: "follow" },
+                { id: "n-before", eventId: "before" }
+              ],
+              edges: [
+                { from: "n-intro", to: "n-follow", relation: "after", offsetMs: 150 },
+                { from: "n-follow", to: "n-before", relation: "before", offsetMs: 50 }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  };
+}
+
+function createMorphTransitionDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "morph-transition",
+      size: { width: 300, height: 200, unit: "px" },
+      slides: [
+        {
+          id: "a",
+          objects: [
+            {
+              id: "shape-a",
+              type: "shape",
+              shape: "rect",
+              morphKey: "shared",
+              bounds: { x: 10, y: 20, width: 100, height: 80 },
+              opacity: 0.2,
+              transform: { rotateDeg: 0 },
+              style: { fill: { type: "solid", color: "#ff0000" } }
+            }
+          ],
+          timeline: { durationMs: 1000, events: [] }
+        },
+        {
+          id: "b",
+          objects: [
+            {
+              id: "shape-b",
+              type: "shape",
+              shape: "rect",
+              morphKey: "shared",
+              bounds: { x: 110, y: 120, width: 200, height: 120 },
+              opacity: 1,
+              transform: { rotateDeg: 90 },
+              style: { fill: { type: "solid", color: "#0000ff" } }
+            }
+          ],
+          transition: {
+            type: "morph",
+            durationMs: 1000,
+            morph: {
+              strategy: "morph",
+              matching: { matchBy: ["morphKey"] },
+              properties: ["bounds", "transform", "opacity", "fill"]
+            }
+          },
+          timeline: { durationMs: 1000, events: [] }
         }
       ]
     }

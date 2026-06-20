@@ -8,7 +8,14 @@ import { parsePptxToIr, exportIrToPptx } from "../pptx/index.ts";
 import { parseNativeKeynoteToIr } from "./native.ts";
 
 export { detectNativeKeynotePackage, parseNativeKeynoteToIr } from "./native.ts";
-export type { NativeIwaCompression, NativeIwaStreamMetadata, NativeIwaStreamRole, NativeKeynoteDetection } from "./native.ts";
+export type {
+  NativeIwaCompression,
+  NativeIwaFieldSummary,
+  NativeIwaStreamMetadata,
+  NativeIwaStreamRole,
+  NativeKeynoteDetection,
+  NativeKeynotePackageFormat
+} from "./native.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -18,12 +25,14 @@ export interface KeynoteImportOptions {
   nativeFallback?: boolean;
   workDir?: string;
   automationTimeoutMs?: number;
+  allowAutomation?: boolean;
   bridgeExport?: (keynotePath: string, pptxPath: string, options: KeynoteAutomationOptions) => Promise<void>;
 }
 
 export interface KeynoteExportOptions {
   intermediatePptxPath?: string;
   automationTimeoutMs?: number;
+  allowAutomation?: boolean;
 }
 
 export async function parseKeynoteToIr(
@@ -40,7 +49,10 @@ export async function parseKeynoteToIr(
 
   if (!options.exportedPptxPath) {
     try {
-      await (options.bridgeExport ?? exportKeynoteToPptx)(keynotePath, pptxPath, { automationTimeoutMs: options.automationTimeoutMs });
+      await (options.bridgeExport ?? exportKeynoteToPptx)(keynotePath, pptxPath, {
+        automationTimeoutMs: options.automationTimeoutMs,
+        allowAutomation: options.allowAutomation
+      });
     } catch (error) {
       if (options.nativeFallback === false) {
         throw error;
@@ -90,7 +102,10 @@ export async function exportIrToKeynote(deck: DeckIR, keynotePath: string, optio
     path.join(path.dirname(keynotePath), `${path.basename(keynotePath, path.extname(keynotePath))}.pptx`);
   await mkdir(path.dirname(pptxPath), { recursive: true });
   await exportIrToPptx(deck, pptxPath);
-  await importPptxAndSaveKeynote(pptxPath, keynotePath, { automationTimeoutMs: options.automationTimeoutMs });
+  await importPptxAndSaveKeynote(pptxPath, keynotePath, {
+    automationTimeoutMs: options.automationTimeoutMs,
+    allowAutomation: options.allowAutomation
+  });
 }
 
 export interface KeynoteExportResult {
@@ -113,10 +128,12 @@ export async function exportIrToKeynoteBridge(
 
 export interface KeynoteAutomationOptions {
   automationTimeoutMs?: number;
+  allowAutomation?: boolean;
 }
 
 export async function exportKeynoteToPptx(keynotePath: string, pptxPath: string, options: KeynoteAutomationOptions = {}): Promise<void> {
   await assertReadableFile(keynotePath, "Input Keynote file");
+  assertAutomationAllowed(options);
   await mkdir(path.dirname(pptxPath), { recursive: true });
   await runAppleScript(`
 set inputFile to POSIX file "${escapeAppleScriptString(path.resolve(keynotePath))}"
@@ -132,6 +149,7 @@ end tell
 
 export async function importPptxAndSaveKeynote(pptxPath: string, keynotePath: string, options: KeynoteAutomationOptions = {}): Promise<void> {
   await assertReadableFile(pptxPath, "Input PPTX file");
+  assertAutomationAllowed(options);
   await mkdir(path.dirname(keynotePath), { recursive: true });
   await runAppleScript(`
 set inputFile to POSIX file "${escapeAppleScriptString(path.resolve(pptxPath))}"
@@ -143,6 +161,16 @@ tell application "Keynote"
   close theDocument saving no
 end tell
 `, options);
+}
+
+function assertAutomationAllowed(options: KeynoteAutomationOptions = {}): void {
+  if (options.allowAutomation || process.env.KEYMORPH_ALLOW_KEYNOTE_AUTOMATION === "1") {
+    return;
+  }
+
+  throw new Error(
+    "Keynote GUI automation is disabled by default. Pass allowAutomation: true or set KEYMORPH_ALLOW_KEYNOTE_AUTOMATION=1 to run AppleScript."
+  );
 }
 
 async function runAppleScript(script: string, options: KeynoteAutomationOptions = {}): Promise<void> {

@@ -10,6 +10,8 @@ import {
   type IRObject,
   type Slide,
   type TimingDependencyEdge,
+  type TimingNode,
+  type TimelineTrigger,
   type UnsupportedFeature
 } from "../ir/index.ts";
 
@@ -191,8 +193,9 @@ function parseSlideXml(source: string, index: number, slideSize: { width: number
       objects,
       timeline: {
         durationMs: Math.max(2500, Math.ceil(maxEventEnd)),
+        triggers: timing.triggers.length ? timing.triggers : undefined,
         events: timing.events,
-        dependencyGraph: { edges: timing.dependencyEdges }
+        dependencyGraph: { nodes: timing.dependencyNodes.length ? timing.dependencyNodes : undefined, edges: timing.dependencyEdges }
       }
     },
     unsupportedFeatures: timing.unsupportedFeatures,
@@ -274,9 +277,48 @@ function readSlideBackground(source: string): string | undefined {
 
 interface TimingParseResult {
   events: AnimationEvent[];
+  triggers: TimelineTrigger[];
+  dependencyNodes: TimingNode[];
   dependencyEdges: TimingDependencyEdge[];
   unsupportedFeatures: UnsupportedFeature[];
   degradedFeatures: DegradedFeature[];
+}
+
+interface ParsedTimingNode {
+  tag: SupportedTimingTag;
+  xml: string;
+  range: XmlElementRange;
+  path: string[];
+}
+
+type SupportedTimingTag = "animEffect" | "set" | "animMotion" | "animScale" | "animRot";
+
+interface TimingSequenceContext {
+  kind: "absolute" | "withPrevious" | "afterPrevious" | "onClick";
+  delayMs: number;
+  triggerId?: string;
+  triggerTargetId?: string;
+  clickIndex?: number;
+}
+
+interface ParsedTimingEvent {
+  event: AnimationEvent;
+  timingContext: TimingSequenceContext;
+}
+
+interface TriggerBuildSequence {
+  targetIds: string[];
+  clickIndex: number;
+}
+
+interface XmlElementRange {
+  localName: string;
+  start: number;
+  openEnd: number;
+  closeStart: number;
+  end: number;
+  parent?: XmlElementRange;
+  children: XmlElementRange[];
 }
 
 function parseSlideTiming(
@@ -286,32 +328,35 @@ function parseSlideTiming(
   shapeIdToObjectId: Map<string, string>
 ): TimingParseResult {
   const timingXml = extractXmlElements(source, "timing")[0];
-  const result: TimingParseResult = { events: [], dependencyEdges: [], unsupportedFeatures: [], degradedFeatures: [] };
+  const result: TimingParseResult = {
+    events: [],
+    triggers: [],
+    dependencyNodes: [],
+    dependencyEdges: [],
+    unsupportedFeatures: [],
+    degradedFeatures: []
+  };
   if (!timingXml) return result;
 
-  for (const node of extractXmlElements(timingXml, "animEffect")) {
-    const event = parseFadeEffect(node, slideIndex, result.events.length, shapeIdToObjectId, result.unsupportedFeatures);
-    if (event) result.events.push(event);
-  }
+  const timingTree = parseXmlElementRanges(timingXml);
+  const timingNodes = extractSupportedTimingNodes(timingXml, timingTree);
+  const parsedEvents: ParsedTimingEvent[] = [];
 
-  for (const node of extractXmlElements(timingXml, "set")) {
-    const event = parseVisibilitySet(node, slideIndex, result.events.length, shapeIdToObjectId, result.unsupportedFeatures);
-    if (event) result.events.push(event);
-  }
-
-  for (const node of extractXmlElements(timingXml, "animMotion")) {
-    const event = parseMotionEffect(node, slideIndex, result.events.length, slideSize, shapeIdToObjectId, result.unsupportedFeatures);
-    if (event) result.events.push(event);
-  }
-
-  for (const node of extractXmlElements(timingXml, "animScale")) {
-    const event = parseScaleEffect(node, slideIndex, result.events.length, shapeIdToObjectId, result.unsupportedFeatures);
-    if (event) result.events.push(event);
-  }
-
-  for (const node of extractXmlElements(timingXml, "animRot")) {
-    const event = parseRotationEffect(node, slideIndex, result.events.length, shapeIdToObjectId, result.unsupportedFeatures);
-    if (event) result.events.push(event);
+  for (const node of timingNodes) {
+    const event = parseSupportedTimingEvent(node, slideIndex, parsedEvents.length, slideSize, shapeIdToObjectId, result.unsupportedFeatures);
+    if (!event) continue;
+    const timingContext = readTimingSequenceContext(
+      timingXml,
+      timingTree,
+      node,
+      slideIndex,
+      parsedEvents.length + 1,
+      shapeIdToObjectId,
+      result.degradedFeatures
+    );
+    applyTimingContext(event, timingContext);
+    parsedEvents.push({ event, timingContext });
+    result.events.push(event);
   }
 
   for (const tag of ["anim", "animClr", "cmd"]) {
@@ -327,22 +372,60 @@ function parseSlideTiming(
     }
   }
 
-  if (/<p:cond\b[^>]*delay="indefinite"/.test(timingXml)) {
+  if (/<p:(?:nextCondLst|endCondLst)\b/.test(timingXml)) {
     result.degradedFeatures.push({
-      code: "presentationml-trigger-timing",
+      code: "presentationml-timing-conditions",
       severity: "warning",
       area: "animation",
-      description: "PowerPoint click/trigger timing is imported as absolute timeline timing in this PPTX slice.",
+      description: "PowerPoint sequence next/end conditions are not fully modeled by the IR timeline.",
       sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing`,
-      fallback: "Preserve supported effects at the beginning of the slide timeline."
+      fallback: "Import supported effect order and explicit start conditions; omit next/end condition behavior."
     });
   }
 
-  result.events.sort((a, b) => eventStartMs(a) - eventStartMs(b));
+  const triggerBuildSequences = parseTriggerBuildSequences(timingXml, shapeIdToObjectId);
+  addTimingDependencies(slideIndex, parsedEvents, triggerBuildSequences, result);
   const buildList = parseBuildListSequencing(timingXml, slideIndex, shapeIdToObjectId, result.events);
   result.degradedFeatures.push(...buildList.degradedFeatures);
-  result.dependencyEdges.push(...buildList.dependencyEdges);
+  addDependencyEdges(result.dependencyEdges, buildList.dependencyEdges);
   return result;
+}
+
+function parseSupportedTimingEvent(
+  node: ParsedTimingNode,
+  slideIndex: number,
+  eventIndex: number,
+  slideSize: { width: number; height: number },
+  shapeIdToObjectId: Map<string, string>,
+  unsupportedFeatures: UnsupportedFeature[]
+): AnimationEvent | undefined {
+  if (node.tag === "animEffect") {
+    return parseFadeEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures);
+  }
+  if (node.tag === "set") {
+    return parseVisibilitySet(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures);
+  }
+  if (node.tag === "animMotion") {
+    return parseMotionEffect(node.xml, slideIndex, eventIndex, slideSize, shapeIdToObjectId, unsupportedFeatures);
+  }
+  if (node.tag === "animScale") {
+    return parseScaleEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures);
+  }
+  return parseRotationEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures);
+}
+
+function applyTimingContext(event: AnimationEvent, context: TimingSequenceContext): void {
+  const childDelayMs = eventStartMs(event);
+  const offsetMs = context.delayMs + childDelayMs;
+  if (context.kind === "withPrevious") {
+    event.start = { type: "withPrevious", offsetMs };
+  } else if (context.kind === "afterPrevious") {
+    event.start = { type: "afterPrevious", offsetMs };
+  } else if (context.kind === "onClick" && context.triggerId) {
+    event.start = { type: "trigger", triggerId: context.triggerId, offsetMs };
+  } else {
+    event.start = { type: "absolute", atMs: offsetMs };
+  }
 }
 
 function parseFadeEffect(
@@ -622,9 +705,9 @@ function parseBuildListSequencing(
   const buildListXml = extractXmlElements(timingXml, "bldLst")[0];
   if (!buildListXml) return { dependencyEdges: [], degradedFeatures: [] };
 
-  const objectIds = Array.from(buildListXml.matchAll(/spid="([^"]+)"/g))
+  const objectIds = uniqueStrings(Array.from(buildListXml.matchAll(/spid="([^"]+)"/g))
     .map((match) => shapeIdToObjectId.get(match[1]))
-    .filter((targetId): targetId is string => Boolean(targetId));
+    .filter((targetId): targetId is string => Boolean(targetId)));
   const sequencedEvents = objectIds
     .map((targetId) => events.find((event) => "targetId" in event && event.targetId === targetId))
     .filter((event): event is AnimationEvent => Boolean(event));
@@ -655,6 +738,206 @@ function parseBuildListSequencing(
       }
     ]
   };
+}
+
+function extractSupportedTimingNodes(timingXml: string, ranges: XmlElementRange[]): ParsedTimingNode[] {
+  const supported = new Set<SupportedTimingTag>(["animEffect", "set", "animMotion", "animScale", "animRot"]);
+  return ranges
+    .filter((range): range is XmlElementRange & { localName: SupportedTimingTag } => supported.has(range.localName as SupportedTimingTag))
+    .sort((a, b) => a.start - b.start)
+    .map((range) => ({
+      tag: range.localName,
+      xml: timingXml.slice(range.start, range.end),
+      range,
+      path: xmlAncestorPath(range)
+    }));
+}
+
+function readTimingSequenceContext(
+  timingXml: string,
+  ranges: XmlElementRange[],
+  node: ParsedTimingNode,
+  slideIndex: number,
+  eventOrdinal: number,
+  shapeIdToObjectId: Map<string, string>,
+  degradedFeatures: DegradedFeature[]
+): TimingSequenceContext {
+  const ancestors = xmlAncestors(node.range);
+  const timingContainer = ancestors.find((ancestor) => ancestor.localName === "par" || ancestor.localName === "seq");
+  const containerCTn = timingContainer ? immediateChildRange(ranges, timingContainer, "cTn") : undefined;
+  const containerCTnXml = containerCTn ? timingXml.slice(containerCTn.start, containerCTn.end) : undefined;
+  const attrs = containerCTnXml ? readXmlAttributes(containerCTnXml, "cTn") : new Map();
+  const nodeType = String(attrs.get("nodeType") ?? "").toLowerCase();
+  const condSource = containerCTn ? immediateChildXml(timingXml, ranges, containerCTn, "stCondLst") : undefined;
+  const cond = readStartCondition(condSource ?? node.xml);
+  const delayMs = parseTimingMs(cond.delay, 0);
+
+  if (cond.delay === "indefinite" || cond.event === "onClick" || nodeType === "clickeffect" || nodeType === "clickpar") {
+    const triggerId = `slide-${slideIndex + 1}-click-${eventOrdinal}`;
+    const triggerTargetId = cond.targetSpid ? shapeIdToObjectId.get(cond.targetSpid) : undefined;
+    return { kind: "onClick", delayMs, triggerId, triggerTargetId, clickIndex: eventOrdinal };
+  }
+
+  if (nodeType === "aftereffect" || cond.event === "onEnd") {
+    return { kind: "afterPrevious", delayMs };
+  }
+
+  if (nodeType === "witheffect" || cond.event === "begin") {
+    return { kind: "withPrevious", delayMs };
+  }
+
+  if (cond.event && !["begin", "onEnd", "onClick"].includes(cond.event)) {
+    degradedFeatures.push({
+      code: "presentationml-trigger-timing",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint timing trigger event "${cond.event}" is not represented exactly in the IR timeline.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/${node.path.join("/")}`,
+      fallback: "Import the supported effect with its delay as absolute timing."
+    });
+  }
+
+  if (cond.delay === "indefinite") {
+    degradedFeatures.push({
+      code: "presentationml-trigger-timing",
+      severity: "warning",
+      area: "animation",
+      description: "PowerPoint indefinite trigger timing could not be associated with a click sequence.",
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/${node.path.join("/")}`,
+      fallback: "Import the supported effect at the beginning of the slide timeline."
+    });
+  }
+
+  return { kind: "absolute", delayMs };
+}
+
+function readStartCondition(source: string): { delay?: string; event?: string; targetSpid?: string } {
+  const stCondList = extractXmlElements(source, "stCondLst")[0];
+  const condSource = stCondList ?? source;
+  const cond = extractXmlElements(condSource, "cond")[0] ?? condSource.match(/<p:cond\b[^>]*\/>/)?.[0];
+  if (!cond) return {};
+  const attrs = readXmlAttributes(cond, "cond");
+  return {
+    delay: attrs.get("delay"),
+    event: attrs.get("evt"),
+    targetSpid: cond.match(/<p:spTgt\b[^>]*spid="([^"]+)"/)?.[1]
+  };
+}
+
+function addTimingDependencies(
+  slideIndex: number,
+  parsedEvents: ParsedTimingEvent[],
+  triggerBuildSequences: TriggerBuildSequence[],
+  result: TimingParseResult
+): void {
+  const triggers = new Map<string, TimelineTrigger>();
+  const dependencyNodes: TimingNode[] = [];
+  const dependencyEdges: TimingDependencyEdge[] = [];
+
+  parsedEvents.forEach(({ event, timingContext }, index) => {
+    dependencyNodes.push({ id: event.id, eventId: event.id, label: event.label, kind: "event" });
+    if (timingContext.kind === "onClick" && timingContext.triggerId) {
+      const trigger = {
+        id: timingContext.triggerId,
+        type: "onClick" as const,
+        targetId: timingContext.triggerTargetId,
+        clickIndex: timingContext.clickIndex ?? index + 1
+      };
+      triggers.set(trigger.id, trigger);
+      dependencyNodes.push({ id: trigger.id, label: `Click ${trigger.clickIndex}`, kind: "trigger" });
+      dependencyEdges.push({
+        id: `${event.id}-trigger-edge`,
+        from: trigger.id,
+        to: event.id,
+        relation: "triggers",
+        offsetMs: timingContext.delayMs
+      });
+    }
+
+    const previous = parsedEvents[index - 1]?.event;
+    if (!previous) return;
+    if (timingContext.kind === "withPrevious") {
+      dependencyEdges.push({
+        id: `${event.id}-with-previous`,
+        from: previous.id,
+        to: event.id,
+        relation: "with",
+        offsetMs: timingContext.delayMs
+      });
+    } else if (timingContext.kind === "afterPrevious") {
+      dependencyEdges.push({
+        id: `${event.id}-after-previous`,
+        from: previous.id,
+        to: event.id,
+        relation: "after",
+        offsetMs: timingContext.delayMs
+      });
+    }
+  });
+
+  for (const buildSequence of triggerBuildSequences) {
+    const triggerId = `slide-${slideIndex + 1}-build-click-${buildSequence.clickIndex}`;
+    triggers.set(triggerId, { id: triggerId, type: "onClick", clickIndex: buildSequence.clickIndex });
+    dependencyNodes.push({ id: triggerId, label: `Build click ${buildSequence.clickIndex}`, kind: "trigger" });
+    const eventsByTarget = buildSequence.targetIds
+      .map((targetId) => parsedEvents.find(({ event }) => "targetId" in event && event.targetId === targetId)?.event)
+      .filter((event): event is AnimationEvent => Boolean(event));
+    eventsByTarget.forEach((event, index) => {
+      dependencyEdges.push({
+        id: `${event.id}-build-click-${buildSequence.clickIndex}`,
+        from: index === 0 ? triggerId : eventsByTarget[index - 1].id,
+        to: event.id,
+        relation: index === 0 ? "triggers" : "after"
+      });
+    });
+  }
+
+  result.triggers = uniqueById([...result.triggers, ...triggers.values()]);
+  result.dependencyNodes = uniqueById([...result.dependencyNodes, ...dependencyNodes]);
+  addDependencyEdges(result.dependencyEdges, dependencyEdges);
+}
+
+function parseTriggerBuildSequences(timingXml: string, shapeIdToObjectId: Map<string, string>): TriggerBuildSequence[] {
+  return extractXmlElements(timingXml, "bldLst")
+    .flatMap((buildListXml) => extractXmlElements(buildListXml, "bldP"))
+    .map((build, index) => {
+      const attrs = readXmlAttributes(build, "bldP");
+      const targetId = attrs.get("spid") ? shapeIdToObjectId.get(attrs.get("spid") ?? "") : undefined;
+      const childTargetIds = Array.from(build.matchAll(/<p:bld\b[^>]*spid="([^"]+)"/g))
+        .map((match) => match[1])
+        .map((shapeId) => (shapeId ? shapeIdToObjectId.get(shapeId) : undefined))
+        .filter((id): id is string => Boolean(id));
+      return {
+        targetIds: uniqueStrings([...(targetId ? [targetId] : []), ...childTargetIds]),
+        clickIndex: Number(attrs.get("grpId")) || index + 1
+      };
+    })
+    .filter((sequence) => sequence.targetIds.length > 1);
+}
+
+function uniqueStrings(items: string[]): string[] {
+  return Array.from(new Set(items));
+}
+
+function addDependencyEdges(target: TimingDependencyEdge[], edges: TimingDependencyEdge[]): void {
+  const seen = new Set(target.map((edge) => `${edge.from}\u0000${edge.to}\u0000${edge.relation}\u0000${edge.offsetMs ?? ""}`));
+  for (const edge of edges) {
+    const key = `${edge.from}\u0000${edge.to}\u0000${edge.relation}\u0000${edge.offsetMs ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    target.push(edge);
+  }
+}
+
+function uniqueById<T extends { id: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const item of items) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    result.push(item);
+  }
+  return result;
 }
 
 function resolveTimingTarget(
@@ -861,6 +1144,69 @@ function extractXmlElements(source: string, localName: string): string[] {
   return source.match(elementPattern) ?? [];
 }
 
+function parseXmlElementRanges(source: string): XmlElementRange[] {
+  const ranges: XmlElementRange[] = [];
+  const stack: XmlElementRange[] = [];
+  const tagPattern = /<(?<closing>\/)?(?<prefix>[A-Za-z_][\w.-]*):(?<localName>[A-Za-z_][\w.-]*)(?<attrs>[^<>]*?)(?<selfClosing>\/)?>/g;
+  for (const match of source.matchAll(tagPattern)) {
+    const localName = match.groups?.localName;
+    if (!localName) continue;
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    if (match.groups?.closing) {
+      const stackIndex = findLastIndex(stack, (range) => range.localName === localName);
+      if (stackIndex === -1) continue;
+      const range = stack[stackIndex];
+      stack.splice(stackIndex);
+      range.closeStart = start;
+      range.end = end;
+      ranges.push(range);
+      continue;
+    }
+
+    const parent = stack[stack.length - 1];
+    const range: XmlElementRange = { localName, start, openEnd: end, closeStart: end, end, parent, children: [] };
+    if (parent) parent.children.push(range);
+    if (match.groups?.selfClosing || /\/\s*>$/.test(match[0])) {
+      ranges.push(range);
+    } else {
+      stack.push(range);
+    }
+  }
+  return ranges.sort((a, b) => a.start - b.start);
+}
+
+function findLastIndex<T>(items: T[], predicate: (item: T) => boolean): number {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (predicate(items[index])) return index;
+  }
+  return -1;
+}
+
+function xmlAncestors(range: XmlElementRange): XmlElementRange[] {
+  const ancestors: XmlElementRange[] = [];
+  for (let current = range.parent; current; current = current.parent) {
+    ancestors.push(current);
+  }
+  return ancestors;
+}
+
+function xmlAncestorPath(range: XmlElementRange): string[] {
+  return [...xmlAncestors(range).reverse().map((ancestor) => `p:${ancestor.localName}`), `p:${range.localName}`];
+}
+
+function immediateChildXml(source: string, ranges: XmlElementRange[], parent: XmlElementRange, localName: string): string | undefined {
+  const child = immediateChildRange(ranges, parent, localName);
+  return child ? source.slice(child.start, child.end) : undefined;
+}
+
+function immediateChildRange(ranges: XmlElementRange[], parent: XmlElementRange, localName: string): XmlElementRange | undefined {
+  return (
+    parent.children.find((candidate) => candidate.localName === localName) ??
+    ranges.find((candidate) => candidate.localName === localName && candidate.parent === parent)
+  );
+}
+
 function readXmlAttributes(source: string, localName: string): Map<string, string> {
   const attrs = new Map<string, string>();
   const match = source.match(new RegExp(`<p:${localName}\\b([^>]*)>`));
@@ -899,7 +1245,8 @@ function presentationRels(slideCount: number): string {
 
 function slideXml(deck: DeckIR, slide: Slide): string {
   const bg = solidFill(slide.background) ?? "#ffffff";
-  const shapes = slide.objects.map((object, index) => objectToShape(deck, object, index + 2)).join("");
+  const shapeIds = assignShapeIds(slide.objects);
+  const shapes = slide.objects.map((object) => objectToShape(deck, object, shapeIds)).join("");
   const timing = timingXml(deck, slide);
   return xml(`\
 <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
@@ -926,7 +1273,7 @@ function slideXml(deck: DeckIR, slide: Slide): string {
 }
 
 function timingXml(deck: DeckIR, slide: Slide): string {
-  const shapeIds = new Map(slide.objects.map((object, index) => [object.id, String(index + 2)]));
+  const shapeIds = assignShapeIds(slide.objects);
   const entries: string[] = [];
   let nextNodeIndex = 0;
   for (const event of slide.timeline?.events ?? []) {
@@ -937,6 +1284,7 @@ function timingXml(deck: DeckIR, slide: Slide): string {
   if (entries.length === 0) return "";
 
   const mainSequence = entries.join("");
+  const buildList = buildListXml(slide, shapeIds);
   return `\
 <p:timing>
   <p:tnLst>
@@ -954,6 +1302,7 @@ function timingXml(deck: DeckIR, slide: Slide): string {
       </p:cTn>
     </p:par>
   </p:tnLst>
+  ${buildList}
 </p:timing>`;
 }
 
@@ -967,7 +1316,7 @@ function eventToTimingNodes(
   if (event.kind === "visibility") {
     const shapeId = shapeIds.get(event.targetId);
     if (!shapeId) return [];
-    return [timingWrapper(startIndex, visibilitySetXml(startIndex, shapeId, event.visible, eventStartMs(event)))];
+    return [timingWrapper(slide, event, startIndex, visibilitySetXml(startIndex, shapeId, event.visible, 0), shapeIds)];
   }
 
   if (event.kind !== "keyframes") return [];
@@ -978,40 +1327,132 @@ function eventToTimingNodes(
   const opacity = opacityFade(event);
   if (opacity) {
     const nodeIndex = startIndex + timingNodes.length;
-    timingNodes.push(timingWrapper(nodeIndex, fadeEffectXml(nodeIndex, shapeId, opacity, event.durationMs ?? 500, eventStartMs(event))));
+    timingNodes.push(timingWrapper(slide, event, nodeIndex, fadeEffectXml(nodeIndex, shapeId, opacity, event.durationMs ?? 500, 0), shapeIds));
   }
 
   const motion = motionOffsets(deck, slide, event);
   if (motion && (motion.fromX !== motion.toX || motion.fromY !== motion.toY)) {
     const nodeIndex = startIndex + timingNodes.length;
-    timingNodes.push(timingWrapper(nodeIndex, motionPathXml(deck, nodeIndex, shapeId, motion, event.durationMs ?? 500, eventStartMs(event))));
+    timingNodes.push(timingWrapper(slide, event, nodeIndex, motionPathXml(deck, nodeIndex, shapeId, motion, event.durationMs ?? 500, 0), shapeIds));
   }
 
   const scale = scaleValues(event);
   if (scale && (scale.fromX !== scale.toX || scale.fromY !== scale.toY)) {
     const nodeIndex = startIndex + timingNodes.length;
-    timingNodes.push(timingWrapper(nodeIndex, scaleXml(nodeIndex, shapeId, scale, event.durationMs ?? 500, eventStartMs(event))));
+    timingNodes.push(timingWrapper(slide, event, nodeIndex, scaleXml(nodeIndex, shapeId, scale, event.durationMs ?? 500, 0), shapeIds));
   }
 
   const rotation = rotationValues(event);
   if (rotation && rotation.from !== rotation.to) {
     const nodeIndex = startIndex + timingNodes.length;
-    timingNodes.push(timingWrapper(nodeIndex, rotationXml(nodeIndex, shapeId, rotation, event.durationMs ?? 500, eventStartMs(event))));
+    timingNodes.push(timingWrapper(slide, event, nodeIndex, rotationXml(nodeIndex, shapeId, rotation, event.durationMs ?? 500, 0), shapeIds));
   }
 
   return timingNodes;
 }
 
-function timingWrapper(index: number, childXml: string): string {
+function timingWrapper(slide: Slide, event: AnimationEvent, index: number, childXml: string, shapeIds: Map<string, string>): string {
   const parId = 3 + index * 3;
+  const context = exportTimingContext(slide, event, index, shapeIds);
+  const stCond = startConditionXml(context);
+  const nodeType = context.nodeType ? ` nodeType="${context.nodeType}"` : "";
+  const presetClass = context.presetClass ? ` presetClass="${context.presetClass}"` : "";
   return `\
 <p:par>
-  <p:cTn id="${parId}" fill="hold">
+  <p:cTn id="${parId}" fill="hold"${nodeType}${presetClass}>
+    ${stCond}
     <p:childTnLst>
       ${childXml}
     </p:childTnLst>
   </p:cTn>
 </p:par>`;
+}
+
+function exportTimingContext(
+  slide: Slide,
+  event: AnimationEvent,
+  index: number,
+  shapeIds: Map<string, string>
+): { kind: "absolute" | "withPrevious" | "afterPrevious" | "onClick"; delayMs: number; nodeType?: string; presetClass?: string; triggerShapeId?: string } {
+  const start = event.start;
+  if (start?.type === "withPrevious" || start?.type === "with") {
+    return { kind: "withPrevious", delayMs: start.offsetMs ?? 0, nodeType: "withEffect" };
+  }
+  if (start?.type === "afterPrevious" || start?.type === "after") {
+    return { kind: "afterPrevious", delayMs: start.offsetMs ?? 0, nodeType: "afterEffect" };
+  }
+  if (start?.type === "onClick") {
+    const triggerShapeId = start.targetId ? shapeIds.get(start.targetId) : targetShapeId(event, shapeIds);
+    return { kind: "onClick", delayMs: 0, nodeType: "clickEffect", presetClass: "entr", triggerShapeId };
+  }
+  if (start?.type === "trigger") {
+    const trigger = slide.timeline?.triggers?.find((candidate) => candidate.id === start.triggerId);
+    if (trigger?.type === "onClick") {
+      const triggerShapeId = trigger.targetId ? shapeIds.get(trigger.targetId) : targetShapeId(event, shapeIds);
+      return { kind: "onClick", delayMs: start.offsetMs ?? 0, nodeType: "clickEffect", presetClass: "entr", triggerShapeId };
+    }
+    if (trigger?.type === "afterPrevious") {
+      return { kind: "afterPrevious", delayMs: trigger.offsetMs ?? start.offsetMs ?? 0, nodeType: "afterEffect" };
+    }
+  }
+  return { kind: "absolute", delayMs: eventStartMs(event) };
+}
+
+function startConditionXml(context: { kind: string; delayMs: number; triggerShapeId?: string }): string {
+  const delay = Math.max(0, Math.round(context.delayMs));
+  if (context.kind === "onClick") {
+    const target = context.triggerShapeId ? `<p:tgtEl><p:spTgt spid="${context.triggerShapeId}"/></p:tgtEl>` : "";
+    const delayValue = delay > 0 ? String(delay) : "indefinite";
+    return `<p:stCondLst><p:cond delay="${delayValue}" evt="onClick">${target}</p:cond></p:stCondLst>`;
+  }
+  if (context.kind === "withPrevious") {
+    return `<p:stCondLst><p:cond delay="${delay}" evt="begin"/></p:stCondLst>`;
+  }
+  if (context.kind === "afterPrevious") {
+    return `<p:stCondLst><p:cond delay="${delay}" evt="onEnd"/></p:stCondLst>`;
+  }
+  return `<p:stCondLst><p:cond delay="${delay}"/></p:stCondLst>`;
+}
+
+function targetShapeId(event: AnimationEvent, shapeIds: Map<string, string>): string | undefined {
+  return "targetId" in event ? shapeIds.get(event.targetId) : undefined;
+}
+
+function buildListXml(slide: Slide, shapeIds: Map<string, string>): string {
+  const orderedShapeIds = orderedBuildShapeIds(slide, shapeIds);
+  if (orderedShapeIds.length === 0) return "";
+  const items = orderedShapeIds
+    .map((shapeId, index) => `<p:bldP spid="${shapeId}" grpId="${index + 1}"><p:bld spid="${shapeId}"/></p:bldP>`)
+    .join("");
+  return `<p:bldLst>${items}</p:bldLst>`;
+}
+
+function orderedBuildShapeIds(slide: Slide, shapeIds: Map<string, string>): string[] {
+  const events = slide.timeline?.events ?? [];
+  const eventIds = new Set(events.map((event) => event.id));
+  const edges = (slide.timeline?.dependencyGraph?.edges ?? []).filter(
+    (edge) => eventIds.has(edge.to) && (eventIds.has(edge.from) || edge.relation === "triggers")
+  );
+  const linkedEventIds = new Set(edges.flatMap((edge) => [edge.from, edge.to]).filter((id) => eventIds.has(id)));
+  events.forEach((event) => {
+    if (["with", "withPrevious", "after", "afterPrevious", "onClick", "trigger"].includes(String(event.start?.type))) {
+      linkedEventIds.add(event.id);
+    }
+  });
+  const triggeredEventIds = new Set(
+    events
+      .filter((event) => event.start?.type === "onClick" || event.start?.type === "trigger" || linkedEventIds.has(event.id))
+      .map((event) => event.id)
+  );
+  if (triggeredEventIds.size === 0) return [];
+  const shapeIdsInOrder: string[] = [];
+  for (const event of events) {
+    if (!triggeredEventIds.has(event.id)) continue;
+    const shapeId = targetShapeId(event, shapeIds);
+    if (!shapeId || shapeIdsInOrder.includes(shapeId)) continue;
+    shapeIdsInOrder.push(shapeId);
+  }
+  return shapeIdsInOrder;
 }
 
 function fadeEffectXml(index: number, shapeId: string, fade: "in" | "out", durationMs: number, delayMs: number): string {
@@ -1162,11 +1603,27 @@ function formatMotionCoordinate(value: number): string {
   return Object.is(rounded, -0) ? "0" : String(rounded);
 }
 
-function objectToShape(deck: DeckIR, object: IRObject, id: number): string {
+function assignShapeIds(objects: IRObject[]): Map<string, string> {
+  const ids = new Map<string, string>();
+  let nextId = 2;
+  const visit = (object: IRObject) => {
+    if (object.type !== "group") {
+      ids.set(object.id, String(nextId));
+      nextId += 1;
+      return;
+    }
+    for (const child of object.children) visit(child);
+  };
+  for (const object of objects) visit(object);
+  return ids;
+}
+
+function objectToShape(deck: DeckIR, object: IRObject, shapeIds: Map<string, string>): string {
   if (object.type === "group") {
-    return object.children.map((child, index) => objectToShape(deck, child, id + index)).join("");
+    return object.children.map((child) => objectToShape(deck, child, shapeIds)).join("");
   }
 
+  const id = Number(shapeIds.get(object.id) ?? 2);
   const bounds = object.bounds ?? { x: 0, y: 0, width: 100, height: 100 };
   const x = pxToEmu(bounds.x, deck.deck.size.width, WIDE_LAYOUT.width);
   const y = pxToEmu(bounds.y, deck.deck.size.height, WIDE_LAYOUT.height);

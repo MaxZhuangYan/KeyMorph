@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
 
 export interface RgbaImage {
@@ -10,6 +11,7 @@ export interface RgbaImage {
 export interface PixelFidelityOptions {
   threshold?: number;
   includeAlpha?: boolean;
+  diffPath?: string;
 }
 
 export interface PixelFidelityResult {
@@ -26,6 +28,11 @@ export interface PixelFidelityResult {
   threshold: number;
   dimensionsMatch: boolean;
   pixelFidelityScore: number;
+  diffPath?: string;
+}
+
+export interface RgbaDiffOptions extends PixelFidelityOptions {
+  matchOpacity?: number;
 }
 
 export function compareRgbaImages(
@@ -106,11 +113,69 @@ export async function comparePngFiles(
   options: PixelFidelityOptions = {}
 ): Promise<PixelFidelityResult> {
   const [reference, actual] = await Promise.all([readPngFile(referencePath), readPngFile(actualPath)]);
-  return compareRgbaImages(reference, actual, options);
+  const result = compareRgbaImages(reference, actual, options);
+  if (options.diffPath) {
+    await writePngFile(options.diffPath, createRgbaDiffImage(reference, actual, options));
+    return { ...result, diffPath: options.diffPath };
+  }
+  return result;
 }
 
 export async function readPngFile(filePath: string): Promise<RgbaImage> {
   return decodePng(await readFile(filePath));
+}
+
+export async function writePngFile(filePath: string, image: RgbaImage): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, encodePng(image));
+}
+
+export function createRgbaDiffImage(
+  reference: RgbaImage,
+  actual: RgbaImage,
+  options: RgbaDiffOptions = {}
+): RgbaImage {
+  assertImage(reference, "reference");
+  assertImage(actual, "actual");
+
+  const threshold = normalizeThreshold(options.threshold);
+  const includeAlpha = options.includeAlpha ?? true;
+  const width = Math.max(reference.width, actual.width);
+  const height = Math.max(reference.height, actual.height);
+  const channels = includeAlpha ? 4 : 3;
+  const matchOpacity = Math.max(0, Math.min(1, options.matchOpacity ?? 0.24));
+  const data = new Uint8Array(width * height * 4);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const outputOffset = (y * width + x) * 4;
+      const refOffset = pixelOffset(reference, x, y);
+      const actualOffset = pixelOffset(actual, x, y);
+
+      if (refOffset === undefined || actualOffset === undefined) {
+        data[outputOffset] = 255;
+        data[outputOffset + 1] = 0;
+        data[outputOffset + 2] = 255;
+        data[outputOffset + 3] = 255;
+        continue;
+      }
+
+      const distance = normalizedPixelDistance(reference.data, actual.data, refOffset, actualOffset, channels);
+      if (distance > threshold) {
+        data[outputOffset] = 255;
+        data[outputOffset + 1] = 40;
+        data[outputOffset + 2] = 40;
+        data[outputOffset + 3] = 255;
+      } else {
+        data[outputOffset] = Math.round(Number(actual.data[actualOffset]) * matchOpacity + 255 * (1 - matchOpacity));
+        data[outputOffset + 1] = Math.round(Number(actual.data[actualOffset + 1]) * matchOpacity + 255 * (1 - matchOpacity));
+        data[outputOffset + 2] = Math.round(Number(actual.data[actualOffset + 2]) * matchOpacity + 255 * (1 - matchOpacity));
+        data[outputOffset + 3] = 255;
+      }
+    }
+  }
+
+  return { width, height, data };
 }
 
 export function decodePng(input: Uint8Array): RgbaImage {
@@ -276,6 +341,26 @@ function assertImage(image: RgbaImage, name: string): void {
   if (image.data.length !== image.width * image.height * 4) {
     throw new Error(`${name} image data must be RGBA with width * height * 4 bytes.`);
   }
+}
+
+function pixelOffset(image: RgbaImage, x: number, y: number): number | undefined {
+  if (x < 0 || y < 0 || x >= image.width || y >= image.height) return undefined;
+  return (y * image.width + x) * 4;
+}
+
+function normalizedPixelDistance(
+  referenceData: Uint8Array | Uint8ClampedArray,
+  actualData: Uint8Array | Uint8ClampedArray,
+  referenceOffset: number,
+  actualOffset: number,
+  channels: number
+): number {
+  let channelSquared = 0;
+  for (let channel = 0; channel < channels; channel += 1) {
+    const delta = Math.abs(Number(referenceData[referenceOffset + channel]) - Number(actualData[actualOffset + channel])) / 255;
+    channelSquared += delta * delta;
+  }
+  return Math.sqrt(channelSquared / channels);
 }
 
 function assertPngSignature(data: Buffer): void {

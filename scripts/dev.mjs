@@ -1,5 +1,5 @@
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +10,13 @@ import { parsePptxToIr, exportIrToPptx } from "../src/pptx/index.ts";
 import { exportIrToKeynote, parseKeynoteToIr } from "../src/keynote/index.ts";
 import { createLossReport, scoreConversion } from "../src/report/index.ts";
 import { renderHtmlDocument } from "../src/runtime/index.ts";
-import { createVideoExportPlan, exportIrToVideo, VideoExportDependencyError } from "../src/video/index.ts";
+import {
+  createVideoExportPlan,
+  createVideoFrameFidelityReport,
+  describeVideoDependencies,
+  exportIrToVideo,
+  VideoExportDependencyError
+} from "../src/video/index.ts";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const host = "127.0.0.1";
@@ -89,6 +95,7 @@ async function handleConvert(request, response) {
 
   const report = createLossReport(deck.conversion ?? { status: "success", messages: [] });
   const videoPlan = summarizeVideoPlan(createVideoExportPlan(deck));
+  const videoDependencies = await describeVideoDependencies();
   await writeJson(reportPath, report);
   send(
     response,
@@ -105,6 +112,7 @@ async function handleConvert(request, response) {
       recommendedFixes: report.recommendedFixes,
       previewUrl: `/demo/out/jobs/${jobId}/runtime.html`,
       videoPlan,
+      videoDependencies,
       videoEndpoint: `/api/jobs/${jobId}/video`,
       keynoteEndpoint: `/api/jobs/${jobId}/keynote`,
       downloads: {
@@ -145,19 +153,47 @@ async function handleVideoExport(jobId, url, response) {
   const outputPath = path.join(jobDir, "render.mp4");
   const options = {
     fps: parsePositiveNumber(url.searchParams.get("fps")) ?? 30,
-    scale: parsePositiveNumber(url.searchParams.get("scale")) ?? 4
+    scale: parsePositiveNumber(url.searchParams.get("scale")) ?? 4,
+    keepFrames: true,
+    framesDir: path.join(jobDir, "frames", "rendering")
   };
   const plan = createVideoExportPlan(deck, options);
+  const previousFramesDir = path.join(jobDir, "frames", "previous");
+  const latestFramesDir = path.join(jobDir, "frames", "latest");
+  const renderingFramesDir = options.framesDir;
+  const diffDir = path.join(jobDir, "frame-diffs");
+  const fidelityReportPath = path.join(jobDir, "frame-fidelity.json");
 
   try {
+    await rm(renderingFramesDir, { recursive: true, force: true });
+    await rm(diffDir, { recursive: true, force: true });
+    await rm(previousFramesDir, { recursive: true, force: true });
+    await renameIfExists(latestFramesDir, previousFramesDir);
     await exportIrToVideo(deck, outputPath, options);
+    await rename(renderingFramesDir, latestFramesDir);
+    const frameFidelity = (await directoryExists(previousFramesDir))
+      ? await createVideoFrameFidelityReport(deck, previousFramesDir, latestFramesDir, {
+          fps: options.fps,
+          scale: options.scale,
+          diffDir,
+          reportPath: fidelityReportPath
+        })
+      : null;
     send(
       response,
       200,
       JSON.stringify({
         status: "ready",
         videoUrl: `/demo/out/jobs/${jobId}/render.mp4`,
-        plan: summarizeVideoPlan(plan)
+        plan: summarizeVideoPlan(plan),
+        framesUrl: `/demo/out/jobs/${jobId}/frames/latest/`,
+        frameFidelity: frameFidelity
+          ? {
+              reportUrl: `/demo/out/jobs/${jobId}/frame-fidelity.json`,
+              diffUrl: `/demo/out/jobs/${jobId}/frame-diffs/`,
+              summary: frameFidelity.summary
+            }
+          : null
       }),
       "application/json; charset=utf-8"
     );
@@ -170,6 +206,7 @@ async function handleVideoExport(jobId, url, response) {
           status: "dependency-missing",
           missing: error.missing,
           message: error.message,
+          guidance: error.guidance,
           plan: summarizeVideoPlan(plan)
         }),
         "application/json; charset=utf-8"
@@ -257,6 +294,10 @@ async function serveStatic(pathname, response) {
 
   try {
     const stats = await stat(filePath);
+    if (stats.isDirectory()) {
+      send(response, 200, JSON.stringify({ path: pathname, message: "Directory listing is not enabled." }), "application/json; charset=utf-8");
+      return;
+    }
     if (!stats.isFile()) throw new Error("Not a file");
     response.writeHead(200, { "Content-Type": contentType(filePath) });
     createReadStream(filePath).pipe(response);
@@ -413,7 +454,9 @@ function renderAppHtml() {
         ['Lost animations', result.animationLostCount],
         ['Degraded animations', result.degradedAnimationCount],
         ['Uncertain mappings', result.uncertainMappingCount],
-        ['Video frames', result.videoPlan.totalFrames + ' @ ' + result.videoPlan.fps + ' fps']
+        ['Video frames', result.videoPlan.totalFrames + ' @ ' + result.videoPlan.fps + ' fps'],
+        ['Frame capture', dependencyLabel(result.videoDependencies, ['playwright', 'browser'])],
+        ['MP4 encoder', dependencyLabel(result.videoDependencies, ['ffmpeg'])]
       ].map(([label, value]) => '<div class="metric"><span>' + label + '</span><strong>' + value + '</strong></div>').join('');
       if (result.recommendedFixes && result.recommendedFixes.length) {
         recommendationsEl.hidden = false;
@@ -480,7 +523,7 @@ function renderAppHtml() {
           return;
         }
         videoStatus.className = 'status';
-        videoStatus.innerHTML = 'MP4 ready. <a class="download" href="' + payload.videoUrl + '">Download video</a>';
+        videoStatus.innerHTML = 'MP4 ready. <a class="download" href="' + payload.videoUrl + '">Download video</a>' + fidelityLinks(payload.frameFidelity);
       } catch (error) {
         videoStatus.className = 'status error';
         videoStatus.textContent = error instanceof Error ? error.message : String(error);
@@ -491,6 +534,16 @@ function renderAppHtml() {
 
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+    }
+    function dependencyLabel(status, keys) {
+      if (!status?.available) return 'unknown';
+      const ready = keys.every((key) => status.available[key]);
+      return ready ? 'ready' : 'missing';
+    }
+    function fidelityLinks(frameFidelity) {
+      if (!frameFidelity) return '<div class="sub">Frame fidelity report will be created after a second render of this job.</div>';
+      const score = frameFidelity.summary?.meanPixelFidelityScore ?? 'n/a';
+      return '<div class="sub">Frame fidelity mean score: ' + score + '. <a class="download" href="' + frameFidelity.reportUrl + '">Download frame report</a></div>';
     }
   </script>
 </body>
@@ -503,6 +556,21 @@ async function writeJson(filePath, value) {
 
 async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
+}
+
+async function directoryExists(dirPath) {
+  try {
+    return (await stat(dirPath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function renameIfExists(from, to) {
+  if (!(await directoryExists(from))) return false;
+  await mkdir(path.dirname(to), { recursive: true });
+  await rename(from, to);
+  return true;
 }
 
 function sanitizeFileName(fileName) {
@@ -544,6 +612,7 @@ function send(response, status, body, type) {
 function contentType(filePath) {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
   if (filePath.endsWith(".json")) return "application/json; charset=utf-8";
+  if (filePath.endsWith(".png")) return "image/png";
   if (filePath.endsWith(".pptx")) {
     return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
   }

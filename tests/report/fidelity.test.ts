@@ -6,7 +6,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import { compareRgbaImages, decodePng, encodePng, type RgbaImage } from "../../src/report/fidelity.ts";
+import { comparePngFiles, compareRgbaImages, decodePng, encodePng, type RgbaImage } from "../../src/report/fidelity.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -58,6 +58,25 @@ describe("pixel fidelity scoring", () => {
     assert.equal(report.totalPixels, 1);
     assert.equal(report.mismatchedPixels, 1);
     assert.ok(report.pixelFidelityScore < 1);
+  });
+
+  test("writes optional PNG diff output without external pixel dependencies", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-fidelity-diff-"));
+    const referencePath = path.join(dir, "reference.png");
+    const actualPath = path.join(dir, "actual.png");
+    const diffPath = path.join(dir, "diff.png");
+
+    await writeFile(referencePath, encodePng(image(2, 1, [255, 255, 255, 255, 0, 0, 0, 255])));
+    await writeFile(actualPath, encodePng(image(2, 1, [255, 255, 255, 255, 255, 0, 0, 255])));
+
+    const result = await comparePngFiles(referencePath, actualPath, { threshold: 0.01, diffPath });
+    const diff = decodePng(await readFile(diffPath));
+
+    assert.equal(result.diffPath, diffPath);
+    assert.equal(result.mismatchedPixels, 1);
+    assert.equal(diff.width, 2);
+    assert.equal(diff.height, 1);
+    assert.deepEqual(Array.from(diff.data.slice(4, 8)), [255, 40, 40, 255]);
   });
 });
 

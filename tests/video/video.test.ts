@@ -1,12 +1,15 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createDemoDeck } from "../../src/demo/createDemoDeck.ts";
+import { decodePng, encodePng, type RgbaImage } from "../../src/report/fidelity.ts";
 import {
+  captureVideoFrames,
   comparePixelFrames,
+  createVideoFrameFidelityReport,
   createVideoExportPlan,
   createVideoFramePlan,
   describeVideoDependencies,
@@ -66,17 +69,12 @@ describe("video export planning", () => {
     const status = await describeVideoDependencies("keymorph-missing-ffmpeg");
 
     assert.equal(status.available.ffmpeg, false);
+    assert.equal(status.available.pngFidelity, true);
     assert.equal(status.missing.includes("ffmpeg"), true);
     assert.ok(status.guidance.some((item) => item.includes("ffmpegPath")));
   });
 
-  test("compares rendered frame PNGs with bundled pixel tools", async (context) => {
-    const status = await describeVideoDependencies("keymorph-missing-ffmpeg");
-    if (!status.available.pixelmatch || !status.available.pngjs) {
-      context.skip("pixelmatch/pngjs are not available in local or bundled runtime paths.");
-      return;
-    }
-
+  test("compares rendered frame PNGs and writes an optional diff without external pixel tools", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-video-pixel-"));
     const referencePath = path.join(dir, "reference.png");
     const actualPath = path.join(dir, "actual.png");
@@ -87,12 +85,66 @@ describe("video export planning", () => {
     const result = await comparePixelFrames(referencePath, actualPath, { threshold: 0, diffPath });
 
     assert.equal(result.dimensionsMatch, true);
-    assert.equal(result.comparedPixels, 2);
+    assert.equal(result.totalPixels, 2);
     assert.equal(result.mismatchedPixels, 1);
     assert.equal(result.mismatchRatio, 0.5);
     assert.equal(result.diffPath, diffPath);
+    assert.deepEqual(Array.from(decodePng(await readFile(diffPath)).data.slice(4, 8)), [255, 40, 40, 255]);
+  });
+
+  test("creates a frame-level fidelity report with optional per-frame diffs", async () => {
+    const deck = createDemoDeck();
+    const framePlan = createVideoExportPlan(deck, { fps: 1 }).frames;
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-video-report-"));
+    const referenceDir = path.join(dir, "reference");
+    const actualDir = path.join(dir, "actual");
+    const diffDir = path.join(dir, "diff");
+    const reportPath = path.join(dir, "frame-fidelity.json");
+    await mkdir(referenceDir, { recursive: true });
+    await mkdir(actualDir, { recursive: true });
+
+    for (const frame of framePlan) {
+      await writeFile(path.join(referenceDir, frame.outputPath), encodePng(image(1, 1, [255, 255, 255, 255])));
+      await writeFile(
+        path.join(actualDir, frame.outputPath),
+        encodePng(frame.frame === 1 ? image(1, 1, [0, 0, 0, 255]) : image(1, 1, [255, 255, 255, 255]))
+      );
+    }
+
+    const report = await createVideoFrameFidelityReport(deck, referenceDir, actualDir, {
+      fps: 1,
+      diffDir,
+      reportPath
+    });
+    const persisted = JSON.parse(await readFile(reportPath, "utf8"));
+
+    assert.equal(report.frames.length, framePlan.length);
+    assert.equal(report.summary.frameCount, framePlan.length);
+    assert.equal(report.summary.mismatchedPixels, 1);
+    assert.equal(report.summary.mismatchRatio, Number((1 / framePlan.length).toFixed(6)));
+    assert.equal(report.summary.worstFrame?.frame, 1);
+    assert.equal(persisted.summary.mismatchedPixels, 1);
+    assert.equal(decodePng(await readFile(path.join(diffDir, framePlan[1]?.outputPath ?? ""))).width, 1);
+  });
+
+  test("capture reports missing browser dependencies gracefully", async (context) => {
+    const status = await describeVideoDependencies("keymorph-missing-ffmpeg");
+    if (status.available.playwright && status.available.browser) {
+      context.skip("Playwright browser is available; missing-browser behavior is not active in this environment.");
+      return;
+    }
+
+    await assert.rejects(() => captureVideoFrames(createDemoDeck(), { fps: 1, scale: 1 }), (error) => {
+      assert.ok(error instanceof VideoExportDependencyError);
+      assert.ok(error.missing.includes("playwright") || error.missing.includes("playwright chromium browser"));
+      return true;
+    });
   });
 });
+
+function image(width: number, height: number, data: number[]): RgbaImage {
+  return { width, height, data: new Uint8Array(data) };
+}
 
 const RED_RED_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAD0lEQVR4AWP8z8DwnwEIAA0FAgA+gZVNAAAAAElFTkSuQmCC",

@@ -16,13 +16,35 @@ describe("Keynote bridge", () => {
       () => exportKeynoteToPptx(missingKeyPath, path.join(dir, "missing.pptx")),
       /Input Keynote file does not exist/
     );
+
+    const keyPath = path.join(dir, "present.key");
+    await writeFile(keyPath, new Uint8Array([0x50, 0x4b, 0x03, 0x04]));
+    await withAutomationDisabled(async () => {
+      await assert.rejects(
+        () => exportKeynoteToPptx(keyPath, path.join(dir, "present.pptx")),
+        /Keynote GUI automation is disabled by default/
+      );
+    });
   });
 
   test("detects and parses a native directory-style .key package", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-native-"));
     const keyPath = path.join(dir, "sample.key");
     await mkdir(path.join(keyPath, "Metadata"), { recursive: true });
-    await writeFile(path.join(keyPath, "Metadata", "Properties.plist"), plist({ title: "Native Fixture", slideWidth: 1024, slideHeight: 768 }));
+    await mkdir(path.join(keyPath, "QuickLook"), { recursive: true });
+    await writeFile(
+      path.join(keyPath, "Metadata", "Properties.plist"),
+      plist({
+        title: "Native Fixture",
+        author: "KeyMorph Test",
+        CreationDate: "2026-01-02T03:04:05Z",
+        ModificationDate: "2026-01-03T03:04:05Z",
+        DocumentIdentifier: "fixture-document-id",
+        slideWidth: 1024,
+        slideHeight: 768
+      })
+    );
+    await writeFile(path.join(keyPath, "QuickLook", "Thumbnail.jpg"), new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
     await writeFile(
       path.join(keyPath, "Index.zip"),
       zip(
@@ -37,14 +59,24 @@ describe("Keynote bridge", () => {
     const detection = await detectNativeKeynotePackage(keyPath);
     assert.equal(detection.isNative, true);
     assert.equal(detection.container, "directory");
+    assert.equal(detection.packageFormat, "directory-index-zip");
+    assert.equal(detection.hasLooseIndexDirectory, false);
+    assert.equal(detection.hasQuickLookPreview, true);
+    assert.deepEqual(detection.quickLookPaths, ["QuickLook/Thumbnail.jpg"]);
     assert.equal(detection.hasIndexZip, true);
     assert.deepEqual(detection.iwaPaths, ["Index/Document.iwa", "Index/Slide-1.iwa", "Index/Slide-2.iwa"]);
     assert.equal(detection.iwaStreams?.find((stream) => stream.path === "Index/Slide-1.iwa")?.role, "slide");
     assert.ok(detection.iwaStreams?.find((stream) => stream.path === "Index/Slide-2.iwa")?.compression.includes("snappy-framed"));
+    assert.ok((detection.iwaStreams?.find((stream) => stream.path === "Index/Slide-1.iwa")?.protobufFieldCount ?? 0) >= 2);
 
     const deck = await parseNativeKeynoteToIr(keyPath);
     assert.equal(validateIR(deck).valid, true);
     assert.equal(deck.deck.title, "Native Fixture");
+    assert.equal(deck.metadata?.author, "KeyMorph Test");
+    assert.equal(deck.metadata?.createdAt, "2026-01-02T03:04:05Z");
+    assert.equal(deck.metadata?.updatedAt, "2026-01-03T03:04:05Z");
+    assert.equal(deck.metadata?.custom?.nativePackageFormat, "directory-index-zip");
+    assert.equal(deck.metadata?.custom?.nativeDocumentIdentifier, "fixture-document-id");
     assert.equal(deck.deck.size.width, 1024);
     assert.equal(deck.deck.size.height, 768);
     assert.equal(deck.deck.slides.length, 2);
@@ -56,6 +88,53 @@ describe("Keynote bridge", () => {
     );
     assert.equal(deck.conversion?.status, "partial");
     assert.equal(deck.conversion?.tool, "keymorph-keynote-native-probe");
+    assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-iwa-fields-scanned"), true);
+    assert.equal(deck.conversion?.metadata?.packageFormat, "directory-index-zip");
+  });
+
+  test("scans nested protobuf fields and records uncertain field evidence", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-nested-iwa-"));
+    const keyPath = path.join(dir, "nested.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero image.png"), pngBytes());
+
+    const nestedShapeMessage = concat([
+      protoString("Nested field title", 1),
+      protoString("Data/hero%20image.png?checksum=ignored", 2)
+    ]);
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        protoString("Top-level title", 1),
+        protoBytes(nestedShapeMessage, 7),
+        protoVarint(3, 42)
+      ])
+    );
+
+    const detection = await detectNativeKeynotePackage(keyPath);
+    const stream = detection.iwaStreams?.[0];
+    assert.equal(detection.packageFormat, "directory-loose-index");
+    assert.equal(detection.hasLooseIndexDirectory, true);
+    assert.ok((stream?.protobufFieldCount ?? 0) >= 4);
+    assert.ok((stream?.nestedMessageCount ?? 0) >= 1);
+    assert.equal(stream?.fieldSummaries.some((summary) => summary.fieldPath === "7.1" && summary.sampleText === "Nested field title"), true);
+    assert.equal(stream?.assetReferenceCount, 1);
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeNestedMessageCount, 1);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeFieldSummaries?.some((summary) => summary.fieldPath === "7.1"), true);
+    assert.equal(deck.deck.slides[0]?.objects.some((object) => object.type === "image" && object.name === "hero image.png"), true);
+    assert.equal(
+      deck.deck.slides[0]?.objects.some(
+        (object) => object.type === "text" && object.metadata?.nativeFieldPath === "7.1" && object.text.plainText === "Nested field title"
+      ),
+      true
+    );
+    assert.equal(deck.conversion?.unsupportedFeatures?.some((feature) => feature.code === "keynote-native-protobuf-schema-private"), true);
+    assert.equal(deck.conversion?.uncertainMappings?.some((mapping) => mapping.code === "keynote-native-container-detection"), true);
+    assert.equal(deck.conversion?.metadata?.totalNestedMessageCount, 1);
   });
 
   test("extracts package asset references into IR assets and approximate objects", async () => {
@@ -72,7 +151,9 @@ describe("Keynote bridge", () => {
 
     const detection = await detectNativeKeynotePackage(keyPath);
     assert.deepEqual(detection.assetPaths, ["Data/clip.mov", "Data/hero.png"]);
+    assert.equal(detection.packageFormat, "directory-loose-index");
     assert.equal(detection.iwaStreams?.[0]?.assetReferenceCount, 2);
+    assert.ok((detection.iwaStreams?.[0]?.referenceCandidateCount ?? 0) >= 2);
 
     const deck = await parseNativeKeynoteToIr(keyPath);
     assert.equal(validateIR(deck).valid, true);
@@ -123,6 +204,7 @@ describe("Keynote bridge", () => {
     const detection = await detectNativeKeynotePackage(keyPath);
     assert.equal(detection.isNative, true);
     assert.equal(detection.container, "zip");
+    assert.equal(detection.packageFormat, "zip-loose-index");
     assert.equal(detection.hasIndexZip, false);
 
     const deck = await parseKeynoteToIr(keyPath, { preferNative: true });
@@ -147,11 +229,45 @@ describe("Keynote bridge", () => {
     assert.equal(deck.deck.slides[0]?.objects[0]?.type, "text");
     assert.equal(deck.conversion?.messages[0]?.code, "keynote-bridge-fallback-native");
   });
+
+  test("default bridge path does not trigger GUI automation before native fallback", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-safe-fallback-"));
+    const keyPath = path.join(dir, "safe.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("Safe native fallback"));
+
+    const deck = await withAutomationDisabled(() => parseKeynoteToIr(keyPath));
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.slides[0]?.objects[0]?.type, "text");
+    assert.match(deck.conversion?.messages[0]?.message ?? "", /Keynote GUI automation is disabled by default/);
+  });
 });
+
+async function withAutomationDisabled<T>(callback: () => Promise<T>): Promise<T> {
+  const previous = process.env.KEYMORPH_ALLOW_KEYNOTE_AUTOMATION;
+  delete process.env.KEYMORPH_ALLOW_KEYNOTE_AUTOMATION;
+  try {
+    return await callback();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.KEYMORPH_ALLOW_KEYNOTE_AUTOMATION;
+    } else {
+      process.env.KEYMORPH_ALLOW_KEYNOTE_AUTOMATION = previous;
+    }
+  }
+}
 
 function protoString(value: string, fieldNumber = 1): Uint8Array {
   const encoded = new TextEncoder().encode(value);
-  return concat([varint((fieldNumber << 3) | 2), varint(encoded.length), encoded]);
+  return protoBytes(encoded, fieldNumber);
+}
+
+function protoBytes(value: Uint8Array, fieldNumber: number): Uint8Array {
+  return concat([varint((fieldNumber << 3) | 2), varint(value.length), value]);
+}
+
+function protoVarint(fieldNumber: number, value: number): Uint8Array {
+  return concat([varint(fieldNumber << 3), varint(value)]);
 }
 
 function plist(values: Record<string, string | number>): Uint8Array {

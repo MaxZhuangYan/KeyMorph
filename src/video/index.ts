@@ -1,10 +1,11 @@
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 import type { DeckIR } from "../ir/index.ts";
+import { comparePngFiles, type PixelFidelityOptions, type PixelFidelityResult } from "../report/fidelity.ts";
 import { createDeckTimeline, renderHtmlDocument, resolveDeckTime, type DeckTimeResolution } from "../runtime/index.ts";
 
 export interface VideoExportOptions {
@@ -12,30 +13,69 @@ export interface VideoExportOptions {
   scale?: number;
   keepFrames?: boolean;
   ffmpegPath?: string;
+  framesDir?: string;
 }
 
-export interface PixelFrameFidelityOptions {
-  threshold?: number;
+export interface VideoFrameCaptureOptions extends VideoExportOptions {
+  outputDir?: string;
+}
+
+export interface VideoFrameCaptureResult {
+  plan: VideoExportPlan;
+  framesDir: string;
+  htmlPath: string;
+  frames: CapturedVideoFrame[];
+  cleanup?: () => Promise<void>;
+}
+
+export interface CapturedVideoFrame extends VideoFramePlan {
+  filePath: string;
+}
+
+export interface PixelFrameFidelityOptions extends PixelFidelityOptions {
+  diffPath?: string;
   includeAA?: boolean;
-  diffPath?: string;
 }
 
-export interface PixelFrameFidelityResult {
-  width: number;
-  height: number;
-  comparedPixels: number;
-  mismatchedPixels: number;
-  mismatchRatio: number;
-  threshold: number;
-  dimensionsMatch: boolean;
-  diffPath?: string;
+export type PixelFrameFidelityResult = PixelFidelityResult;
+
+export interface VideoFrameFidelityOptions extends PixelFrameFidelityOptions {
+  diffDir?: string;
+  reportPath?: string;
+}
+
+export interface VideoFrameFidelityEntry extends PixelFidelityResult {
+  frame: number;
+  timeMs: number;
+  referencePath: string;
+  actualPath: string;
+  outputPath: string;
+  resolution: DeckTimeResolution;
+}
+
+export interface VideoFrameFidelityReport {
+  generatedAt: string;
+  plan: Omit<VideoExportPlan, "frames">;
+  frames: VideoFrameFidelityEntry[];
+  summary: {
+    frameCount: number;
+    totalPixels: number;
+    comparedPixels: number;
+    mismatchedPixels: number;
+    mismatchRatio: number;
+    meanPixelFidelityScore: number;
+    worstFrame?: VideoFrameFidelityEntry;
+  };
+  reportPath?: string;
 }
 
 export interface VideoDependencyStatus {
   missing: string[];
   available: {
     playwright: boolean;
+    browser: boolean;
     ffmpeg: boolean;
+    pngFidelity: boolean;
     pixelmatch: boolean;
     pngjs: boolean;
   };
@@ -129,37 +169,100 @@ export async function comparePixelFrames(
   actualPngPath: string,
   options: PixelFrameFidelityOptions = {}
 ): Promise<PixelFrameFidelityResult> {
-  const { pixelmatch, PNG } = await importPixelFrameTools().catch(async () => {
-    throw new PixelFrameFidelityDependencyError(await missingPixelFrameDependencies());
-  });
-  const [reference, actual] = await Promise.all([readPng(PNG, referencePngPath), readPng(PNG, actualPngPath)]);
-  const width = Math.max(reference.width, actual.width);
-  const height = Math.max(reference.height, actual.height);
-  const dimensionsMatch = reference.width === actual.width && reference.height === actual.height;
-  const comparedPixels = width * height;
-  const referenceData = normalizePngData(PNG, reference, width, height);
-  const actualData = normalizePngData(PNG, actual, width, height);
-  const diff = options.diffPath ? new PNG({ width, height }) : undefined;
-  const threshold = normalizePixelmatchThreshold(options.threshold);
-  const mismatchedPixels = pixelmatch(referenceData, actualData, diff?.data, width, height, {
-    threshold,
-    includeAA: options.includeAA ?? true
-  });
+  return comparePngFiles(referencePngPath, actualPngPath, options);
+}
 
-  if (options.diffPath && diff) {
-    await writeFile(options.diffPath, PNG.sync.write(diff));
+export async function captureVideoFrames(
+  deck: DeckIR,
+  options: VideoFrameCaptureOptions = {}
+): Promise<VideoFrameCaptureResult> {
+  const { chromium } = await importPlaywright().catch(() => {
+    throw new VideoExportDependencyError(["playwright"]);
+  });
+  const plan = createVideoExportPlan(deck, options);
+  const ownsFramesDir = !options.outputDir && !options.framesDir;
+  const framesDir = path.resolve(options.outputDir ?? options.framesDir ?? (await mkdtemp(path.join(tmpdir(), "keymorph-frames-"))));
+  const htmlPath = path.join(framesDir, "runtime.html");
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  let completed = false;
+
+  try {
+    await mkdir(framesDir, { recursive: true });
+    await writeFile(htmlPath, renderHtmlDocument(deck, { controls: false, stageScale: plan.scale }), "utf8");
+    try {
+      browser = await chromium.launch({ headless: true });
+    } catch {
+      throw new VideoExportDependencyError(["playwright chromium browser"]);
+    }
+    const page = await browser.newPage({
+      viewport: { width: plan.outputWidth, height: plan.outputHeight },
+      deviceScaleFactor: 1
+    });
+    await page.goto(pathToFileURL(htmlPath).toString(), { waitUntil: "load" });
+
+    for (const frame of plan.frames) {
+      const framePath = path.join(framesDir, frame.outputPath);
+      await mkdir(path.dirname(framePath), { recursive: true });
+      await page.evaluate(async (time) => {
+        window.__keyMorphRuntime?.seekGlobal(time);
+        await document.fonts?.ready;
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      }, frame.timeMs);
+      await page.screenshot({ path: framePath });
+    }
+
+    completed = true;
+    return {
+      plan,
+      framesDir,
+      htmlPath,
+      frames: plan.frames.map((frame) => ({ ...frame, filePath: path.join(framesDir, frame.outputPath) })),
+      cleanup: ownsFramesDir ? () => rm(framesDir, { recursive: true, force: true }) : undefined
+    };
+  } finally {
+    await browser?.close();
+    if (!completed && ownsFramesDir) await rm(framesDir, { recursive: true, force: true });
+  }
+}
+
+export async function createVideoFrameFidelityReport(
+  deck: DeckIR,
+  referenceFramesDir: string,
+  actualFramesDir: string,
+  options: VideoFrameFidelityOptions = {}
+): Promise<VideoFrameFidelityReport> {
+  const plan = createVideoExportPlan(deck, options);
+  if (options.diffDir) await mkdir(options.diffDir, { recursive: true });
+
+  const frames: VideoFrameFidelityEntry[] = [];
+  for (const frame of plan.frames) {
+    const referencePath = path.join(referenceFramesDir, frame.outputPath);
+    const actualPath = path.join(actualFramesDir, frame.outputPath);
+    const diffPath = options.diffDir ? path.join(options.diffDir, frame.outputPath) : undefined;
+    const result = await comparePixelFrames(referencePath, actualPath, { ...options, diffPath });
+    frames.push({
+      ...result,
+      frame: frame.frame,
+      timeMs: frame.timeMs,
+      referencePath,
+      actualPath,
+      outputPath: frame.outputPath,
+      resolution: frame.resolution
+    });
   }
 
-  return {
-    width,
-    height,
-    comparedPixels,
-    mismatchedPixels,
-    mismatchRatio: Number((mismatchedPixels / Math.max(1, comparedPixels)).toFixed(6)),
-    threshold,
-    dimensionsMatch,
-    diffPath: options.diffPath
+  const report: VideoFrameFidelityReport = {
+    generatedAt: new Date().toISOString(),
+    plan: summarizePlan(plan),
+    frames,
+    summary: summarizeFrameFidelity(frames),
+    reportPath: options.reportPath
   };
+  if (options.reportPath) {
+    await mkdir(path.dirname(options.reportPath), { recursive: true });
+    await writeFile(options.reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  }
+  return report;
 }
 
 export async function exportIrToVideo(
@@ -170,39 +273,15 @@ export async function exportIrToVideo(
   const missing = await missingVideoDependencies(options.ffmpegPath);
   if (missing.length) throw new VideoExportDependencyError(missing);
 
-  const { chromium } = await importPlaywright().catch(() => {
-    throw new VideoExportDependencyError(["playwright"]);
-  });
   const ffmpeg = options.ffmpegPath ?? "ffmpeg";
-  const plan = createVideoExportPlan(deck, options);
-  const workspace = await mkdtemp(path.join(tmpdir(), "keymorph-video-"));
-  const htmlPath = path.join(workspace, "runtime.html");
-
-  let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
+  const capture = await captureVideoFrames(deck, { ...options, outputDir: options.framesDir });
   try {
-    await writeFile(htmlPath, renderHtmlDocument(deck, { controls: false, stageScale: plan.scale }), "utf8");
-    try {
-      browser = await chromium.launch({ headless: true });
-    } catch (error) {
-      throw new VideoExportDependencyError(["playwright chromium browser"]);
-    }
-    const page = await browser.newPage({
-      viewport: { width: plan.outputWidth, height: plan.outputHeight },
-      deviceScaleFactor: 1
-    });
-    await page.goto(pathToFileURL(htmlPath).toString(), { waitUntil: "load" });
-
-    for (const frame of plan.frames) {
-      await page.evaluate((time) => window.__keyMorphRuntime?.seekGlobal(time), frame.timeMs);
-      await page.screenshot({ path: path.join(workspace, frame.outputPath) });
-    }
-
     await run(ffmpeg, [
       "-y",
       "-framerate",
-      String(plan.fps),
+      String(capture.plan.fps),
       "-i",
-      path.join(workspace, "frame-%06d.png"),
+      path.join(capture.framesDir, "frame-%06d.png"),
       "-c:v",
       "libx264",
       "-pix_fmt",
@@ -210,9 +289,47 @@ export async function exportIrToVideo(
       outputPath
     ]);
   } finally {
-    await browser?.close();
-    if (!options.keepFrames) await rm(workspace, { recursive: true, force: true });
+    if (!options.keepFrames) await capture.cleanup?.();
   }
+}
+
+function summarizePlan(plan: VideoExportPlan): Omit<VideoExportPlan, "frames"> {
+  return {
+    width: plan.width,
+    height: plan.height,
+    scale: plan.scale,
+    fps: plan.fps,
+    durationMs: plan.durationMs,
+    totalFrames: plan.totalFrames,
+    outputWidth: plan.outputWidth,
+    outputHeight: plan.outputHeight
+  };
+}
+
+function summarizeFrameFidelity(frames: VideoFrameFidelityEntry[]): VideoFrameFidelityReport["summary"] {
+  const frameCount = frames.length;
+  const totalPixels = frames.reduce((sum, frame) => sum + frame.totalPixels, 0);
+  const comparedPixels = frames.reduce((sum, frame) => sum + frame.comparedPixels, 0);
+  const mismatchedPixels = frames.reduce((sum, frame) => sum + frame.mismatchedPixels, 0);
+  const meanPixelFidelityScore = frameCount
+    ? frames.reduce((sum, frame) => sum + frame.pixelFidelityScore, 0) / frameCount
+    : 1;
+  const worstFrame = frames.reduce<VideoFrameFidelityEntry | undefined>((worst, frame) => {
+    if (!worst) return frame;
+    if (frame.pixelFidelityScore < worst.pixelFidelityScore) return frame;
+    if (frame.pixelFidelityScore === worst.pixelFidelityScore && frame.mismatchRatio > worst.mismatchRatio) return frame;
+    return worst;
+  }, undefined);
+
+  return {
+    frameCount,
+    totalPixels,
+    comparedPixels,
+    mismatchedPixels,
+    mismatchRatio: Number((mismatchedPixels / Math.max(1, totalPixels)).toFixed(6)),
+    meanPixelFidelityScore: Number(meanPixelFidelityScore.toFixed(4)),
+    worstFrame
+  };
 }
 
 async function missingVideoDependencies(ffmpegPath = "ffmpeg"): Promise<string[]> {
@@ -239,15 +356,21 @@ export async function resolveVideoDependencies(ffmpegPath = "ffmpeg"): Promise<s
 }
 
 export async function describeVideoDependencies(ffmpegPath = "ffmpeg"): Promise<VideoDependencyStatus> {
-  const [videoMissing, pixelMissing] = await Promise.all([missingVideoDependencies(ffmpegPath), missingPixelFrameDependencies()]);
-  const missing = Array.from(new Set([...videoMissing, ...pixelMissing]));
+  const [videoMissing, frameCaptureMissing, pixelMissing] = await Promise.all([
+    missingVideoDependencies(ffmpegPath),
+    missingFrameCaptureDependencies(),
+    missingPixelFrameDependencies()
+  ]);
+  const missing = Array.from(new Set([...videoMissing, ...frameCaptureMissing]));
   return {
     missing,
     available: {
       playwright: !missing.includes("playwright"),
+      browser: !missing.includes("playwright") && !missing.includes("playwright chromium browser"),
       ffmpeg: !missing.includes("ffmpeg"),
-      pixelmatch: !missing.includes("pixelmatch"),
-      pngjs: !missing.includes("pngjs")
+      pngFidelity: true,
+      pixelmatch: !pixelMissing.includes("pixelmatch"),
+      pngjs: !pixelMissing.includes("pngjs")
     },
     guidance: videoDependencyGuidance(missing)
   };
@@ -282,6 +405,30 @@ async function missingPixelFrameDependencies(): Promise<string[]> {
     missing.push("pngjs");
   }
   return missing;
+}
+
+async function missingFrameCaptureDependencies(): Promise<string[]> {
+  let playwright: Awaited<ReturnType<typeof importPlaywright>>;
+  try {
+    playwright = await importPlaywright();
+  } catch {
+    return ["playwright"];
+  }
+
+  if (!(await canLaunchChromium(playwright))) return ["playwright chromium browser"];
+  return [];
+}
+
+async function canLaunchChromium(playwright: Awaited<ReturnType<typeof importPlaywright>>): Promise<boolean> {
+  let browser: Awaited<ReturnType<typeof playwright.chromium.launch>> | undefined;
+  try {
+    browser = await playwright.chromium.launch({ headless: true });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await browser?.close().catch(() => undefined);
+  }
 }
 
 async function importPixelFrameTools(): Promise<{ pixelmatch: Pixelmatch; PNG: PngConstructor }> {
