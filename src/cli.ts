@@ -8,7 +8,14 @@ import { renderHtmlDocument } from "./runtime/index.ts";
 import { createLossReport, scoreConversion, type ConversionLossReport } from "./report/index.ts";
 import { comparePngFiles } from "./report/fidelity.ts";
 import { exportIrToPptx, parsePptxToIr } from "./pptx/index.ts";
-import { exportIrToKeynote, exportKeynoteToHtml, exportKeynoteToMovie, parseKeynoteToIr, type KeynoteAutomationOptions } from "./keynote/index.ts";
+import {
+  exportIrToKeynote,
+  exportKeynoteToHtml,
+  exportKeynoteToMovie,
+  parseKeynoteHtmlExportToIr,
+  parseKeynoteToIr,
+  type KeynoteAutomationOptions
+} from "./keynote/index.ts";
 import {
   createVideoExportPlan,
   createVideoFrameFidelityReport,
@@ -510,6 +517,11 @@ async function main(): Promise<void> {
       await writeJson(output, await parseKeynoteToIr(input, { workDir: path.dirname(path.resolve(output)) }));
       return;
     }
+    case "keyhtml-to-ir": {
+      if (!input || !output) throw new Error("Usage: keyhtml-to-ir <keynote-html-export-dir> <output.ir.json>");
+      await writeJson(output, await parseKeynoteHtmlExportToIr(input));
+      return;
+    }
     case "ir-to-html": {
       if (!input || !output) throw new Error("Usage: ir-to-html <input.ir.json> <output.html>");
       const deck = await readJson<DeckIR>(input);
@@ -551,7 +563,7 @@ async function main(): Promise<void> {
     }
     default:
       throw new Error(
-        "Usage: keymorph <demo|convert|inspect|bundle-keynote|bundle-video|pptx-to-ir|key-to-ir|ir-to-html|ir-to-pptx|ir-to-key|ir-to-video|ir-report|png-fidelity> [input] [output]"
+        "Usage: keymorph <demo|convert|inspect|bundle-keynote|bundle-video|pptx-to-ir|key-to-ir|keyhtml-to-ir|ir-to-html|ir-to-pptx|ir-to-key|ir-to-video|ir-report|png-fidelity> [input] [output]"
       );
   }
 }

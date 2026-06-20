@@ -7,6 +7,8 @@ import type { DeckIR } from "../ir/index.ts";
 import { parsePptxToIr, exportIrToPptx } from "../pptx/index.ts";
 import { parseNativeKeynoteToIr } from "./native.ts";
 
+export { isKeynoteHtmlExportDir, parseKeynoteHtmlExportToIr, parseKeynoteHtmlToIr } from "./html.ts";
+export type { KeynoteHtmlImportOptions, KeynoteHtmlParseOptions } from "./html.ts";
 export { detectNativeKeynotePackage, parseNativeKeynoteToIr } from "./native.ts";
 export type {
   NativeIwaCompression,

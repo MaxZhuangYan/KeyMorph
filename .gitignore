@@ -5,3 +5,4 @@ coverage/
 *.log
 demo/out/
 *.mp4
+local-fixtures/
