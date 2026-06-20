@@ -159,7 +159,12 @@ export interface NativeIwaBuildTimingEvidence {
   buildId?: string;
   durationMs?: number;
   delayMs?: number;
+  triggerGroupRaw?: number;
   group?: number;
+  rawField5?: number;
+  rawField6?: number;
+  rawField72?: number;
+  startRelation?: "withPrevious" | "afterPrevious" | "unknown";
   startsWithPrevious?: boolean;
   afterPrevious?: boolean;
   confidence: number;
@@ -2062,7 +2067,8 @@ function recoverNativeBuildAnimations(
     const resolutions = resolveNativeBuildTargets(build, objectLookup);
     const durationMs = clampNativeBuildDuration(timing?.durationMs ?? build.durationMs);
     const delayMs = clampNativeBuildDelay(timing?.delayMs ?? build.delayMs);
-    const baseStartMs = timing?.startsWithPrevious ? groupStartMs : cursorMs;
+    const startsWithPrevious = isNativeTimingWithPrevious(timing);
+    const baseStartMs = startsWithPrevious ? groupStartMs : cursorMs;
     const startMs = baseStartMs + delayMs;
     let generatedEventCount = 0;
     for (const [targetIndex, resolution] of resolutions.entries()) {
@@ -2072,12 +2078,13 @@ function recoverNativeBuildAnimations(
         generatedEventCount += 1;
       }
     }
-    if (generatedEventCount > 0) {
-      if (!timing?.startsWithPrevious) {
+    if (generatedEventCount > 0 || timing || build.durationMs !== undefined) {
+      if (!startsWithPrevious) {
         groupStartMs = startMs;
       }
       cursorMs = Math.max(cursorMs, startMs + durationMs);
-    } else {
+    }
+    if (generatedEventCount === 0) {
       unresolvedBuildCount += 1;
     }
   }
@@ -2089,6 +2096,10 @@ function recoverNativeBuildAnimations(
     timingRecords,
     unresolvedBuildCount
   };
+}
+
+function isNativeTimingWithPrevious(timing: NativeIwaBuildTimingEvidence | undefined): boolean {
+  return timing?.startRelation === "withPrevious" || timing?.startsWithPrevious === true;
 }
 
 function createNativeBuildObjectLookup(objects: IRObject[]): Map<string, Array<{ object: IRObject; method: string }>> {
@@ -2385,6 +2396,11 @@ function nativeBuildEventMetadata(
       : {}),
     ...(timing ? { nativeBuildTimingConfidence: timing.confidence } : {}),
     ...(timing?.group !== undefined ? { nativeBuildTimingGroup: timing.group } : {}),
+    ...(timing?.triggerGroupRaw !== undefined ? { nativeBuildTimingTriggerGroupRaw: timing.triggerGroupRaw } : {}),
+    ...(timing?.rawField5 !== undefined ? { nativeBuildTimingRawField5: timing.rawField5 } : {}),
+    ...(timing?.rawField6 !== undefined ? { nativeBuildTimingRawField6: timing.rawField6 } : {}),
+    ...(timing?.rawField72 !== undefined ? { nativeBuildTimingRawField72: timing.rawField72 } : {}),
+    ...(timing?.startRelation ? { nativeBuildStartRelation: timing.startRelation } : {}),
     ...(timing?.startsWithPrevious !== undefined ? { nativeBuildStartsWithPrevious: timing.startsWithPrevious } : {}),
     ...(timing?.afterPrevious !== undefined ? { nativeBuildAfterPrevious: timing.afterPrevious } : {})
   };
@@ -3072,21 +3088,32 @@ function nativeBuildTimingEvidenceFromPayload(
   const durationMs = nativeSecondsToMs(numericValueAtFieldPath(payload, [4]));
   const startsWithPreviousRaw = numericValueAtFieldPath(payload, [5]);
   const afterPreviousRaw = numericValueAtFieldPath(payload, [6]);
-  const group = numericValueAtFieldPath(payload, [7, 2]);
+  const triggerGroupRaw = numericValueAtFieldPath(payload, [7, 2]);
+  const startsWithPrevious = startsWithPreviousRaw !== undefined ? startsWithPreviousRaw !== 0 : undefined;
+  const afterPreviousRawFlag = afterPreviousRaw !== undefined ? afterPreviousRaw !== 0 : undefined;
+  const startRelation =
+    startsWithPrevious === true
+      ? "withPrevious"
+      : afterPreviousRawFlag === true
+        ? "afterPrevious"
+        : startsWithPrevious !== undefined || afterPreviousRawFlag !== undefined
+          ? "unknown"
+          : undefined;
+  const afterPrevious = startRelation === "afterPrevious" ? true : startRelation === "withPrevious" ? false : afterPreviousRawFlag;
   const sourceFieldPaths = [
     ...(buildId ? ["1.1"] : []),
     ...(delayMs !== undefined ? ["3"] : []),
     ...(durationMs !== undefined ? ["4"] : []),
     ...(startsWithPreviousRaw !== undefined ? ["5"] : []),
     ...(afterPreviousRaw !== undefined ? ["6"] : []),
-    ...(group !== undefined ? ["7.2"] : [])
+    ...(triggerGroupRaw !== undefined ? ["7.2"] : [])
   ];
   const confidence = roundConfidence(
     0.32 +
       (buildId ? 0.28 : 0) +
       (durationMs !== undefined ? 0.16 : 0) +
       (record.identifier ? 0.08 : 0) +
-      (group !== undefined ? 0.04 : 0)
+      (triggerGroupRaw !== undefined ? 0.04 : 0)
   );
   return {
     kind: "buildTiming",
@@ -3094,9 +3121,10 @@ function nativeBuildTimingEvidenceFromPayload(
     ...(buildId ? { buildId } : {}),
     ...(durationMs !== undefined ? { durationMs } : {}),
     ...(delayMs !== undefined ? { delayMs } : {}),
-    ...(group !== undefined ? { group } : {}),
-    ...(startsWithPreviousRaw !== undefined ? { startsWithPrevious: startsWithPreviousRaw !== 0 } : {}),
-    ...(afterPreviousRaw !== undefined ? { afterPrevious: afterPreviousRaw !== 0 } : {}),
+    ...(triggerGroupRaw !== undefined ? { triggerGroupRaw, group: triggerGroupRaw, rawField72: triggerGroupRaw } : {}),
+    ...(startsWithPreviousRaw !== undefined ? { rawField5: startsWithPreviousRaw, startsWithPrevious } : {}),
+    ...(afterPreviousRaw !== undefined ? { rawField6: afterPreviousRaw, afterPrevious } : {}),
+    ...(startRelation ? { startRelation } : {}),
     confidence,
     sourceFieldPaths: uniqueStrings(sourceFieldPaths)
   };

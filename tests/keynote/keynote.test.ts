@@ -620,6 +620,106 @@ describe("Keynote bridge", () => {
     assert.equal(deck.deck.slides[0]?.timeline?.durationMs, 2500);
   });
 
+  test("preserves native timing cursor when an unresolved build has timing", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-unresolved-timing-"));
+    const keyPath = path.join(dir, "timing.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(111, [
+          { type: 3005, payload: nativeImagePlacementPayload(42, { x: 10, y: 20, width: 100, height: 80 }), dataReferences: [42] }
+        ]),
+        iwaArchiveRecord(9001, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 999, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9002, [
+          { type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 1, afterPrevious: true }) }
+        ]),
+        iwaArchiveRecord(9003, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9004, [
+          { type: 153, payload: nativeBuildTimingPayload({ buildId: 9003, durationSeconds: 1, afterPrevious: true }) }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const events = deck.deck.slides[0]?.timeline?.events ?? [];
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0]?.start, { type: "absolute", atMs: 1000 });
+    assert.equal(events[0]?.metadata?.nativeBuildStartRelation, "afterPrevious");
+    assert.equal(events[0]?.metadata?.nativeBuildTimingRawField6, 1);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationUnresolvedCount, 1);
+  });
+
+  test("derives native timing start relation from raw type 153 flags", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-timing-relation-"));
+    const keyPath = path.join(dir, "timing.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(111, [
+          { type: 3005, payload: nativeImagePlacementPayload(42, { x: 10, y: 20, width: 100, height: 80 }), dataReferences: [42] }
+        ]),
+        iwaArchiveRecord(9001, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9002, [
+          { type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 1, startsWithPrevious: false, afterPrevious: true }) }
+        ]),
+        iwaArchiveRecord(9003, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9004, [
+          { type: 153, payload: nativeBuildTimingPayload({ buildId: 9003, durationSeconds: 1, startsWithPrevious: true, afterPrevious: true }) }
+        ]),
+        iwaArchiveRecord(9005, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9006, [
+          { type: 153, payload: nativeBuildTimingPayload({ buildId: 9005, durationSeconds: 1, startsWithPrevious: true, afterPrevious: false }) }
+        ]),
+        iwaArchiveRecord(9007, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9008, [
+          { type: 153, payload: nativeBuildTimingPayload({ buildId: 9007, durationSeconds: 1, startsWithPrevious: false, afterPrevious: true }) }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const events = deck.deck.slides[0]?.timeline?.events ?? [];
+    assert.deepEqual(
+      events.map((event) => event.start),
+      [
+        { type: "absolute", atMs: 0 },
+        { type: "absolute", atMs: 0 },
+        { type: "absolute", atMs: 0 },
+        { type: "absolute", atMs: 1000 }
+      ]
+    );
+    assert.deepEqual(
+      events.map((event) => event.metadata?.nativeBuildStartRelation),
+      ["afterPrevious", "withPrevious", "withPrevious", "afterPrevious"]
+    );
+    assert.equal(events[1]?.metadata?.nativeBuildStartsWithPrevious, true);
+    assert.equal(events[1]?.metadata?.nativeBuildAfterPrevious, false);
+    assert.equal(events[1]?.metadata?.nativeBuildTimingRawField5, 1);
+    assert.equal(events[1]?.metadata?.nativeBuildTimingRawField6, 1);
+  });
+
   test("approximates native Keynote wipe as a bounds reveal", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-wipe-"));
     const keyPath = path.join(dir, "wipe.key");
