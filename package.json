@@ -7,6 +7,7 @@
   "scripts": {
     "build": "node --experimental-transform-types scripts/check.mjs",
     "test": "node --experimental-transform-types --test tests/**/*.test.ts",
+    "dev": "node --experimental-transform-types scripts/dev.mjs",
     "demo": "node --experimental-transform-types src/cli.ts demo",
     "pptx:to-ir": "node --experimental-transform-types src/cli.ts pptx-to-ir",
     "ir:to-pptx": "node --experimental-transform-types src/cli.ts ir-to-pptx",

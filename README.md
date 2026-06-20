@@ -25,11 +25,13 @@ The system optimizes for visual fidelity and records any unsupported animation o
 ```bash
 npm run build
 npm test
+npm run dev
 npm run demo
 npm run ir:report -- demo/out/imported.ir.json demo/out/conversion-report.json
 ```
 
 `npm run demo` generates a local round-trip under `demo/out`: source IR, original PPTX, imported IR, HTML runtime, rebuilt PPTX, and conversion report.
+`npm run dev` generates the same demo and serves it at `http://127.0.0.1:4173/demo/out/runtime.html`.
 
 This checkpoint intentionally has no external npm runtime dependencies. It uses Node 24's built-in TypeScript transform.
 
