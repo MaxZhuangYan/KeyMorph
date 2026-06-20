@@ -23,21 +23,29 @@ async function runDemo(): Promise<void> {
   const outDir = path.resolve("demo/out");
   await mkdir(outDir, { recursive: true });
 
-  const deck = createDemoDeck();
-  const irPath = path.join(outDir, "demo.ir.json");
+  const sourceDeck = createDemoDeck();
+  const sourceIrPath = path.join(outDir, "source.ir.json");
+  const originalPptxPath = path.join(outDir, "original.pptx");
+  const importedIrPath = path.join(outDir, "imported.ir.json");
   const htmlPath = path.join(outDir, "runtime.html");
   const pptxPath = path.join(outDir, "rebuilt.pptx");
   const reportPath = path.join(outDir, "conversion-report.json");
 
-  await writeJson(irPath, deck);
-  await writeFile(htmlPath, renderHtmlDocument(deck), "utf8");
-  await exportIrToPptx(deck, pptxPath);
-  await writeJson(reportPath, scoreConversion(deck.conversion ?? { status: "success", messages: [] }));
+  await writeJson(sourceIrPath, sourceDeck);
+  await exportIrToPptx(sourceDeck, originalPptxPath);
+
+  const importedDeck = await parsePptxToIr(originalPptxPath);
+  await writeJson(importedIrPath, importedDeck);
+  await writeFile(htmlPath, renderHtmlDocument(importedDeck), "utf8");
+  await exportIrToPptx(importedDeck, pptxPath);
+  await writeJson(reportPath, scoreConversion(importedDeck.conversion ?? { status: "success", messages: [] }));
 
   console.log("Demo generated:");
-  console.log(`  IR: ${irPath}`);
+  console.log(`  source IR: ${sourceIrPath}`);
+  console.log(`  original PPTX: ${originalPptxPath}`);
+  console.log(`  imported IR: ${importedIrPath}`);
   console.log(`  HTML runtime: ${pathToFileURL(htmlPath).toString()}`);
-  console.log(`  PPTX: ${pptxPath}`);
+  console.log(`  rebuilt PPTX: ${pptxPath}`);
   console.log(`  report: ${reportPath}`);
 }
 

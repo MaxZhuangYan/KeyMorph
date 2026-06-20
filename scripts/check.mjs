@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { createDemoDeck } from "../src/demo/createDemoDeck.ts";
 import { validateIR } from "../src/ir/index.ts";
-import { exportIrToPptx } from "../src/pptx/index.ts";
+import { exportIrToPptx, parsePptxToIr } from "../src/pptx/index.ts";
 import { renderHtmlDocument } from "../src/runtime/index.ts";
 
 const deck = createDemoDeck();
@@ -24,6 +24,11 @@ await exportIrToPptx(deck, pptxPath);
 const pptxStats = await stat(pptxPath);
 if (pptxStats.size <= 0) {
   throw new Error("PPTX smoke check failed.");
+}
+
+const imported = await parsePptxToIr(pptxPath);
+if (imported.deck.slides.length !== deck.deck.slides.length) {
+  throw new Error("PPTX round-trip smoke check failed.");
 }
 
 console.log("KeyMorph build smoke check passed.");
