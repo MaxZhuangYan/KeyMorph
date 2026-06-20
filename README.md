@@ -31,8 +31,14 @@ npm run ir:report -- demo/out/imported.ir.json demo/out/conversion-report.json
 ```
 
 `npm run demo` generates a local round-trip under `demo/out`: source IR, original PPTX, imported IR, HTML runtime, rebuilt PPTX, and conversion report.
-`npm run dev` starts the local product UI for drag-and-drop conversion. Drop a `.pptx` or `.ir.json`, and it returns an HTML preview plus downloadable PPTX, IR, and loss report. The server starts at `http://127.0.0.1:4173/` or the next available port.
-On macOS with Keynote installed, `.key` input and `.key` export are handled through local Keynote automation as a PPTX bridge. macOS may prompt for automation permission the first time.
+`npm run dev` starts the local product UI for drag-and-drop conversion. Drop a `.pptx`, `.key`, or `.ir.json`, and it returns an HTML runtime preview plus downloadable HTML, PPTX, Keynote when available, IR, loss report, and an MP4 render action. The server starts at `http://127.0.0.1:4173/` or the next available port.
+On macOS with Keynote installed, `.key` input and `.key` export are handled through local Keynote automation as a PPTX bridge. If the bridge is unavailable, KeyMorph can inspect native directory-style or ZIP-backed `.key` packages and recover approximate text slides with explicit loss-report warnings. macOS may prompt for automation permission the first time.
+
+## Current conversion coverage
+
+- PPTX animation XML: imports and exports fade effects, visibility set events, and simple motion paths as IR timeline events. Unsupported timing nodes are recorded in the report.
+- HTML runtime: plays a deck-level timeline with global scrubbing, slide stepping, basic keyframes, visibility/property events, and best-effort transitions/morph-style numeric interpolation.
+- Video export: renders the HTML runtime through Playwright and encodes with `ffmpeg` when both are available. Missing local dependencies are reported in the UI instead of failing silently.
 
 This checkpoint intentionally has no external npm runtime dependencies. It uses Node 24's built-in TypeScript transform.
 

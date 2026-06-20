@@ -5,11 +5,17 @@ import { promisify } from "node:util";
 
 import type { DeckIR } from "../ir/index.ts";
 import { parsePptxToIr, exportIrToPptx } from "../pptx/index.ts";
+import { parseNativeKeynoteToIr } from "./native.ts";
+
+export { detectNativeKeynotePackage, parseNativeKeynoteToIr } from "./native.ts";
+export type { NativeKeynoteDetection } from "./native.ts";
 
 const execFileAsync = promisify(execFile);
 
 export interface KeynoteImportOptions {
   exportedPptxPath?: string;
+  preferNative?: boolean;
+  nativeFallback?: boolean;
   workDir?: string;
 }
 
@@ -21,12 +27,33 @@ export async function parseKeynoteToIr(
   keynotePath: string,
   options: KeynoteImportOptions = {}
 ): Promise<DeckIR> {
+  if (options.preferNative) {
+    return parseNativeKeynoteToIr(keynotePath);
+  }
+
   const pptxPath =
     options.exportedPptxPath ??
     path.join(options.workDir ?? path.dirname(keynotePath), `${path.basename(keynotePath, path.extname(keynotePath))}.keynote-bridge.pptx`);
 
   if (!options.exportedPptxPath) {
-    await exportKeynoteToPptx(keynotePath, pptxPath);
+    try {
+      await exportKeynoteToPptx(keynotePath, pptxPath);
+    } catch (error) {
+      if (options.nativeFallback === false) {
+        throw error;
+      }
+      try {
+        const deck = await parseNativeKeynoteToIr(keynotePath);
+        deck.conversion?.messages.unshift({
+          severity: "warning",
+          code: "keynote-bridge-fallback-native",
+          message: `Keynote PPTX bridge failed, so native package probing was used instead. ${errorMessage(error)}`
+        });
+        return deck;
+      } catch {
+        throw error;
+      }
+    }
   }
 
   const deck = await parsePptxToIr(pptxPath);
@@ -123,4 +150,8 @@ async function runAppleScript(script: string): Promise<void> {
 
 function escapeAppleScriptString(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

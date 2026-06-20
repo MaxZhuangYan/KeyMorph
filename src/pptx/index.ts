@@ -1,7 +1,16 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
-import { IR_VERSION, type ConversionReport, type DeckIR, type IRObject, type Slide } from "../ir/index.ts";
+import {
+  IR_VERSION,
+  type AnimationEvent,
+  type ConversionReport,
+  type DeckIR,
+  type DegradedFeature,
+  type IRObject,
+  type Slide,
+  type UnsupportedFeature
+} from "../ir/index.ts";
 
 const EMU_PER_INCH = 914400;
 const WIDE_LAYOUT = { width: 13.333333, height: 7.5 };
@@ -12,7 +21,8 @@ export async function parsePptxToIr(filePath: string): Promise<DeckIR> {
   const presentationXml = getTextEntry(entries, "ppt/presentation.xml");
   const slidePaths = presentationXml ? readSlidePaths(entries, presentationXml) : [];
   const size = presentationXml ? readSlideSize(presentationXml) : { width: 1280, height: 720 };
-  const slides = slidePaths.map((slidePath, index) => parseSlideXml(getTextEntry(entries, slidePath) ?? "", index));
+  const slideResults = slidePaths.map((slidePath, index) => parseSlideXml(getTextEntry(entries, slidePath) ?? "", index, size));
+  const slides = slideResults.map((result) => result.slide);
   const parsedSlides = slides.length
     ? slides
     : [
@@ -42,6 +52,9 @@ export async function parsePptxToIr(filePath: string): Promise<DeckIR> {
           timeline: { durationMs: 2500, events: [], dependencyGraph: { edges: [] } }
         }
       ];
+  const unsupportedFeatures = slideResults.flatMap((result) => result.unsupportedFeatures);
+  const degradedFeatures = slideResults.flatMap((result) => result.degradedFeatures);
+  const animationCount = parsedSlides.reduce((total, slide) => total + (slide.timeline?.events.length ?? 0), 0);
 
   const report: ConversionReport = {
     source: { kind: "pptx", uri: filePath },
@@ -53,26 +66,19 @@ export async function parsePptxToIr(filePath: string): Promise<DeckIR> {
         severity: slidePaths.length ? "info" : "warning",
         code: slidePaths.length ? "pptx-static-import" : "pptx-import-placeholder",
         message: slidePaths.length
-          ? "Extracted static slide text and shape placeholders from PresentationML."
+          ? "Extracted static slide objects and supported timing animations from PresentationML."
           : "The PPTX package was readable, but no slide parts were discovered."
       }
     ],
-    unsupportedFeatures: [
-      {
-        code: "presentationml-animation-extraction",
-        severity: "warning",
-        area: "animation",
-        description: "PowerPoint animation timing nodes are not yet mapped in the static parser.",
-        fallback: "Preserve static visual objects and record animation loss."
-      }
-    ],
-    degradedFeatures: [],
+    unsupportedFeatures,
+    degradedFeatures,
     uncertainMappings: [],
     statistics: {
       slideCount: parsedSlides.length,
       objectCount: parsedSlides.reduce((total, slide) => total + slide.objects.length, 0),
-      animationCount: 0,
-      unsupportedFeatureCount: 1
+      animationCount,
+      unsupportedFeatureCount: unsupportedFeatures.length,
+      degradedFeatureCount: degradedFeatures.length
     },
     metadata: {
       byteLength: data.byteLength
@@ -122,12 +128,20 @@ function createPptxFiles(deck: DeckIR): Map<string, string | Uint8Array> {
   return files;
 }
 
-function parseSlideXml(source: string, index: number): Slide {
+interface ParsedSlide {
+  slide: Slide;
+  unsupportedFeatures: UnsupportedFeature[];
+  degradedFeatures: DegradedFeature[];
+}
+
+function parseSlideXml(source: string, index: number, slideSize: { width: number; height: number }): ParsedSlide {
   const objects: IRObject[] = [];
+  const shapeIdToObjectId = new Map<string, string>();
   const shapeSources = source.match(/<p:sp\b[\s\S]*?<\/p:sp>/g) ?? [];
 
   shapeSources.forEach((shapeXml, objectIndex) => {
     const id = `slide-${index + 1}-object-${objectIndex + 1}`;
+    const sourceShapeId = readShapeSourceId(shapeXml);
     const text = readShapeText(shapeXml);
     const bounds = readShapeBounds(shapeXml, { x: 96 + objectIndex * 28, y: 96 + objectIndex * 28, width: 400, height: 100 });
     if (text) {
@@ -137,6 +151,7 @@ function parseSlideXml(source: string, index: number): Slide {
         name: readShapeName(shapeXml) ?? "Text",
         bounds,
         opacity: 1,
+        metadata: sourceShapeId ? { pptxShapeId: sourceShapeId } : undefined,
         text: {
           plainText: text,
           runs: [{ text, style: { fontFamily: "Arial", fontSize: 28, color: "#111827" } }]
@@ -150,25 +165,36 @@ function parseSlideXml(source: string, index: number): Slide {
         shape: readShapePreset(shapeXml),
         bounds,
         opacity: 1,
+        metadata: sourceShapeId ? { pptxShapeId: sourceShapeId } : undefined,
         style: {
           fill: { type: "solid", color: readShapeFill(shapeXml) ?? "#e2e8f0" },
           stroke: { color: "#94a3b8", width: 1 }
         }
       });
     }
+    if (sourceShapeId && objects.some((object) => object.id === id)) {
+      shapeIdToObjectId.set(sourceShapeId, id);
+    }
   });
 
+  const timing = parseSlideTiming(source, index, slideSize, shapeIdToObjectId);
+  const maxEventEnd = timing.events.reduce((max, event) => Math.max(max, eventStartMs(event) + (event.durationMs ?? 0)), 0);
+
   return {
-    id: `slide-${index + 1}`,
-    index,
-    name: `Slide ${index + 1}`,
-    background: { type: "solid", color: readSlideBackground(source) ?? "#ffffff" },
-    objects,
-    timeline: {
-      durationMs: 2500,
-      events: [],
-      dependencyGraph: { edges: [] }
-    }
+    slide: {
+      id: `slide-${index + 1}`,
+      index,
+      name: `Slide ${index + 1}`,
+      background: { type: "solid", color: readSlideBackground(source) ?? "#ffffff" },
+      objects,
+      timeline: {
+        durationMs: Math.max(2500, Math.ceil(maxEventEnd)),
+        events: timing.events,
+        dependencyGraph: { edges: [] }
+      }
+    },
+    unsupportedFeatures: timing.unsupportedFeatures,
+    degradedFeatures: timing.degradedFeatures
   };
 }
 
@@ -209,6 +235,11 @@ function readShapeName(source: string): string | undefined {
   return match ? unescapeXml(match[1]) : undefined;
 }
 
+function readShapeSourceId(source: string): string | undefined {
+  const match = source.match(/<p:cNvPr\b[^>]*id="([^"]*)"/);
+  return match ? unescapeXml(match[1]) : undefined;
+}
+
 function readShapeBounds(source: string, fallback: { x: number; y: number; width: number; height: number }) {
   const offset = source.match(/<a:off\b[^>]*x="(-?\d+)"[^>]*y="(-?\d+)"/);
   const extent = source.match(/<a:ext\b[^>]*cx="(\d+)"[^>]*cy="(\d+)"/);
@@ -237,6 +268,371 @@ function readShapeFill(source: string): string | undefined {
 function readSlideBackground(source: string): string | undefined {
   const match = source.match(/<p:bg>[\s\S]*?<a:srgbClr\b[^>]*val="([0-9A-Fa-f]{6})"/);
   return match ? `#${match[1]}` : undefined;
+}
+
+interface TimingParseResult {
+  events: AnimationEvent[];
+  unsupportedFeatures: UnsupportedFeature[];
+  degradedFeatures: DegradedFeature[];
+}
+
+function parseSlideTiming(
+  source: string,
+  slideIndex: number,
+  slideSize: { width: number; height: number },
+  shapeIdToObjectId: Map<string, string>
+): TimingParseResult {
+  const timingXml = extractXmlElements(source, "timing")[0];
+  const result: TimingParseResult = { events: [], unsupportedFeatures: [], degradedFeatures: [] };
+  if (!timingXml) return result;
+
+  for (const node of extractXmlElements(timingXml, "animEffect")) {
+    const event = parseFadeEffect(node, slideIndex, result.events.length, shapeIdToObjectId, result.unsupportedFeatures);
+    if (event) result.events.push(event);
+  }
+
+  for (const node of extractXmlElements(timingXml, "set")) {
+    const event = parseVisibilitySet(node, slideIndex, result.events.length, shapeIdToObjectId, result.unsupportedFeatures);
+    if (event) result.events.push(event);
+  }
+
+  for (const node of extractXmlElements(timingXml, "animMotion")) {
+    const event = parseMotionEffect(node, slideIndex, result.events.length, slideSize, shapeIdToObjectId, result.unsupportedFeatures);
+    if (event) result.events.push(event);
+  }
+
+  for (const tag of ["anim", "animClr", "animRot", "animScale", "cmd"]) {
+    for (const _node of extractXmlElements(timingXml, tag)) {
+      result.unsupportedFeatures.push({
+        code: `presentationml-${tag}`,
+        severity: "warning",
+        area: "animation",
+        description: `PowerPoint p:${tag} animation nodes are not mapped to the IR timeline yet.`,
+        sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:${tag}`,
+        fallback: "Preserve the static object and omit this animation."
+      });
+    }
+  }
+
+  if (/<p:bldLst\b[\s\S]*?<p:bld[APDGr]/.test(timingXml)) {
+    result.degradedFeatures.push({
+      code: "presentationml-build-list",
+      severity: "warning",
+      area: "animation",
+      description: "PowerPoint text/object build-list sequencing is only partially represented by object-level timing events.",
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:bldLst`,
+      fallback: "Import supported object-level effects and preserve static slide content."
+    });
+  }
+
+  if (/<p:cond\b[^>]*delay="indefinite"/.test(timingXml)) {
+    result.degradedFeatures.push({
+      code: "presentationml-trigger-timing",
+      severity: "warning",
+      area: "animation",
+      description: "PowerPoint click/trigger timing is imported as absolute timeline timing in this PPTX slice.",
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing`,
+      fallback: "Preserve supported effects at the beginning of the slide timeline."
+    });
+  }
+
+  result.events.sort((a, b) => eventStartMs(a) - eventStartMs(b));
+  return result;
+}
+
+function parseFadeEffect(
+  node: string,
+  slideIndex: number,
+  eventIndex: number,
+  shapeIdToObjectId: Map<string, string>,
+  unsupportedFeatures: UnsupportedFeature[]
+): AnimationEvent | undefined {
+  const attrs = readXmlAttributes(node, "animEffect");
+  const filter = String(attrs.get("filter") ?? "").toLowerCase();
+  if (!filter.includes("fade")) {
+    unsupportedFeatures.push({
+      code: "presentationml-animation-effect",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint animEffect filter "${attrs.get("filter") ?? "unknown"}" is not mapped to IR keyframes.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:animEffect`,
+      fallback: "Preserve the static object and omit this effect."
+    });
+    return undefined;
+  }
+
+  const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
+  if (!targetId) return undefined;
+
+  const transition = String(attrs.get("transition") ?? "in").toLowerCase();
+  const fadesOut = transition === "out";
+  return {
+    id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+    kind: "keyframes",
+    label: fadesOut ? "Fade out" : "Fade in",
+    targetId,
+    start: { type: "absolute", atMs: readTimingDelay(node) },
+    durationMs: readTimingDuration(node, 500),
+    easing: "linear",
+    fill: "both",
+    tracks: [
+      {
+        property: "opacity",
+        keyframes: [
+          { offset: 0, value: fadesOut ? 1 : 0 },
+          { offset: 1, value: fadesOut ? 0 : 1 }
+        ]
+      }
+    ],
+    metadata: { pptxEffect: "fade", pptxTransition: fadesOut ? "out" : "in" }
+  };
+}
+
+function parseVisibilitySet(
+  node: string,
+  slideIndex: number,
+  eventIndex: number,
+  shapeIdToObjectId: Map<string, string>,
+  unsupportedFeatures: UnsupportedFeature[]
+): AnimationEvent | undefined {
+  const attrNames = Array.from(node.matchAll(/<p:attrName>([\s\S]*?)<\/p:attrName>/g)).map((match) => unescapeXml(match[1]));
+  if (!attrNames.some((name) => name.toLowerCase() === "style.visibility")) {
+    unsupportedFeatures.push({
+      code: "presentationml-set-animation",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint set animation attributes "${attrNames.join(", ") || "unknown"}" are not mapped to IR visibility events.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:set`,
+      fallback: "Preserve the static object and omit this set animation."
+    });
+    return undefined;
+  }
+
+  const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
+  if (!targetId) return undefined;
+
+  const visible = readVisibilityValue(node);
+  if (visible === undefined) {
+    unsupportedFeatures.push({
+      code: "presentationml-visibility-value",
+      severity: "warning",
+      area: "animation",
+      description: "PowerPoint visibility set animation has an unsupported target value.",
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:set/p:to`,
+      fallback: "Preserve the static object and omit this visibility toggle."
+    });
+    return undefined;
+  }
+
+  return {
+    id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+    kind: "visibility",
+    label: visible ? "Appear" : "Disappear",
+    targetId,
+    start: { type: "absolute", atMs: readTimingDelay(node) },
+    durationMs: 0,
+    fill: "both",
+    visible,
+    metadata: { pptxEffect: "visibility" }
+  };
+}
+
+function parseMotionEffect(
+  node: string,
+  slideIndex: number,
+  eventIndex: number,
+  slideSize: { width: number; height: number },
+  shapeIdToObjectId: Map<string, string>,
+  unsupportedFeatures: UnsupportedFeature[]
+): AnimationEvent | undefined {
+  const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
+  if (!targetId) return undefined;
+
+  const attrs = readXmlAttributes(node, "animMotion");
+  const delta =
+    parseMotionPath(attrs.get("path"), slideSize) ??
+    parseMotionBy(attrs.get("by"), slideSize) ??
+    parseMotionFromTo(attrs.get("from"), attrs.get("to"), slideSize);
+  if (!delta) {
+    unsupportedFeatures.push({
+      code: "presentationml-motion-path",
+      severity: "warning",
+      area: "animation",
+      description: "PowerPoint motion path is not a simple line/by/from-to path that can be mapped to IR translate keyframes.",
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:animMotion`,
+      fallback: "Preserve the static object and omit this motion path."
+    });
+    return undefined;
+  }
+
+  const tracks = [];
+  if (delta.x !== 0) {
+    tracks.push({
+      property: "transform.translateX",
+      keyframes: [
+        { offset: 0, value: 0 },
+        { offset: 1, value: delta.x }
+      ]
+    });
+  }
+  if (delta.y !== 0) {
+    tracks.push({
+      property: "transform.translateY",
+      keyframes: [
+        { offset: 0, value: 0 },
+        { offset: 1, value: delta.y }
+      ]
+    });
+  }
+  if (tracks.length === 0) return undefined;
+
+  return {
+    id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+    kind: "keyframes",
+    label: "Motion path",
+    targetId,
+    start: { type: "absolute", atMs: readTimingDelay(node) },
+    durationMs: readTimingDuration(node, 500),
+    easing: "linear",
+    fill: "both",
+    tracks,
+    metadata: { pptxEffect: "motionPath" }
+  };
+}
+
+function resolveTimingTarget(
+  node: string,
+  slideIndex: number,
+  shapeIdToObjectId: Map<string, string>,
+  unsupportedFeatures: UnsupportedFeature[]
+): string | undefined {
+  const shapeId = node.match(/<p:spTgt\b[^>]*spid="([^"]+)"/)?.[1];
+  if (!shapeId) {
+    unsupportedFeatures.push({
+      code: "presentationml-animation-target",
+      severity: "warning",
+      area: "animation",
+      description: "PowerPoint timing node does not target a slide shape.",
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing`,
+      fallback: "Preserve the static object and omit this animation."
+    });
+    return undefined;
+  }
+
+  const targetId = shapeIdToObjectId.get(shapeId);
+  if (!targetId) {
+    unsupportedFeatures.push({
+      code: "presentationml-animation-target",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint timing node targets shape id "${shapeId}", which was not imported as an IR object.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing`,
+      fallback: "Preserve the static object and omit this animation."
+    });
+  }
+  return targetId;
+}
+
+function readTimingDuration(node: string, fallbackMs: number): number {
+  const cBhvr = extractXmlElements(node, "cBhvr")[0] ?? node;
+  const cTnAttrs = readXmlAttributes(cBhvr, "cTn");
+  return parseTimingMs(cTnAttrs.get("dur"), fallbackMs);
+}
+
+function readTimingDelay(node: string): number {
+  const match = node.match(/<p:cond\b[^>]*delay="([^"]+)"/);
+  return parseTimingMs(match?.[1], 0);
+}
+
+function readVisibilityValue(node: string): boolean | undefined {
+  const strValue = node.match(/<p:strVal\b[^>]*val="([^"]+)"/)?.[1]?.toLowerCase();
+  if (strValue === "visible" || strValue === "true" || strValue === "1") return true;
+  if (strValue === "hidden" || strValue === "false" || strValue === "0") return false;
+  const boolValue = node.match(/<p:boolVal\b[^>]*val="([^"]+)"/)?.[1]?.toLowerCase();
+  if (boolValue === "true" || boolValue === "1") return true;
+  if (boolValue === "false" || boolValue === "0") return false;
+  return undefined;
+}
+
+function parseMotionPath(path: string | undefined, slideSize: { width: number; height: number }): { x: number; y: number } | undefined {
+  if (!path) return undefined;
+  const points = Array.from(path.matchAll(/[ML]\s*(-?\d*\.?\d+)[,\s]+(-?\d*\.?\d+)/gi)).map((match) => ({
+    x: Number(match[1]),
+    y: Number(match[2])
+  }));
+  if (points.length < 2 || points.some((point) => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return undefined;
+  const first = points[0];
+  const last = points[points.length - 1];
+  return {
+    x: motionCoordinateToPx(last.x - first.x, slideSize.width),
+    y: motionCoordinateToPx(last.y - first.y, slideSize.height)
+  };
+}
+
+function parseMotionBy(value: string | undefined, slideSize: { width: number; height: number }): { x: number; y: number } | undefined {
+  const point = parseMotionPoint(value);
+  if (!point) return undefined;
+  return {
+    x: motionCoordinateToPx(point.x, slideSize.width),
+    y: motionCoordinateToPx(point.y, slideSize.height)
+  };
+}
+
+function parseMotionFromTo(
+  from: string | undefined,
+  to: string | undefined,
+  slideSize: { width: number; height: number }
+): { x: number; y: number } | undefined {
+  const fromPoint = parseMotionPoint(from);
+  const toPoint = parseMotionPoint(to);
+  if (!fromPoint || !toPoint) return undefined;
+  return {
+    x: motionCoordinateToPx(toPoint.x - fromPoint.x, slideSize.width),
+    y: motionCoordinateToPx(toPoint.y - fromPoint.y, slideSize.height)
+  };
+}
+
+function parseMotionPoint(value: string | undefined): { x: number; y: number } | undefined {
+  if (!value) return undefined;
+  const parts = value
+    .trim()
+    .split(/[,\s]+/)
+    .filter(Boolean)
+    .map(Number);
+  if (parts.length < 2 || !Number.isFinite(parts[0]) || !Number.isFinite(parts[1])) return undefined;
+  return { x: parts[0], y: parts[1] };
+}
+
+function motionCoordinateToPx(value: number, slidePixels: number): number {
+  const px = Math.abs(value) <= 1.5 ? value * slidePixels : value;
+  return Math.round(px * 1000) / 1000;
+}
+
+function parseTimingMs(value: string | undefined, fallbackMs: number): number {
+  if (!value || value === "indefinite") return fallbackMs;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, numeric) : fallbackMs;
+}
+
+function eventStartMs(event: AnimationEvent): number {
+  if (event.start?.type === "absolute") return event.start.atMs;
+  if (event.start && "offsetMs" in event.start && typeof event.start.offsetMs === "number") return event.start.offsetMs;
+  return event.delayMs ?? 0;
+}
+
+function extractXmlElements(source: string, localName: string): string[] {
+  const elementPattern = new RegExp(`<p:${localName}\\b[\\s\\S]*?<\\/p:${localName}>`, "g");
+  return source.match(elementPattern) ?? [];
+}
+
+function readXmlAttributes(source: string, localName: string): Map<string, string> {
+  const attrs = new Map<string, string>();
+  const match = source.match(new RegExp(`<p:${localName}\\b([^>]*)>`));
+  if (!match) return attrs;
+  for (const attr of match[1].matchAll(/([A-Za-z_:][\w:.-]*)="([^"]*)"/g)) {
+    attrs.set(attr[1], unescapeXml(attr[2]));
+  }
+  return attrs;
 }
 
 function presentationXml(deck: DeckIR): string {
@@ -268,6 +664,7 @@ function presentationRels(slideCount: number): string {
 function slideXml(deck: DeckIR, slide: Slide): string {
   const bg = solidFill(slide.background) ?? "#ffffff";
   const shapes = slide.objects.map((object, index) => objectToShape(deck, object, index + 2)).join("");
+  const timing = timingXml(deck, slide);
   return xml(`\
 <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
   <p:cSld>
@@ -288,7 +685,178 @@ function slideXml(deck: DeckIR, slide: Slide): string {
     </p:spTree>
   </p:cSld>
   <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+  ${timing}
 </p:sld>`);
+}
+
+function timingXml(deck: DeckIR, slide: Slide): string {
+  const shapeIds = new Map(slide.objects.map((object, index) => [object.id, String(index + 2)]));
+  const entries: string[] = [];
+  let nextNodeIndex = 0;
+  for (const event of slide.timeline?.events ?? []) {
+    const nodes = eventToTimingNodes(deck, slide, event, nextNodeIndex, shapeIds);
+    entries.push(...nodes);
+    nextNodeIndex += nodes.length;
+  }
+  if (entries.length === 0) return "";
+
+  const mainSequence = entries.join("");
+  return `\
+<p:timing>
+  <p:tnLst>
+    <p:par>
+      <p:cTn id="1" dur="indefinite" restart="never" nodeType="tmRoot">
+        <p:childTnLst>
+          <p:seq concurrent="1" nextAc="seek">
+            <p:cTn id="2" dur="indefinite" nodeType="mainSeq">
+              <p:childTnLst>
+                ${mainSequence}
+              </p:childTnLst>
+            </p:cTn>
+          </p:seq>
+        </p:childTnLst>
+      </p:cTn>
+    </p:par>
+  </p:tnLst>
+</p:timing>`;
+}
+
+function eventToTimingNodes(
+  deck: DeckIR,
+  slide: Slide,
+  event: AnimationEvent,
+  startIndex: number,
+  shapeIds: Map<string, string>
+): string[] {
+  if (event.kind === "visibility") {
+    const shapeId = shapeIds.get(event.targetId);
+    if (!shapeId) return [];
+    return [timingWrapper(startIndex, visibilitySetXml(startIndex, shapeId, event.visible, eventStartMs(event)))];
+  }
+
+  if (event.kind !== "keyframes") return [];
+  const shapeId = shapeIds.get(event.targetId);
+  if (!shapeId) return [];
+
+  const timingNodes: string[] = [];
+  const opacity = opacityFade(event);
+  if (opacity) {
+    const nodeIndex = startIndex + timingNodes.length;
+    timingNodes.push(timingWrapper(nodeIndex, fadeEffectXml(nodeIndex, shapeId, opacity, event.durationMs ?? 500, eventStartMs(event))));
+  }
+
+  const motion = motionOffsets(deck, slide, event);
+  if (motion && (motion.fromX !== motion.toX || motion.fromY !== motion.toY)) {
+    const nodeIndex = startIndex + timingNodes.length;
+    timingNodes.push(timingWrapper(nodeIndex, motionPathXml(deck, nodeIndex, shapeId, motion, event.durationMs ?? 500, eventStartMs(event))));
+  }
+
+  return timingNodes;
+}
+
+function timingWrapper(index: number, childXml: string): string {
+  const parId = 3 + index * 3;
+  return `\
+<p:par>
+  <p:cTn id="${parId}" fill="hold">
+    <p:childTnLst>
+      ${childXml}
+    </p:childTnLst>
+  </p:cTn>
+</p:par>`;
+}
+
+function fadeEffectXml(index: number, shapeId: string, fade: "in" | "out", durationMs: number, delayMs: number): string {
+  return `\
+<p:animEffect transition="${fade}" filter="fade">
+  <p:cBhvr>
+    <p:cTn id="${4 + index * 3}" dur="${Math.max(1, Math.round(durationMs))}" fill="hold">
+      <p:stCondLst><p:cond delay="${Math.max(0, Math.round(delayMs))}"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="${shapeId}"/></p:tgtEl>
+  </p:cBhvr>
+</p:animEffect>`;
+}
+
+function visibilitySetXml(index: number, shapeId: string, visible: boolean, delayMs: number): string {
+  return `\
+<p:set>
+  <p:cBhvr>
+    <p:cTn id="${4 + index * 3}" dur="1" fill="hold">
+      <p:stCondLst><p:cond delay="${Math.max(0, Math.round(delayMs))}"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="${shapeId}"/></p:tgtEl>
+    <p:attrNameLst><p:attrName>style.visibility</p:attrName></p:attrNameLst>
+  </p:cBhvr>
+  <p:to><p:strVal val="${visible ? "visible" : "hidden"}"/></p:to>
+</p:set>`;
+}
+
+function motionPathXml(
+  deck: DeckIR,
+  index: number,
+  shapeId: string,
+  motion: { fromX: number; fromY: number; toX: number; toY: number },
+  durationMs: number,
+  delayMs: number
+): string {
+  const fromX = formatMotionCoordinate(motion.fromX / deck.deck.size.width);
+  const fromY = formatMotionCoordinate(motion.fromY / deck.deck.size.height);
+  const toX = formatMotionCoordinate(motion.toX / deck.deck.size.width);
+  const toY = formatMotionCoordinate(motion.toY / deck.deck.size.height);
+  return `\
+<p:animMotion origin="layout" path="M ${fromX} ${fromY} L ${toX} ${toY} E" pathEditMode="relative">
+  <p:cBhvr>
+    <p:cTn id="${4 + index * 3}" dur="${Math.max(1, Math.round(durationMs))}" fill="hold">
+      <p:stCondLst><p:cond delay="${Math.max(0, Math.round(delayMs))}"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="${shapeId}"/></p:tgtEl>
+  </p:cBhvr>
+</p:animMotion>`;
+}
+
+function opacityFade(event: AnimationEvent): "in" | "out" | undefined {
+  if (event.kind !== "keyframes") return undefined;
+  const track = event.tracks.find((candidate) => candidate.property === "opacity");
+  const values = twoPointNumericValues(track?.keyframes);
+  if (!values) return undefined;
+  if (values.from === 0 && values.to === 1) return "in";
+  if (values.from === 1 && values.to === 0) return "out";
+  return undefined;
+}
+
+function motionOffsets(deck: DeckIR, slide: Slide, event: AnimationEvent): { fromX: number; fromY: number; toX: number; toY: number } | undefined {
+  if (event.kind !== "keyframes") return undefined;
+  const object = slide.objects.find((candidate) => candidate.id === event.targetId);
+  const translateX = twoPointNumericValues(event.tracks.find((track) => track.property === "transform.translateX")?.keyframes);
+  const translateY = twoPointNumericValues(event.tracks.find((track) => track.property === "transform.translateY")?.keyframes);
+  const boundsX = twoPointNumericValues(event.tracks.find((track) => track.property === "bounds.x")?.keyframes);
+  const boundsY = twoPointNumericValues(event.tracks.find((track) => track.property === "bounds.y")?.keyframes);
+  const fromX = translateX ? translateX.from : boundsX ? boundsX.from - (object?.bounds?.x ?? 0) : 0;
+  const toX = translateX ? translateX.to : boundsX ? boundsX.to - (object?.bounds?.x ?? 0) : 0;
+  const fromY = translateY ? translateY.from : boundsY ? boundsY.from - (object?.bounds?.y ?? 0) : 0;
+  const toY = translateY ? translateY.to : boundsY ? boundsY.to - (object?.bounds?.y ?? 0) : 0;
+  if (fromX === toX && fromY === toY) return undefined;
+  if (!Number.isFinite(deck.deck.size.width) || !Number.isFinite(deck.deck.size.height)) return undefined;
+  const deltaX = toX - fromX;
+  const deltaY = toY - fromY;
+  if (object?.bounds && Math.abs(deltaX) > deck.deck.size.width * 2 && Math.abs(deltaY) > deck.deck.size.height * 2) return undefined;
+  return { fromX, fromY, toX, toY };
+}
+
+function twoPointNumericValues(keyframes: { offset: number; value: unknown }[] | undefined): { from: number; to: number } | undefined {
+  if (!keyframes || keyframes.length < 2) return undefined;
+  const first = keyframes[0];
+  const last = keyframes[keyframes.length - 1];
+  if (first.offset !== 0 || last.offset !== 1) return undefined;
+  if (typeof first.value !== "number" || typeof last.value !== "number") return undefined;
+  return { from: first.value, to: last.value };
+}
+
+function formatMotionCoordinate(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  const rounded = Math.round(value * 1000000) / 1000000;
+  return Object.is(rounded, -0) ? "0" : String(rounded);
 }
 
 function objectToShape(deck: DeckIR, object: IRObject, id: number): string {
