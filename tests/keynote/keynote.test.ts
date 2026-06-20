@@ -636,6 +636,54 @@ describe("Keynote bridge", () => {
     assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationUnresolvedCount, 0);
   });
 
+  test("preserves character-level dissolve build semantics when degrading to object opacity", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-character-dissolve-"));
+    const keyPath = path.join(dir, "character-dissolve.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(1200, [{ type: 2001, payload: nativeTextContentPayload("逐字溶解") }]),
+        iwaArchiveRecord(1100, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1200,
+              bounds: { x: 240, y: 180, width: 420, height: 96 }
+            })
+          }
+        ]),
+        iwaArchiveRecord(1300, [
+          {
+            type: 8,
+            payload: nativeBuildPayload({
+              targetId: 1100,
+              direction: "In",
+              effect: "apple:dissolve character",
+              durationSeconds: 0.75
+            })
+          }
+        ]),
+        iwaArchiveRecord(1301, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 1300, durationSeconds: 0.75 }) }])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.metadata?.nativeExtraction === "typed-iwa-text-drawable");
+    assert.equal(object?.type, "text");
+    const event = deck.deck.slides[0]?.timeline?.events[0];
+    assert.equal(event?.kind, "keyframes");
+    assert.equal(event?.targetId, object?.id);
+    assert.equal(event?.metadata?.nativeBuildFallback, "dissolve-in");
+    assert.equal(event?.metadata?.nativeBuildGranularity, "character");
+    assert.match(String(event?.metadata?.nativeBuildDegradation), /Per-character dissolve/);
+    assert.equal(deck.conversion?.degradedFeatures?.some((feature) => feature.code === "keynote-native-character-build-degraded"), true);
+    assert.equal(deck.conversion?.metadata?.recoveredCharacterBuildAnimationCount, 1);
+  });
+
   test("starts native Keynote builds together when timing startsWithPrevious is set", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-timing-groups-"));
     const keyPath = path.join(dir, "timing.key");

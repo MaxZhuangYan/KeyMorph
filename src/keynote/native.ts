@@ -487,6 +487,10 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
     (total, slide) => total + (slide.timeline?.events ?? []).filter((event) => event.metadata?.nativeSource === "keynote-iwa-build").length,
     0
   );
+  const recoveredCharacterBuildAnimationCount = slides.reduce(
+    (total, slide) => total + (slide.timeline?.events ?? []).filter((event) => event.metadata?.nativeBuildGranularity === "character").length,
+    0
+  );
   const unresolvedNativeBuildRecordCount = slides.reduce(
     (total, slide) => total + Number(slide.metadata?.nativeBuildAnimationUnresolvedCount ?? 0),
     0
@@ -519,6 +523,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       buildTimingRecordCount: totalNativeBuildTimingRecordCount,
       recoveredBuildRecordCount: recoveredNativeBuildRecordCount,
       recoveredBuildAnimationCount: recoveredNativeBuildAnimationCount,
+      recoveredCharacterBuildAnimationCount,
       unresolvedBuildRecordCount: unresolvedNativeBuildRecordCount,
       protobufFieldCount: totalProtobufFieldCount,
       nestedMessageCount: totalNestedMessageCount,
@@ -613,6 +618,18 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
             description:
               `Decoded ${totalNativeBuildRecordCount} Keynote build record(s), but ${unresolvedNativeBuildRecordCount} could not be attached to a recovered IR object target.`,
             fallback: "Preserve build/timing evidence in slide metadata and recover only effects whose target archive id maps to a known object."
+          }
+        ]
+      : []),
+    ...(recoveredCharacterBuildAnimationCount > 0
+      ? [
+          {
+            code: "keynote-native-character-build-degraded",
+            severity: "warning" as const,
+            area: "animation" as const,
+            description:
+              `Recovered ${recoveredCharacterBuildAnimationCount} character-level Keynote build event(s), but the current IR runtime approximates them at object level while preserving character granularity metadata.`,
+            fallback: "Preserve nativeBuildGranularity=character and upgrade the runtime to grapheme-level split text playback."
           }
         ]
       : []),
@@ -886,6 +903,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         totalNativeBuildTimingRecordCount,
         recoveredNativeBuildRecordCount,
         recoveredNativeBuildAnimationCount,
+        recoveredCharacterBuildAnimationCount,
         unresolvedNativeBuildRecordCount,
         slideOrderEvidence: slideOrderEvidence
           ? {
@@ -2506,6 +2524,11 @@ function nativeDissolveBuildEventFromEvidence(
     tracks: [twoPointTrack("opacity", from, to)],
     metadata: {
       ...nativeBuildEventMetadata(build, timing, resolution, `dissolve-${direction}`),
+      ...(nativeBuildGranularity(build.effect)
+        ? {
+            nativeBuildGranularity: nativeBuildGranularity(build.effect)!
+          }
+        : {}),
       nativeBuildDegradation: build.effect && /character/i.test(build.effect) ? "Per-character dissolve is approximated as object-level opacity." : "Dissolve is approximated as object-level opacity."
     }
   };
@@ -2689,6 +2712,15 @@ function nativeBuildEventMetadata(
     ...(timing?.startsWithPrevious !== undefined ? { nativeBuildStartsWithPrevious: timing.startsWithPrevious } : {}),
     ...(timing?.afterPrevious !== undefined ? { nativeBuildAfterPrevious: timing.afterPrevious } : {})
   };
+}
+
+function nativeBuildGranularity(effect: string | undefined): "character" | "word" | "line" | "object" | undefined {
+  const normalized = effect?.toLowerCase() ?? "";
+  if (/\bcharacter\b/.test(normalized)) return "character";
+  if (/\bword\b/.test(normalized)) return "word";
+  if (/\bline\b/.test(normalized)) return "line";
+  if (normalized) return "object";
+  return undefined;
 }
 
 function normalizeNativeBuildDirection(direction: string | undefined, effect: string | undefined): "in" | "out" | "action" | undefined {
