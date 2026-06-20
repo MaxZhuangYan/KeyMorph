@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 
 import { createDemoDeck } from "../src/demo/createDemoDeck.ts";
 import { parsePptxToIr, exportIrToPptx } from "../src/pptx/index.ts";
+import { exportIrToKeynote, parseKeynoteToIr } from "../src/keynote/index.ts";
 import { createLossReport, scoreConversion } from "../src/report/index.ts";
 import { renderHtmlDocument } from "../src/runtime/index.ts";
 
@@ -67,11 +68,13 @@ async function handleConvert(request, response) {
   const importedIrPath = path.join(jobDir, "deck.ir.json");
   const htmlPath = path.join(jobDir, "runtime.html");
   const pptxPath = path.join(jobDir, "rebuilt.pptx");
+  const keynotePath = path.join(jobDir, "rebuilt.key");
   const reportPath = path.join(jobDir, "loss-report.json");
 
   await writeJson(importedIrPath, deck);
   await writeFile(htmlPath, renderHtmlDocument(deck), "utf8");
   await exportIrToPptx(deck, pptxPath);
+  const keyExport = await tryExportKeynote(deck, keynotePath, path.join(jobDir, "rebuilt.key-bridge.pptx"));
   await writeJson(reportPath, createLossReport(deck.conversion ?? { status: "success", messages: [] }));
 
   const report = createLossReport(deck.conversion ?? { status: "success", messages: [] });
@@ -92,8 +95,11 @@ async function handleConvert(request, response) {
       downloads: {
         ir: `/demo/out/jobs/${jobId}/deck.ir.json`,
         pptx: `/demo/out/jobs/${jobId}/rebuilt.pptx`,
+        key: keyExport.available ? `/demo/out/jobs/${jobId}/rebuilt.key` : null,
         report: `/demo/out/jobs/${jobId}/loss-report.json`
-      }
+      },
+      keynoteAvailable: keyExport.available,
+      keynoteMessage: keyExport.message
     }),
     "application/json; charset=utf-8"
   );
@@ -131,9 +137,22 @@ async function inputToIr(sourcePath, fileName, data) {
     return JSON.parse(new TextDecoder().decode(data));
   }
   if (lowerName.endsWith(".key")) {
-    throw new Error("Native .key import needs a Keynote-exported PPTX bridge in this MVP. Export the Keynote deck as PPTX and drop that file here.");
+    return parseKeynoteToIr(sourcePath, { workDir: path.dirname(sourcePath) });
   }
   throw new Error("Unsupported file type. Drop a .pptx or .ir.json file.");
+}
+
+async function tryExportKeynote(deck, keynotePath, intermediatePptxPath) {
+  try {
+    await exportIrToKeynote(deck, keynotePath, { intermediatePptxPath });
+    return { available: true, message: "Keynote file generated." };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      available: false,
+      message: `Keynote export unavailable: ${message}`
+    };
+  }
 }
 
 async function readUpload(request) {
@@ -303,7 +322,11 @@ function renderAppHtml() {
         ['Uncertain mappings', result.uncertainMappingCount]
       ].map(([label, value]) => '<div class="metric"><span>' + label + '</span><strong>' + value + '</strong></div>').join('');
       downloadsEl.hidden = false;
-      downloadsEl.innerHTML = '<a class="download" href="' + result.downloads.pptx + '">Download PPTX</a><a class="download" href="' + result.downloads.ir + '">Download IR</a><a class="download" href="' + result.downloads.report + '">Download report</a>';
+      const keyLink = result.downloads.key ? '<a class="download" href="' + result.downloads.key + '">Download Keynote</a>' : '';
+      downloadsEl.innerHTML = '<a class="download" href="' + result.downloads.pptx + '">Download PPTX</a>' + keyLink + '<a class="download" href="' + result.downloads.ir + '">Download IR</a><a class="download" href="' + result.downloads.report + '">Download report</a>';
+      if (!result.keynoteAvailable && result.keynoteMessage) {
+        downloadsEl.innerHTML += '<div class="status">' + result.keynoteMessage + '</div>';
+      }
       previewPane.className = '';
       previewPane.innerHTML = '<iframe title="KeyMorph runtime preview" src="' + result.previewUrl + '"></iframe>';
       previewTitle.textContent = result.sourceName;

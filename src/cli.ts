@@ -6,6 +6,7 @@ import { createDemoDeck } from "./demo/createDemoDeck.ts";
 import { renderHtmlDocument } from "./runtime/index.ts";
 import { createLossReport, scoreConversion } from "./report/index.ts";
 import { exportIrToPptx, parsePptxToIr } from "./pptx/index.ts";
+import { exportIrToKeynote, parseKeynoteToIr } from "./keynote/index.ts";
 import { exportIrToVideo } from "./video/index.ts";
 import type { DeckIR } from "./ir/index.ts";
 
@@ -61,6 +62,11 @@ async function main(): Promise<void> {
       await writeJson(output, await parsePptxToIr(input));
       return;
     }
+    case "key-to-ir": {
+      if (!input || !output) throw new Error("Usage: key-to-ir <input.key> <output.ir.json>");
+      await writeJson(output, await parseKeynoteToIr(input, { workDir: path.dirname(path.resolve(output)) }));
+      return;
+    }
     case "ir-to-html": {
       if (!input || !output) throw new Error("Usage: ir-to-html <input.ir.json> <output.html>");
       const deck = await readJson<DeckIR>(input);
@@ -71,6 +77,11 @@ async function main(): Promise<void> {
     case "ir-to-pptx": {
       if (!input || !output) throw new Error("Usage: ir-to-pptx <input.ir.json> <output.pptx>");
       await exportIrToPptx(await readJson<DeckIR>(input), output);
+      return;
+    }
+    case "ir-to-key": {
+      if (!input || !output) throw new Error("Usage: ir-to-key <input.ir.json> <output.key>");
+      await exportIrToKeynote(await readJson<DeckIR>(input), output);
       return;
     }
     case "ir-to-video": {
@@ -86,7 +97,7 @@ async function main(): Promise<void> {
     }
     default:
       throw new Error(
-        "Usage: keymorph <demo|pptx-to-ir|ir-to-html|ir-to-pptx|ir-to-video|ir-report> [input] [output]"
+        "Usage: keymorph <demo|pptx-to-ir|key-to-ir|ir-to-html|ir-to-pptx|ir-to-key|ir-to-video|ir-report> [input] [output]"
       );
   }
 }

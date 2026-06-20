@@ -10,7 +10,9 @@
     "dev": "node --experimental-transform-types scripts/dev.mjs",
     "demo": "node --experimental-transform-types src/cli.ts demo",
     "pptx:to-ir": "node --experimental-transform-types src/cli.ts pptx-to-ir",
+    "key:to-ir": "node --experimental-transform-types src/cli.ts key-to-ir",
     "ir:to-pptx": "node --experimental-transform-types src/cli.ts ir-to-pptx",
+    "ir:to-key": "node --experimental-transform-types src/cli.ts ir-to-key",
     "ir:to-html": "node --experimental-transform-types src/cli.ts ir-to-html",
     "ir:to-video": "node --experimental-transform-types src/cli.ts ir-to-video",
     "ir:report": "node --experimental-transform-types src/cli.ts ir-report"

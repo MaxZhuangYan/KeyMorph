@@ -32,6 +32,7 @@ npm run ir:report -- demo/out/imported.ir.json demo/out/conversion-report.json
 
 `npm run demo` generates a local round-trip under `demo/out`: source IR, original PPTX, imported IR, HTML runtime, rebuilt PPTX, and conversion report.
 `npm run dev` starts the local product UI for drag-and-drop conversion. Drop a `.pptx` or `.ir.json`, and it returns an HTML preview plus downloadable PPTX, IR, and loss report. The server starts at `http://127.0.0.1:4173/` or the next available port.
+On macOS with Keynote installed, `.key` input and `.key` export are handled through local Keynote automation as a PPTX bridge. macOS may prompt for automation permission the first time.
 
 This checkpoint intentionally has no external npm runtime dependencies. It uses Node 24's built-in TypeScript transform.
 
