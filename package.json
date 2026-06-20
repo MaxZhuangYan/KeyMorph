@@ -1,0 +1,19 @@
+{
+  "name": "keymorph",
+  "version": "0.1.0",
+  "description": "Local-first slide deck conversion pipeline with a shared animation IR and HTML runtime.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "node --experimental-transform-types scripts/check.mjs",
+    "test": "node --experimental-transform-types --test tests/**/*.test.ts",
+    "demo": "node --experimental-transform-types src/cli.ts demo",
+    "pptx:to-ir": "node --experimental-transform-types src/cli.ts pptx-to-ir",
+    "ir:to-pptx": "node --experimental-transform-types src/cli.ts ir-to-pptx",
+    "ir:to-html": "node --experimental-transform-types src/cli.ts ir-to-html",
+    "ir:to-video": "node --experimental-transform-types src/cli.ts ir-to-video"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
