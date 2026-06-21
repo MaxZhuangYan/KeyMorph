@@ -16,6 +16,7 @@ import type {
   Slide,
   SlideTransition,
   Stroke,
+  TextContent,
   TextObject,
   Transform2D
 } from "../ir/index.ts";
@@ -1992,11 +1993,60 @@ function renderObjectMarkup(object: IRObject, deck?: DeckIR): string {
 function renderTextObjectContent(object: TextObject | (ShapeObject & TextObject), deck?: DeckIR): string {
   const text = textContent(object);
   if (!hasCharacterBuildEvent(object.id, deck)) {
-    return escapeHtml(text);
+    return renderRichTextContent(object);
   }
   return splitGraphemes(text)
     .map((char, index) => `<span class="km-text-char" data-char-index="${index}">${escapeHtml(char)}</span>`)
     .join("");
+}
+
+function renderRichTextContent(object: TextObject | (ShapeObject & TextObject)): string {
+  const text = "text" in object ? object.text : undefined;
+  if (!text) {
+    return "";
+  }
+  if (text.paragraphs && text.paragraphs.length > 0) {
+    return text.paragraphs.map((paragraph) => renderTextParagraph(paragraph)).join("");
+  }
+  if (text.runs && text.runs.length > 0) {
+    return text.runs.map((run) => renderTextRun(run)).join("");
+  }
+  return escapeHtml(text.plainText ?? "");
+}
+
+function renderTextParagraph(paragraph: NonNullable<TextContent["paragraphs"]>[number]): string {
+  const style = [
+    paragraph.alignment ? `text-align:${paragraph.alignment}` : "",
+    paragraph.bullet?.level !== undefined ? `padding-left:${Math.max(0, paragraph.bullet.level) * 1.4}em` : ""
+  ]
+    .filter(Boolean)
+    .join(";");
+  const marker = paragraph.bullet ? `<span class="km-text-bullet">${escapeHtml(paragraph.bullet.marker ?? "•")}</span>` : "";
+  const runs = paragraph.runs.map((run) => renderTextRun(run)).join("");
+  return `<div class="km-text-paragraph"${style ? ` style="${style}"` : ""}>${marker}${runs}</div>`;
+}
+
+function renderTextRun(run: NonNullable<TextContent["runs"]>[number]): string {
+  const style = textRunStyleCss(run.style);
+  return `<span class="km-text-run"${style ? ` style="${style}"` : ""}>${escapeHtml(run.text)}</span>`;
+}
+
+function textRunStyleCss(style: NonNullable<TextContent["runs"]>[number]["style"]): string {
+  if (!style) {
+    return "";
+  }
+  return [
+    style.fontFamily ? `font-family:${style.fontFamily}` : "",
+    style.fontSize !== undefined ? `font-size:${style.fontSize}px` : "",
+    style.fontWeight !== undefined ? `font-weight:${style.fontWeight}` : "",
+    style.italic ? "font-style:italic" : "",
+    style.underline ? "text-decoration:underline" : "",
+    style.color !== undefined ? `color:${colorToCss(style.color) ?? "#111827"}` : "",
+    style.lineHeight !== undefined ? `line-height:${style.lineHeight}` : "",
+    style.letterSpacing !== undefined ? `letter-spacing:${style.letterSpacing}px` : ""
+  ]
+    .filter(Boolean)
+    .join(";");
 }
 
 function hasCharacterBuildEvent(objectId: string, deck?: DeckIR): boolean {

@@ -61,6 +61,19 @@ describe("HTML runtime rendering", () => {
     assert.doesNotMatch(markup, /class="km-text-char"/);
   });
 
+  test("renders rich text runs and paragraph layout", () => {
+    const deck = createRichTextDeck();
+    const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);
+
+    assert.match(markup, /class="km-text-paragraph" style="text-align:center"/);
+    assert.match(markup, /class="km-text-run" style="font-family:Avenir Next;font-size:42px;font-weight:700;color:#ff0055"/);
+    assert.match(markup, />Polis</);
+    assert.match(markup, /font-style:italic/);
+    assert.match(markup, /text-decoration:underline/);
+    assert.match(markup, /class="km-text-bullet"/);
+    assert.match(markup, /padding-left:1\.4em/);
+  });
+
   test("renders shape text with text layout class and styles", () => {
     const deck = createShapeTextDeck();
     const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);
@@ -766,6 +779,51 @@ function createShapeTextDeck(): DeckIR {
                   {
                     text: "First\nSecond",
                     style: { fontSize: 22, lineHeight: 1.35, color: "#123456" }
+                  }
+                ]
+              }
+            }
+          ],
+          timeline: { durationMs: 1000, events: [] }
+        }
+      ]
+    }
+  };
+}
+
+function createRichTextDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "rich-text",
+      size: { width: 600, height: 320, unit: "px" },
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "rich-title",
+              type: "text",
+              bounds: { x: 40, y: 40, width: 520, height: 160 },
+              text: {
+                paragraphs: [
+                  {
+                    alignment: "center",
+                    runs: [
+                      {
+                        text: "Polis",
+                        style: { fontFamily: "Avenir Next", fontSize: 42, fontWeight: 700, color: "#ff0055" }
+                      },
+                      {
+                        text: " demo",
+                        style: { italic: true, underline: true, color: "#334155" }
+                      }
+                    ]
+                  },
+                  {
+                    alignment: "left",
+                    bullet: { type: "bullet", level: 1, marker: "•" },
+                    runs: [{ text: "Agent society", style: { fontSize: 24, lineHeight: 1.3 } }]
                   }
                 ]
               }
