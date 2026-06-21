@@ -54,6 +54,13 @@ describe("HTML runtime rendering", () => {
     assert.match(renderHtmlDocument(deck), /applyCharacterTextState/);
   });
 
+  test("does not split non-dissolve character metadata into grapheme spans", () => {
+    const deck = createCharacterBuildDeck("blur-in");
+    const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);
+
+    assert.doesNotMatch(markup, /class="km-text-char"/);
+  });
+
   test("converts keyframe event tracks to CSS frames", () => {
     const event = createDemoDeck().deck.slides[0].timeline?.events[0];
 
@@ -602,7 +609,7 @@ function createMorphTransitionDeck(): DeckIR {
   };
 }
 
-function createCharacterBuildDeck(): DeckIR {
+function createCharacterBuildDeck(fallback = "dissolve-in"): DeckIR {
   return {
     irVersion: "keymorph.ir.v1",
     deck: {
@@ -643,6 +650,7 @@ function createCharacterBuildDeck(): DeckIR {
                 ],
                 metadata: {
                   nativeBuildGranularity: "character",
+                  nativeBuildFallback: fallback,
                   nativeBuildDirection: "In"
                 }
               }

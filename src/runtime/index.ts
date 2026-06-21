@@ -5,6 +5,7 @@ import type {
   Easing,
   Fill,
   IRObject,
+  JSONRecord,
   KeyframeAnimationEvent,
   KeyframeTrack,
   MorphProperty,
@@ -701,7 +702,7 @@ function runtimeScript(): string {
   const hasCharacterBuild = (object) => {
     for (const slide of deck.deck.slides || []) {
       for (const event of slide.timeline?.events || []) {
-        if (event.targetId === object.id && event.metadata?.nativeBuildGranularity === "character") return true;
+        if (isCharacterDissolveEvent(event, object.id) && characterOpacityTrack(event)) return true;
       }
     }
     return false;
@@ -1249,6 +1250,12 @@ function runtimeScript(): string {
     }
     return frames[frames.length - 1].value;
   };
+  const isCharacterDissolveEvent = (event, objectId) =>
+    event?.kind === "keyframes" &&
+    event.targetId === objectId &&
+    event.metadata?.nativeBuildGranularity === "character" &&
+    /^dissolve-(in|out)$/.test(String(event.metadata?.nativeBuildFallback || ""));
+  const characterOpacityTrack = (event) => (event.tracks || []).find((track) => normalizeProperty(track.property) === "opacity");
   const stateById = (slide, stateId) => (slide?.states || []).find((item) => item.id === stateId);
   const stateForEndpoint = (endpoint, fallbackSlide, fallbackObjectId) => {
     if (!endpoint) return undefined;
@@ -1348,7 +1355,10 @@ function runtimeScript(): string {
         const progress = eventProgress(event, start, timeMs);
         if (progress === undefined) continue;
         const current = merge(states.get(event.targetId), {});
-        for (const track of event.tracks || []) setProperty(current, track.property, keyframeValue(track, progress));
+        for (const track of event.tracks || []) {
+          if (isCharacterDissolveEvent(event, event.targetId) && normalizeProperty(track.property) === "opacity") continue;
+          setProperty(current, track.property, keyframeValue(track, progress));
+        }
         states.set(event.targetId, current);
       } else if (event.kind === "morph") {
         const start = starts.get(event.id) || 0;
@@ -1405,36 +1415,36 @@ function runtimeScript(): string {
     return states;
   };
   const computeEffectiveSlideObjectStates = (slide, timeMs) => applyEffectiveGroupStates(slide?.objects || [], computeSlideObjectStates(slide, timeMs));
-  const characterOpacityAt = (event, index, count, timeMs) => {
+  const characterOpacityAt = (event, index, count, timeMs, starts) => {
+    const track = characterOpacityTrack(event);
+    if (!track) return undefined;
     const duration = Math.max(1, Number(event.durationMs || 1));
-    const start = event.start?.type === "absolute" ? Number(event.start.atMs || 0) : Number(event.delayMs || 0);
+    const start = starts?.get(event.id) ?? (event.start?.type === "absolute" ? Number(event.start.atMs || 0) : Number(event.delayMs || 0));
     const local = Number(timeMs || 0) - start;
-    const from = String(event.metadata?.nativeBuildDirection || "").toLowerCase() === "out" ? 1 : 0;
-    const to = from === 1 ? 0 : 1;
-    if (local <= 0) return event.fill === "backwards" || event.fill === "both" ? from : undefined;
-    if (local >= duration) return event.fill === "forwards" || event.fill === "both" ? to : undefined;
+    if (local <= 0) return event.fill === "backwards" || event.fill === "both" ? keyframeValue(track, 0) : undefined;
+    if (local >= duration) return event.fill === "forwards" || event.fill === "both" ? keyframeValue(track, 1) : undefined;
     const span = duration / Math.max(1, count);
     const progress = clamp((local - index * span) / Math.max(1, span), 0, 1);
-    return from + (to - from) * easeProgress(progress, event.easing);
+    return keyframeValue(track, easeProgress(event.easing, progress));
   };
-  const applyCharacterTextState = (el, object, statePatch, slide, timeMs) => {
+  const applyCharacterTextState = (el, object, statePatch, slide, timeMs, starts) => {
     const text = textOf(object, statePatch);
     const chars = graphemes(text);
     const spans = Array.from(el.querySelectorAll(".km-text-char"));
     if (spans.length !== chars.length || spans.some((span, index) => span.textContent !== chars[index])) {
       el.innerHTML = characterTextHtml(text);
     }
-    const activeEvents = (slide?.timeline?.events || []).filter((event) => event.targetId === object.id && event.metadata?.nativeBuildGranularity === "character");
+    const activeEvents = (slide?.timeline?.events || []).filter((event) => isCharacterDissolveEvent(event, object.id) && characterOpacityTrack(event));
     for (const [index, span] of Array.from(el.querySelectorAll(".km-text-char")).entries()) {
       let opacity = 1;
       for (const event of activeEvents) {
-        const value = characterOpacityAt(event, index, chars.length, timeMs);
+        const value = characterOpacityAt(event, index, chars.length, timeMs, starts);
         if (value !== undefined) opacity = value;
       }
       span.style.opacity = String(opacity);
     }
   };
-  const applyObjectState = (el, object, statePatch, slide, timeMs) => {
+  const applyObjectState = (el, object, statePatch, slide, timeMs, starts) => {
     if (!el || !object || !statePatch) return;
     const b = statePatch.bounds || { x: 0, y: 0, width: 100, height: 100 };
     el.style.left = Number(b.x || 0) + "px";
@@ -1448,7 +1458,7 @@ function runtimeScript(): string {
     if (object.type === "text" || (object.type === "shape" && object.text)) {
       if (hasCharacterBuild(object)) {
         el.style.opacity = String(object.opacity ?? 1);
-        applyCharacterTextState(el, object, statePatch, slide, timeMs);
+        applyCharacterTextState(el, object, statePatch, slide, timeMs, starts);
       } else {
         el.textContent = textOf(object, statePatch);
       }
@@ -1463,8 +1473,9 @@ function runtimeScript(): string {
   };
   const applySlideFrame = (layer, slide, timeMs) => {
     const states = computeSlideObjectStates(slide, timeMs);
+    const starts = computeEventStarts(slide);
     for (const object of flattenObjects(slide?.objects || [])) {
-      applyObjectState(layer.querySelector('[data-object-id="' + CSS.escape(object.id) + '"]'), object, states.get(object.id), slide, timeMs);
+      applyObjectState(layer.querySelector('[data-object-id="' + CSS.escape(object.id) + '"]'), object, states.get(object.id), slide, timeMs, starts);
     }
     return states;
   };
@@ -1594,7 +1605,7 @@ function runtimeScript(): string {
       if (!toObject) continue;
       const blended = resolved.states.get(pair.toObjectId);
       if (!blended) continue;
-      applyObjectState(currentLayer.querySelector('[data-object-id="' + CSS.escape(pair.toObjectId) + '"]'), toObject, blended, currentSlide, 0);
+      applyObjectState(currentLayer.querySelector('[data-object-id="' + CSS.escape(pair.toObjectId) + '"]'), toObject, blended, currentSlide, 0, undefined);
       const sourceEl = previousLayer.querySelector('[data-object-id="' + CSS.escape(pair.fromObjectId) + '"]');
       if (sourceEl) sourceEl.style.opacity = "0";
     }
@@ -1951,9 +1962,23 @@ function renderTextObjectContent(object: TextObject | (ShapeObject & TextObject)
 function hasCharacterBuildEvent(objectId: string, deck?: DeckIR): boolean {
   return Boolean(
     deck?.deck.slides.some((slide) =>
-      slide.timeline?.events.some((event) => event.targetId === objectId && event.metadata?.nativeBuildGranularity === "character")
+      slide.timeline?.events.some((event) => isStaticCharacterDissolveEvent(event, objectId))
     )
   );
+}
+
+function isStaticCharacterDissolveEvent(event: { kind: string; targetId?: string; metadata?: JSONRecord; tracks?: Array<{ property: string }> }, objectId: string): boolean {
+  return (
+    event.kind === "keyframes" &&
+    event.targetId === objectId &&
+    event.metadata?.nativeBuildGranularity === "character" &&
+    /^dissolve-(in|out)$/.test(String(event.metadata?.nativeBuildFallback ?? "")) &&
+    Boolean(event.tracks?.some((track) => normalizeStaticRuntimeProperty(track.property) === "opacity"))
+  );
+}
+
+function normalizeStaticRuntimeProperty(property: string): string {
+  return property.toLowerCase() === "alpha" ? "opacity" : property;
 }
 
 function splitGraphemes(text: string): string[] {
