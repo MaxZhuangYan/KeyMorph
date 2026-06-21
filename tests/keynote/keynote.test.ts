@@ -463,6 +463,10 @@ describe("Keynote bridge", () => {
     assert.equal(object?.metadata?.nativeTypedVisualSchema, "typed-visual-frame-1.1");
     assert.deepEqual(object?.metadata?.nativeArchiveObjectReferences, ["777"]);
     assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessageCount, 4);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessagesCount, 4);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessagesSampleCount, 4);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessagesSampleLimit, 24);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessagesTruncated, false);
     assert.equal(
       deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessages?.some(
         (message) => message.type === 8 && message.build?.effect === "apple:bc-appear" && message.build.targetNativeId === "777"
@@ -603,6 +607,35 @@ describe("Keynote bridge", () => {
       { offset: 0, value: 18 },
       { offset: 1, value: 0 }
     ]);
+  });
+
+  test("marks sampled native diagnostics as truncated when evidence exceeds the metadata sample limit", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-sampled-diagnostics-"));
+    const keyPath = path.join(dir, "sampled.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat(
+        Array.from({ length: 30 }, (_, index) =>
+          iwaArchiveRecord(1000 + index, [
+            {
+              type: 3097,
+              payload: new Uint8Array()
+            }
+          ])
+        )
+      )
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessageCount, 30);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessagesCount, 30);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessagesSampleCount, 24);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessagesSampleLimit, 24);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessagesTruncated, true);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessages?.length, 24);
   });
 
   test("marks near-identical native placements as a group without collapsing build targets", async () => {

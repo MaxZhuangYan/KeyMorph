@@ -1540,23 +1540,19 @@ function buildNativeSlides(
         nativeAssetReferenceCount: assetMatches.length,
         nativeArchiveRecordCount: scan.archiveRecords.length,
         nativeArchivePayloadCount: scan.archiveRecords.reduce((total, record) => total + record.messageCount, 0),
-        ...(scan.archiveRecords.length > 0 ? { nativeArchiveRecords: scan.archiveRecords.slice(0, 12) } : {}),
+        ...nativeSampledMetadata("nativeArchiveRecords", scan.archiveRecords, 12),
         nativeTypedArchiveMessageCount: scan.typedArchiveMessageCount,
-        ...(scan.archiveMessages.length > 0 ? { nativeTypedArchiveMessages: scan.archiveMessages.slice(0, 24) } : {}),
+        ...nativeSampledMetadata("nativeTypedArchiveMessages", scan.archiveMessages, 24, scan.typedArchiveMessageCount),
         nativeTypedVisualRecordCount: typedVisualRecords.length,
-        ...(typedVisualRecords.length > 0 ? { nativeTypedVisualRecords: typedVisualRecords.slice(0, 24) } : {}),
+        ...nativeSampledMetadata("nativeTypedVisualRecords", typedVisualRecords, 24),
         nativeBuildRecordCount: buildAnimationRecovery.buildRecords.length,
         nativeBuildTimingRecordCount: buildAnimationRecovery.timingRecords.length,
         nativeBuildAnimationRecoveredCount: buildAnimationRecovery.events.length,
         nativeBuildAnimationUnresolvedCount: buildAnimationRecovery.unresolvedBuildCount,
         nativeBuildTimingDependencyCount: buildAnimationRecovery.dependencyEdges.length,
         nativeMorphKeyCount,
-        ...(buildAnimationRecovery.buildRecords.length > 0
-          ? { nativeBuildRecords: buildAnimationRecovery.buildRecords.slice(0, 24) }
-          : {}),
-        ...(buildAnimationRecovery.timingRecords.length > 0
-          ? { nativeBuildTimingRecords: buildAnimationRecovery.timingRecords.slice(0, 24) }
-          : {}),
+        ...nativeSampledMetadata("nativeBuildRecords", buildAnimationRecovery.buildRecords, 24),
+        ...nativeSampledMetadata("nativeBuildTimingRecords", buildAnimationRecovery.timingRecords, 24),
         ...(slideOrderEvidence
           ? {
               nativeSlideOrderSourcePath: slideOrderEvidence.sourcePath,
@@ -1573,17 +1569,34 @@ function buildNativeSlides(
           : {}),
         nativeProtobufFieldCount: scan.protobufFieldCount,
         nativeNestedMessageCount: scan.nestedMessageCount,
-        nativeNumericCandidates: scan.numericCandidates.slice(0, 24).map(stripNumericCandidateInternalFields),
-        nativeGeometryCandidates: scan.geometryCandidates.slice(0, 12),
-        nativeGroupingHints: scan.groupingHints.slice(0, 12),
-        nativeAnimationHints: scan.animationHints.slice(0, 12),
-        nativeFieldSummaries: scan.fieldSummaries.slice(0, 12),
+        ...nativeSampledMetadata("nativeNumericCandidates", scan.numericCandidates.map(stripNumericCandidateInternalFields), 24),
+        ...nativeSampledMetadata("nativeGeometryCandidates", scan.geometryCandidates, 12),
+        ...nativeSampledMetadata("nativeGroupingHints", scan.groupingHints, 12),
+        ...nativeSampledMetadata("nativeAnimationHints", scan.animationHints, 12),
+        ...nativeSampledMetadata("nativeFieldSummaries", scan.fieldSummaries, 12),
         nativeParser: "iwa-protobuf-field-scan"
       }
     };
   });
 
   return slides.length > 0 ? slides : [createPlaceholderSlide(0, "Native Keynote placeholder", undefined, deckSize)];
+}
+
+function nativeSampledMetadata<T>(key: string, values: T[], limit: number, total = values.length): JSONRecord {
+  if (values.length === 0 && total === 0) {
+    return {};
+  }
+  const sample = values.slice(0, limit);
+  const metadata: JSONRecord = {
+    [`${key}Count`]: total,
+    [`${key}SampleCount`]: sample.length,
+    [`${key}SampleLimit`]: limit,
+    [`${key}Truncated`]: total > sample.length
+  };
+  if (sample.length > 0) {
+    metadata[key] = sample as unknown as JSONRecord[];
+  }
+  return metadata;
 }
 
 function chooseSlideIwaEntries(
