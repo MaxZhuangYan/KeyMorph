@@ -15,7 +15,8 @@ import {
   type JSONRecord,
   type KeyframeTrack,
   type Slide,
-  type TimingDependencyEdge
+  type TimingDependencyEdge,
+  type TimelineTrigger
 } from "../ir/index.ts";
 
 const DEFAULT_DECK_SIZE = { width: 1280, height: 720 };
@@ -1603,6 +1604,7 @@ function buildNativeSlides(
       objects,
       timeline: {
         durationMs: buildAnimationRecovery.durationMs,
+        ...(buildAnimationRecovery.triggers.length > 0 ? { triggers: buildAnimationRecovery.triggers } : {}),
         events: buildAnimationRecovery.events,
         dependencyGraph: { edges: buildAnimationRecovery.dependencyEdges },
         ...(buildAnimationRecovery.buildRecords.length > 0 || buildAnimationRecovery.timingRecords.length > 0
@@ -1610,6 +1612,7 @@ function buildNativeSlides(
               metadata: {
                 nativeBuildRecordCount: buildAnimationRecovery.buildRecords.length,
                 nativeBuildTimingRecordCount: buildAnimationRecovery.timingRecords.length,
+                nativeBuildTimingTriggerCount: buildAnimationRecovery.triggers.length,
                 nativeBuildAnimationRecoveredCount: buildAnimationRecovery.events.length,
                 nativeBuildAnimationUnresolvedCount: buildAnimationRecovery.unresolvedBuildCount,
                 nativeBuildTimingDependencyCount: buildAnimationRecovery.dependencyEdges.length
@@ -1637,6 +1640,7 @@ function buildNativeSlides(
         ...nativeSampledMetadata("nativeTypedVisualRecords", typedVisualRecords, 24),
         nativeBuildRecordCount: buildAnimationRecovery.buildRecords.length,
         nativeBuildTimingRecordCount: buildAnimationRecovery.timingRecords.length,
+        nativeBuildTimingTriggerCount: buildAnimationRecovery.triggers.length,
         nativeBuildAnimationRecoveredCount: buildAnimationRecovery.events.length,
         nativeBuildAnimationUnresolvedCount: buildAnimationRecovery.unresolvedBuildCount,
         nativeBuildTimingDependencyCount: buildAnimationRecovery.dependencyEdges.length,
@@ -2561,6 +2565,7 @@ function nativePlacementGroupKey(object: IRObject): string | undefined {
 
 interface NativeBuildAnimationRecovery {
   events: AnimationEvent[];
+  triggers: TimelineTrigger[];
   dependencyEdges: TimingDependencyEdge[];
   durationMs: number;
   buildRecords: NativeIwaBuildEvidence[];
@@ -2585,7 +2590,7 @@ function recoverNativeBuildAnimations(
     .map((message) => message.buildTiming)
     .filter((timing): timing is NativeIwaBuildTimingEvidence => Boolean(timing));
   if (buildRecords.length === 0) {
-    return { events: [], dependencyEdges: [], durationMs: 2500, buildRecords, timingRecords, unresolvedBuildCount: 0 };
+    return { events: [], triggers: [], dependencyEdges: [], durationMs: 2500, buildRecords, timingRecords, unresolvedBuildCount: 0 };
   }
 
   const objectLookup = createNativeBuildObjectLookup(objects);
@@ -2604,6 +2609,7 @@ function recoverNativeBuildAnimations(
   const sequencedBuilds = sequenceNativeBuildRecords(buildRecords, timingRecords, buildById);
 
   const events: AnimationEvent[] = [];
+  const triggers: TimelineTrigger[] = [];
   const dependencyEdges: TimingDependencyEdge[] = [];
   let cursorMs = 0;
   let cursorAnchor: NativeBuildTimingAnchor | undefined;
@@ -2624,6 +2630,7 @@ function recoverNativeBuildAnimations(
     for (const [targetIndex, resolution] of resolutions.entries()) {
       const event = nativeBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs);
       if (event) {
+        applyNativeBuildTriggerStart(event, timing, startMs, triggers);
         events.push(event);
         generatedEvents.push(event);
       }
@@ -2670,6 +2677,7 @@ function recoverNativeBuildAnimations(
 
   return {
     events,
+    triggers,
     dependencyEdges,
     durationMs: Math.max(2500, events.reduce((max, event) => Math.max(max, eventEndMs(event)), 0) + 500),
     buildRecords,
@@ -2680,6 +2688,49 @@ function recoverNativeBuildAnimations(
 
 function isNativeTimingWithPrevious(timing: NativeIwaBuildTimingEvidence | undefined): boolean {
   return timing?.startRelation === "withPrevious" || timing?.startsWithPrevious === true;
+}
+
+function applyNativeBuildTriggerStart(
+  event: AnimationEvent,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  startMs: number,
+  triggers: TimelineTrigger[]
+): void {
+  if (!isNativeCustomTriggerGroup(timing)) {
+    return;
+  }
+  const triggerGroupRaw = timing.triggerGroupRaw;
+  const triggerId = nativeBuildTriggerId(timing.triggerGroupRaw);
+  if (!triggers.some((trigger) => trigger.id === triggerId)) {
+    triggers.push({
+      id: triggerId,
+      type: "custom",
+      name: `Keynote build trigger group ${triggerGroupRaw}`,
+      metadata: {
+        nativeSource: "keynote-iwa-build-timing",
+        nativeBuildTimingTriggerGroupRaw: triggerGroupRaw,
+        ...(timing.timingId ? { nativeBuildTimingId: timing.timingId } : {})
+      }
+    });
+  }
+  event.start = {
+    type: "trigger",
+    triggerId,
+    offsetMs: Math.max(0, Math.round(startMs))
+  };
+  event.metadata = {
+    ...(event.metadata ?? {}),
+    nativeBuildTriggerId: triggerId,
+    nativeBuildRecoveredAbsoluteStartMs: Math.max(0, Math.round(startMs))
+  };
+}
+
+function isNativeCustomTriggerGroup(timing: NativeIwaBuildTimingEvidence | undefined): timing is NativeIwaBuildTimingEvidence & { triggerGroupRaw: number } {
+  return timing?.triggerGroupRaw !== undefined && timing.triggerGroupRaw > 1;
+}
+
+function nativeBuildTriggerId(triggerGroupRaw: number): string {
+  return `native-build-trigger-${nativeBuildSlug(String(triggerGroupRaw))}`;
 }
 
 function createNativeBuildTimingAnchor(events: AnimationEvent[], startMs: number, durationMs: number): NativeBuildTimingAnchor | undefined {

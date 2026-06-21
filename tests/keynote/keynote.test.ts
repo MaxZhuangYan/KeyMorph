@@ -1122,6 +1122,55 @@ describe("Keynote bridge", () => {
     assert.equal(deck.deck.slides[0]?.timeline?.metadata?.nativeBuildTimingDependencyCount, 3);
   });
 
+  test("maps native timing trigger groups into IR custom triggers", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-trigger-group-"));
+    const keyPath = path.join(dir, "trigger.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(111, [
+          { type: 3005, payload: nativeImagePlacementPayload(42, { x: 10, y: 20, width: 100, height: 80 }), dataReferences: [42] }
+        ]),
+        iwaArchiveRecord(9001, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 111, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 }) }
+        ]),
+        iwaArchiveRecord(9002, [
+          {
+            type: 153,
+            payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 1, delaySeconds: 0.25, triggerGroup: 42 })
+          }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const slide = deck.deck.slides[0];
+    const event = slide?.timeline?.events[0];
+
+    assert.deepEqual(slide?.timeline?.triggers, [
+      {
+        id: "native-build-trigger-42",
+        type: "custom",
+        name: "Keynote build trigger group 42",
+        metadata: {
+          nativeSource: "keynote-iwa-build-timing",
+          nativeBuildTimingTriggerGroupRaw: 42,
+          nativeBuildTimingId: "9002"
+        }
+      }
+    ]);
+    assert.deepEqual(event?.start, { type: "trigger", triggerId: "native-build-trigger-42", offsetMs: 250 });
+    assert.equal(event?.metadata?.nativeBuildTriggerId, "native-build-trigger-42");
+    assert.equal(event?.metadata?.nativeBuildRecoveredAbsoluteStartMs, 250);
+    assert.equal(slide?.timeline?.metadata?.nativeBuildTimingTriggerCount, 1);
+    assert.deepEqual(createSlideTimingPlan(slide).starts, { [event!.id]: 250 });
+  });
+
   test("links multi-target native builds as same-time timing dependencies", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-multi-target-timing-"));
     const keyPath = path.join(dir, "timing.key");
@@ -1472,6 +1521,7 @@ function nativeBuildTimingPayload(values: {
   delaySeconds?: number;
   startsWithPrevious?: boolean;
   afterPrevious?: boolean;
+  triggerGroup?: number;
 }): Uint8Array {
   return concat([
     protoBytes(protoVarint(1, values.buildId), 1),
@@ -1479,7 +1529,7 @@ function nativeBuildTimingPayload(values: {
     protoFixed64(4, values.durationSeconds),
     protoVarint(5, values.startsWithPrevious ? 1 : 0),
     protoVarint(6, values.afterPrevious === false ? 0 : 1),
-    protoBytes(protoVarint(2, 1), 7)
+    protoBytes(protoVarint(2, values.triggerGroup ?? 1), 7)
   ]);
 }
 
