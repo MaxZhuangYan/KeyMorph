@@ -1468,6 +1468,7 @@ function buildNativeSlides(
         match.geometryCandidate ?? scan.geometryCandidates[textObjects.length + assetIndex]
       )
     );
+    applyNativePlacementGroupMetadata(assetObjects);
     const nativeTextObjects = createNativeTextDrawableObjects(slideId, scan.archiveMessages, entry.path, deckSize);
     const textObjectsToKeep = suppressDuplicateFallbackTextObjects(textObjects, nativeTextObjects);
     const objects =
@@ -2189,6 +2190,58 @@ function createAssetObject(
       reason: `Native package asset kind "${asset.kind}" cannot be represented as a direct IR image/media object.`
     }
   };
+}
+
+function applyNativePlacementGroupMetadata(objects: IRObject[]): void {
+  const groups = new Map<string, IRObject[]>();
+  for (const object of objects) {
+    const key = nativePlacementGroupKey(object);
+    if (!key) {
+      continue;
+    }
+    const list = groups.get(key) ?? [];
+    list.push(object);
+    groups.set(key, list);
+  }
+
+  for (const [key, group] of groups) {
+    if (group.length < 2) {
+      continue;
+    }
+    const memberIds = group.map((object) => object.id);
+    for (const [index, object] of group.entries()) {
+      object.metadata = {
+        ...(object.metadata ?? {}),
+        nativePlacementGroupKey: key,
+        nativePlacementGroupIndex: index,
+        nativePlacementGroupSize: group.length,
+        nativePlacementGroupObjectIds: memberIds
+      };
+    }
+  }
+}
+
+function nativePlacementGroupKey(object: IRObject): string | undefined {
+  if (object.type !== "image" && object.type !== "media") {
+    return undefined;
+  }
+  const dataReferences = Array.isArray(object.metadata?.nativeArchiveDataReferences)
+    ? object.metadata.nativeArchiveDataReferences.map(String)
+    : object.metadata?.nativeAssetDataId
+      ? [String(object.metadata.nativeAssetDataId)]
+      : [];
+  if (dataReferences.length === 0 || !object.bounds) {
+    return undefined;
+  }
+  const bounds = object.bounds;
+  return [
+    "placement",
+    uniqueStrings(dataReferences).sort(comparePartPaths).join("+"),
+    Math.round(bounds.x),
+    Math.round(bounds.y),
+    Math.round(bounds.width),
+    Math.round(bounds.height)
+  ].join(":");
 }
 
 interface NativeBuildAnimationRecovery {

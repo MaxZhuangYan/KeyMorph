@@ -468,6 +468,40 @@ describe("Keynote bridge", () => {
     ]);
   });
 
+  test("marks near-identical native placements as a group without collapsing build targets", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-placement-groups-"));
+    const keyPath = path.join(dir, "placement-groups.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(111, [
+          { type: 3005, payload: nativeImagePlacementPayload(42, { x: 100.1, y: 120.2, width: 320.3, height: 180.4 }), dataReferences: [42] }
+        ]),
+        iwaArchiveRecord(222, [
+          { type: 3005, payload: nativeImagePlacementPayload(42, { x: 100.4, y: 120.3, width: 320.1, height: 180.2 }), dataReferences: [42] }
+        ]),
+        iwaArchiveRecord(9001, [
+          { type: 8, payload: nativeBuildPayload({ targetId: 222, direction: "In", effect: "com.apple.iWork.Keynote.Blur", durationSeconds: 0.5 }) }
+        ]),
+        iwaArchiveRecord(9002, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 0.5 }) }])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const imageObjects = deck.deck.slides[0]?.objects.filter((object) => object.type === "image") ?? [];
+    assert.equal(imageObjects.length, 2);
+    assert.equal(imageObjects[0]?.metadata?.nativePlacementGroupSize, 2);
+    assert.equal(imageObjects[0]?.metadata?.nativePlacementGroupKey, imageObjects[1]?.metadata?.nativePlacementGroupKey);
+    assert.deepEqual(imageObjects[0]?.metadata?.nativePlacementGroupObjectIds, imageObjects.map((object) => object.id));
+    const event = deck.deck.slides[0]?.timeline?.events[0];
+    assert.equal(event?.targetId, imageObjects.find((object) => object.metadata?.nativeArchiveIdentifier === "222")?.id);
+  });
+
   test("coalesces native asset variants for the same archive object", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-asset-variants-"));
     const keyPath = path.join(dir, "variants.key");
