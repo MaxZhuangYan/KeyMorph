@@ -950,6 +950,138 @@ describe("Keynote bridge", () => {
     assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationUnresolvedCount, 0);
   });
 
+  test("applies native stylesheet font, color, and alignment to 2011 text drawables", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-text-style-"));
+    const keyPath = path.join(dir, "text-style.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    const stylesheetRecords = concat([
+        iwaArchiveRecord(9100, [
+          {
+            type: 2022,
+            payload: nativeParagraphStylePayload({
+              fontFamily: "AvenirNext-Regular",
+              fontSize: 42,
+              color: { red: 1, green: 1, blue: 1, alpha: 1 },
+              alignment: 2,
+              lineHeight: 1.4
+            }),
+            objectReferences: [9100]
+          }
+        ]),
+        iwaArchiveRecord(9200, [
+          {
+            type: 2021,
+            payload: nativeCharacterStylePayload({
+              fontFamily: "Produkt-Regular",
+              color: { red: 0.85, green: 0.47, blue: 0.34, alpha: 1 }
+            }),
+            objectReferences: [9200]
+          }
+        ])
+      ]);
+    await writeFile(path.join(keyPath, "Index", "DocumentStylesheet.iwa"), iwaSnappyChunks(splitBytes(stylesheetRecords, [17, 91])));
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(1200, [
+          { type: 2001, payload: nativeStyledTextContentPayload("Demo 演示", { paragraphStyleId: 9100, characterStyleId: 9200 }) }
+        ]),
+        iwaArchiveRecord(1100, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1200,
+              bounds: { x: 100, y: 120, width: 800, height: 100 }
+            })
+          }
+        ]),
+        iwaArchiveRecord(1300, [
+          {
+            type: 8,
+            payload: nativeBuildPayload({
+              targetId: 1100,
+              direction: "In",
+              effect: "apple:bc-appear",
+              durationSeconds: 0.5
+            })
+          }
+        ]),
+        iwaArchiveRecord(1301, [{ type: 153, payload: nativeBuildTimingPayload({ buildId: 1300, durationSeconds: 0.5 }) }])
+      ])
+    );
+
+    const detection = await detectNativeKeynotePackage(keyPath);
+    const styleStream = detection.iwaStreams?.find((stream) => stream.path === "Index/DocumentStylesheet.iwa");
+    assert.equal(styleStream?.role, "style");
+    assert.deepEqual(
+      styleStream?.typedArchiveMessages.map((message) => message.type),
+      [2022, 2021]
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.metadata?.nativeExtraction === "typed-iwa-text-drawable");
+    assert.equal(object?.type, "text");
+    if (object?.type !== "text") throw new Error("Expected native text drawable.");
+    assert.equal(object.text.plainText, "Demo 演示");
+    assert.deepEqual(object.text.runs?.[0]?.style, {
+      fontFamily: "Produkt-Regular",
+      fontSize: 42,
+      color: "#d97857",
+      lineHeight: 1.4
+    });
+    assert.equal(object.text.paragraphs?.[0]?.alignment, "center");
+    assert.equal(object.metadata?.nativeTextStyleMapRecordCount, 2);
+    assert.deepEqual(object.metadata?.nativeTextStyleIds, ["9100", "9200"]);
+    assert.equal(object.metadata?.nativeParagraphStyleRunCount, 1);
+    assert.equal(object.metadata?.nativeCharacterStyleRunCount, 1);
+  });
+
+  test("applies native stylesheet to fallback protobuf text candidates", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-fallback-text-style-"));
+    const keyPath = path.join(dir, "fallback-text-style.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "DocumentStylesheet.iwa"),
+      iwaArchiveRecord(9300, [
+        {
+          type: 2022,
+          payload: nativeParagraphStylePayload({
+            fontFamily: "HelveticaNeue-Medium",
+            fontSize: 106,
+            color: { red: 1, green: 1, blue: 1, alpha: 1 },
+            alignment: 2
+          }),
+          objectReferences: [9300]
+        }
+      ])
+    );
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      iwaArchiveRecord(1200, [
+        { type: 2001, payload: nativeStyledTextContentPayload("AI Agent 社会模拟游戏", { paragraphStyleId: 9300 }) }
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.type === "text");
+    assert.equal(object?.type, "text");
+    if (object?.type !== "text") throw new Error("Expected fallback text.");
+    assert.equal(object.text.plainText, "AI Agent 社会模拟游戏");
+    assert.deepEqual(object.text.runs?.[0]?.style, {
+      fontFamily: "HelveticaNeue-Medium",
+      fontSize: 106,
+      color: "#ffffff"
+    });
+    assert.equal(object.text.paragraphs?.[0]?.alignment, "center");
+    assert.equal(object.metadata?.nativeTextStyleMapRecordCount, 1);
+    assert.deepEqual(object.metadata?.nativeTextStyleIds, ["9300"]);
+  });
+
   test("preserves character-level dissolve build semantics when degrading to object opacity", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-character-dissolve-"));
     const keyPath = path.join(dir, "character-dissolve.key");
@@ -1563,6 +1695,66 @@ function nativeTextContentPayload(text: string): Uint8Array {
   return protoString(text, 3);
 }
 
+function nativeStyledTextContentPayload(text: string, styles: { paragraphStyleId?: number; characterStyleId?: number }): Uint8Array {
+  return concat([
+    protoString(text, 3),
+    ...(styles.paragraphStyleId !== undefined ? [protoBytes(nativeTextStyleRunPayload(0, styles.paragraphStyleId), 5)] : []),
+    ...(styles.characterStyleId !== undefined ? [protoBytes(nativeTextStyleRunPayload(0, styles.characterStyleId), 8)] : [])
+  ]);
+}
+
+function nativeTextStyleRunPayload(start: number, styleId: number): Uint8Array {
+  return protoBytes(concat([protoVarint(1, start), protoBytes(protoVarint(1, styleId), 2)]), 1);
+}
+
+function nativeParagraphStylePayload(values: {
+  fontFamily: string;
+  fontSize: number;
+  color: { red: number; green: number; blue: number; alpha: number };
+  alignment?: number;
+  lineHeight?: number;
+}): Uint8Array {
+  return concat([
+    protoBytes(nativeTextStylePayload(values), 11),
+    protoBytes(
+      concat([
+        ...(values.alignment !== undefined ? [protoVarint(1, values.alignment)] : []),
+        ...(values.lineHeight !== undefined ? [protoFixed32(13, values.lineHeight), protoBytes(protoFixed32(2, values.lineHeight), 13)] : [])
+      ]),
+      12
+    )
+  ]);
+}
+
+function nativeCharacterStylePayload(values: {
+  fontFamily?: string;
+  fontSize?: number;
+  color?: { red: number; green: number; blue: number; alpha: number };
+}): Uint8Array {
+  return protoBytes(nativeTextStylePayload(values), 11);
+}
+
+function nativeTextStylePayload(values: {
+  fontFamily?: string;
+  fontSize?: number;
+  color?: { red: number; green: number; blue: number; alpha: number };
+}): Uint8Array {
+  return concat([
+    ...(values.fontSize !== undefined ? [protoFixed32(3, values.fontSize)] : []),
+    ...(values.fontFamily ? [protoString(values.fontFamily, 5)] : []),
+    ...(values.color ? [protoBytes(nativeColorPayload(values.color), 7)] : [])
+  ]);
+}
+
+function nativeColorPayload(color: { red: number; green: number; blue: number; alpha: number }): Uint8Array {
+  return concat([
+    protoFixed32(3, color.red),
+    protoFixed32(4, color.green),
+    protoFixed32(5, color.blue),
+    protoFixed32(6, color.alpha)
+  ]);
+}
+
 function nativeTextDrawablePayload(values: {
   slideId: number;
   textId: number;
@@ -1703,6 +1895,28 @@ function snappyFramed(payload: Uint8Array): Uint8Array {
     checksum,
     compressed
   ]);
+}
+
+function iwaSnappyChunks(payloads: Uint8Array[]): Uint8Array {
+  return concat(
+    payloads.map((payload) => {
+      const compressed = snappyLiteralBlock(payload);
+      return concat([new Uint8Array([0x00]), u24(compressed.byteLength), compressed]);
+    })
+  );
+}
+
+function splitBytes(payload: Uint8Array, offsets: number[]): Uint8Array[] {
+  const chunks: Uint8Array[] = [];
+  let start = 0;
+  for (const offset of offsets) {
+    if (offset > start && offset < payload.byteLength) {
+      chunks.push(payload.subarray(start, offset));
+      start = offset;
+    }
+  }
+  chunks.push(payload.subarray(start));
+  return chunks.filter((chunk) => chunk.byteLength > 0);
 }
 
 function snappyLiteralBlock(payload: Uint8Array): Uint8Array {

@@ -15,6 +15,9 @@ import {
   type JSONRecord,
   type KeyframeTrack,
   type Slide,
+  type TextContent,
+  type TextParagraph,
+  type TextStyle,
   type TimingDependencyEdge,
   type TimelineTrigger
 } from "../ir/index.ts";
@@ -241,8 +244,16 @@ export interface NativeIwaMotionPathEvidence {
 export interface NativeIwaTextContentEvidence {
   kind: "textContent";
   text: string;
+  paragraphStyleRuns: NativeIwaTextStyleRunEvidence[];
+  characterStyleRuns: NativeIwaTextStyleRunEvidence[];
   confidence: number;
   sourceFieldPaths: string[];
+}
+
+export interface NativeIwaTextStyleRunEvidence {
+  start: number;
+  styleId: string;
+  sourceFieldPath: string;
 }
 
 export interface NativeIwaTextDrawableEvidence {
@@ -457,6 +468,19 @@ interface IwaScanResult {
   expandedByteLength: number;
 }
 
+interface NativeTextStyleMap {
+  styles: Map<string, NativeTextStyleRecord>;
+  recordCount: number;
+}
+
+interface NativeTextStyleRecord {
+  styleId: string;
+  type: number;
+  style: TextStyle;
+  alignment?: TextParagraph["alignment"];
+  sourceFieldPaths: string[];
+}
+
 interface IwaArchiveMessageInfo {
   length: number;
   payloadOffset: number;
@@ -550,7 +574,8 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
   const iwaStreams = classifyIwaStreams(parts.iwaEntries, assets);
   const slideOrderEvidence = inferSlideOrderEvidence(parts.iwaEntries);
   const slideEntries = chooseSlideIwaEntries(parts.iwaEntries, slideOrderEvidence);
-  const slides = buildNativeSlides(slideEntries, parts.iwaEntries, deckSize, assets, slideOrderEvidence);
+  const nativeTextStyleMap = readNativeTextStyleMap(parts.iwaEntries);
+  const slides = buildNativeSlides(slideEntries, parts.iwaEntries, deckSize, assets, slideOrderEvidence, nativeTextStyleMap);
   const objectCount = slides.reduce((total, slide) => total + slide.objects.length, 0);
   const recoveredTextObjectCount = slides.reduce(
     (total, slide) => total + slide.objects.filter((object) => object.type === "text").length,
@@ -1523,11 +1548,11 @@ function classifyIwaStreams(
 function classifyIwaRole(entryPath: string): NativeIwaStreamRole {
   const baseName = path.posix.basename(entryPath).toLowerCase();
   if (isSlideIwaPath(entryPath)) return "slide";
+  if (/style/.test(baseName)) return "style";
   if (/(^|[-_.])document[-_.]?/.test(baseName) || baseName === "document.iwa") return "document";
   if (/master/.test(baseName)) return "master";
   if (/layout/.test(baseName)) return "layout";
   if (/theme/.test(baseName)) return "theme";
-  if (/style/.test(baseName)) return "style";
   return "unknown";
 }
 
@@ -1583,7 +1608,8 @@ function buildNativeSlides(
   allIwaEntries: Array<{ path: string; data: Uint8Array }>,
   deckSize: { width: number; height: number },
   assets: NativeAssetCatalog,
-  slideOrderEvidence?: NativeSlideOrderEvidence
+  slideOrderEvidence?: NativeSlideOrderEvidence,
+  textStyleMap: NativeTextStyleMap = emptyNativeTextStyleMap()
 ): Slide[] {
   const entries = slideEntries.length > 0 ? slideEntries : chooseFallbackIwaEntries(allIwaEntries);
   if (entries.length === 0) {
@@ -1601,8 +1627,18 @@ function buildNativeSlides(
     const usePreviewFallback = previewFallback
       ? shouldUsePreviewFallback(textCandidates, assetMatches, previewFallback)
       : false;
+    const textContentByText = nativeTextContentByNormalizedText(scan.archiveMessages);
     const textObjects = textCandidates.map((candidate, objectIndex) =>
-      createTextObject(slideId, candidate, objectIndex, entry.path, deckSize, scan.geometryCandidates[objectIndex])
+      createTextObject(
+        slideId,
+        candidate,
+        objectIndex,
+        entry.path,
+        deckSize,
+        scan.geometryCandidates[objectIndex],
+        textContentByText.get(normalizeTextForDuplicateCheck(candidate.text)),
+        textStyleMap
+      )
     );
     const assetObjects = assetMatches.map((match, assetIndex) =>
       createAssetObject(
@@ -1615,7 +1651,7 @@ function buildNativeSlides(
       )
     );
     applyNativePlacementGroupMetadata(assetObjects);
-    const nativeTextObjects = createNativeTextDrawableObjects(slideId, scan.archiveMessages, entry.path, deckSize);
+    const nativeTextObjects = createNativeTextDrawableObjects(slideId, scan.archiveMessages, entry.path, deckSize, textStyleMap);
     const textObjectsToKeep = suppressDuplicateFallbackTextObjects(textObjects, nativeTextObjects);
     const objects =
       usePreviewFallback && previewFallback
@@ -1983,7 +2019,9 @@ function createTextObject(
   objectIndex: number,
   sourcePath: string,
   deckSize: { width: number; height: number },
-  geometryCandidate?: NativeIwaGeometryCandidate
+  geometryCandidate?: NativeIwaGeometryCandidate,
+  textEntry?: NativeIwaTextContentEvidence,
+  textStyleMap: NativeTextStyleMap = emptyNativeTextStyleMap()
 ): IRObject {
   const text = candidate.text;
   const marginX = Math.round(deckSize.width * 0.075);
@@ -1998,6 +2036,12 @@ function createTextObject(
         width: deckSize.width - marginX * 2,
         height: Math.max(44, lineHeight)
       };
+  const fallbackStyle: TextStyle = {
+    fontFamily: "Helvetica Neue",
+    fontSize: objectIndex === 0 ? 36 : 24,
+    color: "#111827"
+  };
+  const textContent = textEntry ? nativeStyledTextContent(text, textEntry, textStyleMap, fallbackStyle) : { plainText: text, runs: [{ text, style: fallbackStyle }] };
 
   return {
     id: `${slideId}-text-${objectIndex + 1}`,
@@ -2005,24 +2049,20 @@ function createTextObject(
     name: objectIndex === 0 ? "Native text" : `Native text ${objectIndex + 1}`,
     bounds,
     opacity: 1,
-    text: {
-      plainText: text,
-      runs: [
-        {
-          text,
-          style: {
-            fontFamily: "Helvetica Neue",
-            fontSize: objectIndex === 0 ? 36 : 24,
-            color: "#111827"
-          }
-        }
-      ]
-    },
+    text: textContent,
     metadata: {
       nativeSourcePath: sourcePath,
       nativeExtraction: candidate.source === "protobuf" ? "protobuf-field-string" : "raw-string",
       nativeFieldPath: candidate.fieldPath,
       nativeTextConfidence: candidate.confidence,
+      ...(textEntry
+        ? {
+            nativeTextStyleMapRecordCount: textStyleMap.recordCount,
+            nativeParagraphStyleRunCount: textEntry.paragraphStyleRuns.length,
+            nativeCharacterStyleRunCount: textEntry.characterStyleRuns.length,
+            ...nativeTextStyleMetadata(textEntry, textContent)
+          }
+        : {}),
       ...(geometryCandidate
         ? {
             nativeGeometryCandidate: geometryCandidate,
@@ -2033,11 +2073,28 @@ function createTextObject(
   };
 }
 
+function nativeTextContentByNormalizedText(messages: NativeIwaArchiveMessageEvidence[]): Map<string, NativeIwaTextContentEvidence> {
+  const entries = new Map<string, NativeIwaTextContentEvidence>();
+  for (const message of messages) {
+    const textEntry = message.textContent;
+    if (!textEntry) {
+      continue;
+    }
+    const key = normalizeTextForDuplicateCheck(textEntry.text);
+    if (!key || entries.has(key)) {
+      continue;
+    }
+    entries.set(key, textEntry);
+  }
+  return entries;
+}
+
 function createNativeTextDrawableObjects(
   slideId: string,
   messages: NativeIwaArchiveMessageEvidence[],
   sourcePath: string,
-  deckSize: { width: number; height: number }
+  deckSize: { width: number; height: number },
+  textStyleMap: NativeTextStyleMap
 ): IRObject[] {
   const targetIds = nativeBuildTargetIds(messages);
   if (targetIds.size === 0) {
@@ -2063,7 +2120,7 @@ function createNativeTextDrawableObjects(
     if (!textEntry) {
       continue;
     }
-    const object = createNativeTextDrawableObject(slideId, message, drawable, textEntry, objects.length, sourcePath, deckSize);
+    const object = createNativeTextDrawableObject(slideId, message, drawable, textEntry, objects.length, sourcePath, deckSize, textStyleMap);
     if (object) {
       seenDrawableIds.add(drawableId);
       objects.push(object);
@@ -2087,7 +2144,8 @@ function createNativeTextDrawableObject(
   textEntry: NativeIwaTextContentEvidence,
   objectIndex: number,
   sourcePath: string,
-  deckSize: { width: number; height: number }
+  deckSize: { width: number; height: number },
+  textStyleMap: NativeTextStyleMap
 ): IRObject | undefined {
   const text = cleanTextCandidate(textEntry.text);
   if (!text || !message.archiveIdentifier) {
@@ -2102,25 +2160,18 @@ function createNativeTextDrawableObject(
         height: 64
       };
   const fontSize = Math.max(14, Math.min(48, Math.round((bounds.height || 64) * 0.42)));
+  const textContent = nativeStyledTextContent(text, textEntry, textStyleMap, {
+    fontFamily: "Helvetica Neue",
+    fontSize,
+    color: "#111827"
+  });
   return {
     id: `${slideId}-native-text-${objectIndex + 1}`,
     type: "text",
     name: `Native text drawable ${objectIndex + 1}`,
     bounds,
     opacity: 1,
-    text: {
-      plainText: text,
-      runs: [
-        {
-          text,
-          style: {
-            fontFamily: "Helvetica Neue",
-            fontSize,
-            color: "#111827"
-          }
-        }
-      ]
-    },
+    text: textContent,
     metadata: {
       nativeSourcePath: sourcePath,
       nativeExtraction: "typed-iwa-text-drawable",
@@ -2136,6 +2187,10 @@ function createNativeTextDrawableObject(
       nativeTextContentConfidence: textEntry.confidence,
       nativeTextDrawableFieldPaths: drawable.sourceFieldPaths,
       nativeTextContentFieldPaths: textEntry.sourceFieldPaths,
+      nativeTextStyleMapRecordCount: textStyleMap.recordCount,
+      nativeParagraphStyleRunCount: textEntry.paragraphStyleRuns.length,
+      nativeCharacterStyleRunCount: textEntry.characterStyleRuns.length,
+      ...nativeTextStyleMetadata(textEntry, textContent),
       ...(drawable.layout ? nativeTextDrawableLayoutMetadata(drawable.layout) : {}),
       ...(drawable.slideArchiveId ? { nativeTextDrawableSlideArchiveId: drawable.slideArchiveId } : {}),
       ...(drawable.bounds ? { nativeTextDrawableRawBounds: drawable.bounds } : {})
@@ -2150,6 +2205,112 @@ function nativeTextDrawableLayoutMetadata(layout: NativeTextDrawableLayoutEviden
     nativeTextDrawableFrameFieldPaths: layout.frameFieldPaths,
     nativeTextDrawableFrameConfidence: layout.confidence,
     ...(layout.slideArchiveId ? { nativeTextDrawableParentSlideArchiveId: layout.slideArchiveId } : {})
+  };
+}
+
+function nativeStyledTextContent(
+  text: string,
+  textEntry: NativeIwaTextContentEvidence,
+  textStyleMap: NativeTextStyleMap,
+  fallbackStyle: TextStyle
+): TextContent {
+  const runs = createNativeStyledTextRuns(text, textEntry, textStyleMap, fallbackStyle);
+  const paragraphStyle = resolveNativeStyleForOffset(textEntry.paragraphStyleRuns, 0, textStyleMap)?.record;
+  return {
+    plainText: text,
+    runs,
+    ...(paragraphStyle?.alignment
+      ? {
+          paragraphs: [
+            {
+              alignment: paragraphStyle.alignment,
+              runs
+            }
+          ]
+        }
+      : {})
+  };
+}
+
+function createNativeStyledTextRuns(
+  text: string,
+  textEntry: NativeIwaTextContentEvidence,
+  textStyleMap: NativeTextStyleMap,
+  fallbackStyle: TextStyle
+): NonNullable<TextContent["runs"]> {
+  const breakpoints = new Set<number>([0, text.length]);
+  for (const run of [...textEntry.paragraphStyleRuns, ...textEntry.characterStyleRuns]) {
+    if (run.start > 0 && run.start < text.length) {
+      breakpoints.add(run.start);
+    }
+  }
+  const offsets = Array.from(breakpoints).sort((left, right) => left - right);
+  const runs: NonNullable<TextContent["runs"]> = [];
+  for (let index = 0; index < offsets.length - 1; index += 1) {
+    const start = offsets[index] ?? 0;
+    const end = offsets[index + 1] ?? text.length;
+    const runText = text.slice(start, end);
+    if (!runText) {
+      continue;
+    }
+    runs.push({
+      text: runText,
+      style: nativeTextStyleAtOffset(start, textEntry, textStyleMap, fallbackStyle)
+    });
+  }
+  return runs.length > 0 ? runs : [{ text, style: fallbackStyle }];
+}
+
+function nativeTextStyleAtOffset(
+  offset: number,
+  textEntry: NativeIwaTextContentEvidence,
+  textStyleMap: NativeTextStyleMap,
+  fallbackStyle: TextStyle
+): TextStyle {
+  const paragraphStyle = resolveNativeStyleForOffset(textEntry.paragraphStyleRuns, offset, textStyleMap)?.record?.style;
+  const characterStyle = resolveNativeStyleForOffset(textEntry.characterStyleRuns, offset, textStyleMap)?.record?.style;
+  return compactTextStyle({
+    ...fallbackStyle,
+    ...paragraphStyle,
+    ...characterStyle
+  });
+}
+
+function resolveNativeStyleForOffset(
+  runs: NativeIwaTextStyleRunEvidence[],
+  offset: number,
+  textStyleMap: NativeTextStyleMap
+): { run: NativeIwaTextStyleRunEvidence; record?: NativeTextStyleRecord } | undefined {
+  const run = [...runs]
+    .filter((candidate) => candidate.start <= offset)
+    .sort((left, right) => right.start - left.start)[0];
+  if (!run) {
+    return undefined;
+  }
+  return { run, record: textStyleMap.styles.get(run.styleId) };
+}
+
+function compactTextStyle(style: TextStyle): TextStyle {
+  const compact: TextStyle = {};
+  if (style.fontFamily) compact.fontFamily = style.fontFamily;
+  if (style.fontSize !== undefined) compact.fontSize = style.fontSize;
+  if (style.fontWeight !== undefined) compact.fontWeight = style.fontWeight;
+  if (style.italic !== undefined) compact.italic = style.italic;
+  if (style.underline !== undefined) compact.underline = style.underline;
+  if (style.color !== undefined) compact.color = style.color;
+  if (style.lineHeight !== undefined) compact.lineHeight = style.lineHeight;
+  if (style.letterSpacing !== undefined) compact.letterSpacing = style.letterSpacing;
+  return compact;
+}
+
+function nativeTextStyleMetadata(textEntry: NativeIwaTextContentEvidence, textContent: TextContent): JSONRecord {
+  const styleIds = uniqueStrings([
+    ...textEntry.paragraphStyleRuns.map((run) => run.styleId),
+    ...textEntry.characterStyleRuns.map((run) => run.styleId)
+  ]);
+  return {
+    ...(styleIds.length > 0 ? { nativeTextStyleIds: styleIds } : {}),
+    ...(textContent.paragraphs?.[0]?.alignment ? { nativeTextAlignment: textContent.paragraphs[0].alignment } : {})
   };
 }
 
@@ -3577,6 +3738,158 @@ function scanIwaEntry(data: Uint8Array): IwaScanResult {
   return scanIwaPayloads(expandIwaPayloads(data));
 }
 
+function emptyNativeTextStyleMap(): NativeTextStyleMap {
+  return { styles: new Map(), recordCount: 0 };
+}
+
+function readNativeTextStyleMap(iwaEntries: Array<{ path: string; data: Uint8Array }>): NativeTextStyleMap {
+  const styleEntries = iwaEntries.filter((entry) => classifyIwaRole(entry.path) === "style");
+  const styles = new Map<string, NativeTextStyleRecord>();
+  let recordCount = 0;
+
+  for (const entry of styleEntries) {
+    const payloads = expandIwaPayloads(entry.data);
+    const records = nativeStylesheetArchiveRecords(payloads);
+    recordCount += records.length;
+    for (const record of records) {
+      let payloadOffset = record.payloadOffset;
+      for (const [messageIndex, messageInfo] of record.messageInfos.entries()) {
+        const payload = findArchiveMessagePayload(entry.path, entry.data, payloads, record, messageInfo, payloadOffset);
+        payloadOffset += messageInfo.payloadLength;
+        if (!payload || (messageInfo.type !== 2021 && messageInfo.type !== 2022)) {
+          continue;
+        }
+        const styleId = messageInfo.objectReferences[0] ?? record.identifier ?? `${entry.path}:${record.archiveOffset}:${messageIndex}`;
+        const styleRecord = nativeTextStyleRecordFromPayload(styleId, messageInfo.type, payload);
+        if (styleRecord && Object.keys(styleRecord.style).length > 0) {
+          styles.set(styleRecord.styleId, styleRecord);
+        }
+      }
+    }
+  }
+
+  return { styles, recordCount };
+}
+
+function nativeStylesheetArchiveRecords(payloads: ExpandedIwaPayload[]): IwaArchiveRecord[] {
+  const records = new Map<string, IwaArchiveRecord>();
+  for (const payload of payloads) {
+    for (const record of parseIwaArchiveRecords(payload.data)) {
+      records.set(nativeArchiveRecordKey(record), record);
+    }
+  }
+  const combined = concat(payloads.map((payload) => payload.data));
+  for (const record of parseIwaArchiveRecords(combined)) {
+    records.set(nativeArchiveRecordKey(record), record);
+  }
+  return Array.from(records.values()).sort((left, right) => left.archiveOffset - right.archiveOffset);
+}
+
+function nativeArchiveRecordKey(record: IwaArchiveRecord): string {
+  return `${record.archiveOffset}:${record.identifier ?? ""}:${record.messageInfos.map((message) => `${message.type ?? ""}:${message.length}`).join(",")}`;
+}
+
+function findArchiveMessagePayload(
+  entryPath: string,
+  rawEntryData: Uint8Array,
+  payloads: ExpandedIwaPayload[],
+  record: IwaArchiveRecord,
+  messageInfo: IwaArchiveMessageInfo,
+  payloadOffset: number
+): Uint8Array | undefined {
+  for (const payload of payloads) {
+    const records = parseIwaArchiveRecords(payload.data);
+    const matched = records.find((candidate) => nativeArchiveRecordKey(candidate) === nativeArchiveRecordKey(record));
+    if (!matched) {
+      continue;
+    }
+    let offset = matched.payloadOffset;
+    for (const candidateInfo of matched.messageInfos) {
+      if (candidateInfo.type === messageInfo.type && candidateInfo.length === messageInfo.length && offset + candidateInfo.length <= payload.data.byteLength) {
+        return payload.data.subarray(offset, offset + candidateInfo.length);
+      }
+      offset += candidateInfo.length;
+    }
+  }
+
+  const combined = concat(payloads.map((payload) => payload.data));
+  if (payloadOffset + messageInfo.payloadLength <= combined.byteLength) {
+    return combined.subarray(payloadOffset, payloadOffset + messageInfo.payloadLength);
+  }
+  if (payloadOffset + messageInfo.payloadLength <= rawEntryData.byteLength) {
+    return rawEntryData.subarray(payloadOffset, payloadOffset + messageInfo.payloadLength);
+  }
+  void entryPath;
+  return undefined;
+}
+
+function nativeTextStyleRecordFromPayload(styleId: string, type: number, payload: Uint8Array): NativeTextStyleRecord | undefined {
+  const style: TextStyle = {};
+  const fontSize = numericValueAtFieldPath(payload, [11, 3]);
+  const fontFamily = stringValueAtFieldPath(payload, [11, 5]);
+  const color = nativeColorAtFieldPath(payload, [11, 7]) ?? nativeColorAtFieldPath(payload, [11, 46, 1]);
+  const alignment = type === 2022 ? nativeParagraphAlignment(numericValueAtFieldPath(payload, [12, 1])) : undefined;
+  const lineHeight = numericValueAtFieldPath(payload, [12, 13, 2]) ?? numericValueAtFieldPath(payload, [12, 4]);
+
+  if (fontFamily) style.fontFamily = fontFamily;
+  if (fontSize !== undefined && fontSize > 0 && fontSize <= 400) style.fontSize = fontSize;
+  if (color) style.color = color;
+  if (lineHeight !== undefined && lineHeight > 0 && lineHeight < 10) style.lineHeight = lineHeight;
+
+  const sourceFieldPaths = [
+    ...(fontSize !== undefined ? ["11.3"] : []),
+    ...(fontFamily ? ["11.5"] : []),
+    ...(color ? ["11.7", "11.46.1"] : []),
+    ...(alignment ? ["12.1"] : []),
+    ...(lineHeight !== undefined ? ["12.13.2", "12.4"] : [])
+  ];
+  if (Object.keys(style).length === 0 && !alignment) {
+    return undefined;
+  }
+
+  return {
+    styleId,
+    type,
+    style,
+    ...(alignment ? { alignment } : {}),
+    sourceFieldPaths: uniqueStrings(sourceFieldPaths)
+  };
+}
+
+function nativeParagraphAlignment(value: number | undefined): TextParagraph["alignment"] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === 1) return "right";
+  if (value === 2) return "center";
+  if (value === 3) return "justify";
+  return "left";
+}
+
+function nativeColorAtFieldPath(payload: Uint8Array, fieldPath: number[]): string | undefined {
+  const red = numericValueAtFieldPath(payload, [...fieldPath, 3]);
+  const green = numericValueAtFieldPath(payload, [...fieldPath, 4]);
+  const blue = numericValueAtFieldPath(payload, [...fieldPath, 5]);
+  const alpha = numericValueAtFieldPath(payload, [...fieldPath, 6]);
+  if (red === undefined || green === undefined || blue === undefined) {
+    return undefined;
+  }
+  return nativeRgbaToCss(red, green, blue, alpha);
+}
+
+function nativeRgbaToCss(red: number, green: number, blue: number, alpha = 1): string | undefined {
+  const channels = [red, green, blue];
+  if (channels.some((channel) => !Number.isFinite(channel))) {
+    return undefined;
+  }
+  const normalized = channels.map((channel) => Math.max(0, Math.min(255, Math.round(channel <= 1 ? channel * 255 : channel))));
+  const normalizedAlpha = Math.max(0, Math.min(1, alpha <= 1 ? alpha : alpha / 255));
+  if (normalizedAlpha < 0.999) {
+    return `rgba(${normalized[0]}, ${normalized[1]}, ${normalized[2]}, ${Number(normalizedAlpha.toFixed(3))})`;
+  }
+  return `#${normalized.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
+}
+
 function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
   const textCandidates = new Map<string, IwaTextCandidate>();
   const referenceCandidates = new Map<string, IwaReferenceCandidate>();
@@ -3585,14 +3898,14 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
   const fieldSummaries = new Map<string, NativeIwaFieldSummary>();
   const archiveRecords = new Map<string, NativeIwaArchiveRecordEvidence>();
   const archiveMessages = new Map<string, NativeIwaArchiveMessageEvidence>();
+  const perPayloadRecords = payloads.map((payload) => ({ payload, records: parseIwaArchiveRecords(payload.data) }));
   let protobufFieldCount = 0;
   let nestedMessageCount = 0;
   let rawStringCount = 0;
   let typedArchiveMessageCount = 0;
   let orderBase = 0;
 
-  for (const payload of payloads) {
-    const framedRecords = parseIwaArchiveRecords(payload.data);
+  for (const { payload, records: framedRecords } of perPayloadRecords) {
     for (const record of framedRecords) {
       addBestArchiveRecordEvidence(archiveRecords, archiveRecordEvidence(record));
     }
@@ -3650,6 +3963,29 @@ function scanIwaPayloads(payloads: ExpandedIwaPayload[]): IwaScanResult {
         addBestAnimationHint(animationHints, hint);
       }
       orderBase += data.byteLength * 2 + 2;
+    }
+  }
+
+  if (payloads.length > 1 && perPayloadRecords.every((item) => item.records.length === 0)) {
+    const combined = concat(payloads.map((payload) => payload.data));
+    const combinedRecords = parseIwaArchiveRecords(combined);
+    for (const record of combinedRecords) {
+      addBestArchiveRecordEvidence(archiveRecords, archiveRecordEvidence(record));
+    }
+    typedArchiveMessageCount += combinedRecords.reduce((total, record) => total + record.messageInfos.length, 0);
+    for (const item of archiveMessagePayloadsFromRecords(combined, combinedRecords)) {
+      const protobufScan = scanProtobufPayload(item.data, orderBase);
+      addBestArchiveMessageEvidence(
+        archiveMessages,
+        createArchiveMessageEvidence(
+          item.archiveMessage.record,
+          item.archiveMessage.messageInfo,
+          item.archiveMessage.messageIndex,
+          protobufScan,
+          item.data
+        )
+      );
+      orderBase += item.data.byteLength + 1;
     }
   }
 
@@ -4661,12 +4997,49 @@ function nativeTextContentEvidenceFromPayload(
   if (!cleaned) {
     return undefined;
   }
+  const paragraphStyleRuns = nativeTextStyleRunsAtPath(payload, [5, 1], "5.1");
+  const characterStyleRuns = nativeTextStyleRunsAtPath(payload, [8, 1], "8.1");
   return {
     kind: "textContent",
     text: cleaned,
+    paragraphStyleRuns,
+    characterStyleRuns,
     confidence: 0.9,
-    sourceFieldPaths: ["3"]
+    sourceFieldPaths: uniqueStrings([
+      "3",
+      ...(paragraphStyleRuns.length > 0 ? ["5.1.1", "5.1.2.1"] : []),
+      ...(characterStyleRuns.length > 0 ? ["8.1.1", "8.1.2.1"] : [])
+    ])
   };
+}
+
+function nativeTextStyleRunsAtPath(
+  payload: Uint8Array,
+  runContainerPath: number[],
+  sourceFieldPath: string
+): NativeIwaTextStyleRunEvidence[] {
+  const runMessages = bytesValuesAtFieldPath(payload, runContainerPath);
+  const runs: NativeIwaTextStyleRunEvidence[] = [];
+  for (const runMessage of runMessages) {
+    const starts = numericValuesAtFieldPath(runMessage, [1]);
+    const styleIds = numericValuesAtFieldPath(runMessage, [2, 1])
+      .map(nativeIdFromNumber)
+      .filter((value): value is string => Boolean(value));
+    const count = Math.min(starts.length, styleIds.length);
+    for (let index = 0; index < count; index += 1) {
+      const start = starts[index];
+      const styleId = styleIds[index];
+      if (start === undefined || styleId === undefined || start < 0) {
+        continue;
+      }
+      runs.push({
+        start: Math.floor(start),
+        styleId,
+        sourceFieldPath
+      });
+    }
+  }
+  return runs.sort((left, right) => left.start - right.start || left.styleId.localeCompare(right.styleId));
 }
 
 function nativeTextDrawableEvidenceFromPayload(
