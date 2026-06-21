@@ -1489,11 +1489,14 @@ function buildNativeSlides(
         : [createPlaceholderObject(slideId, entry.path, deckSize)];
     const buildAnimationRecovery = recoverNativeBuildAnimations(slideId, objects, scan.archiveMessages);
 
+    const nativeTransition = inferNativeSlideTransition(slideId, index, scan.animationHints, index > 0 ? `slide-${index}` : undefined);
+
     return {
       id: slideId,
       index,
       name: readSlideName(entry.path, index),
       background: { type: "solid" as const, color: "#ffffff" },
+      ...(nativeTransition ? { transition: nativeTransition } : {}),
       objects,
       timeline: {
         durationMs: buildAnimationRecovery.durationMs,
@@ -1722,6 +1725,75 @@ function createPlaceholderSlide(
       nativeSourcePath: sourcePath,
       nativeParser: "iwa-protobuf-field-scan"
     }
+  };
+}
+
+function inferNativeSlideTransition(
+  slideId: string,
+  index: number,
+  hints: NativeIwaAnimationHint[],
+  previousSlideId?: string
+): Slide["transition"] | undefined {
+  if (index === 0 || hints.length === 0) {
+    return undefined;
+  }
+  const best = [...hints].sort(compareAnimationHints)[0];
+  if (!best) {
+    return undefined;
+  }
+  if (best.kind === "magicMove" || best.kind === "morph") {
+    return {
+      id: `${slideId}-native-${best.kind}-transition`,
+      type: best.kind === "magicMove" ? "magicMove" : "morph",
+      durationMs: 1000,
+      easing: "easeInOut",
+      trigger: "auto",
+      ...(previousSlideId ? { fromSlideId: previousSlideId } : {}),
+      toSlideId: slideId,
+      morph: {
+        strategy: best.kind === "magicMove" ? "magicMove" : "morph",
+        matching: {
+          matchBy: ["morphKey", "objectId", "name", "geometry"],
+          fallback: "geometry",
+          tolerance: 0.08
+        },
+        properties: ["bounds", "transform", "opacity"]
+      },
+      metadata: nativeTransitionMetadata(best, "native-animation-hint")
+    };
+  }
+  if (best.kind === "transition" && isSpecificNativeTransitionHint(best)) {
+    return {
+      id: `${slideId}-native-transition`,
+      type: "dissolve",
+      durationMs: 700,
+      easing: "easeInOut",
+      trigger: "auto",
+      ...(previousSlideId ? { fromSlideId: previousSlideId } : {}),
+      toSlideId: slideId,
+      metadata: nativeTransitionMetadata(best, "native-transition-hint")
+    };
+  }
+  return undefined;
+}
+
+function isSpecificNativeTransitionHint(hint: NativeIwaAnimationHint): boolean {
+  const evidence = hint.evidence.trim();
+  if (/^(?:xbo\s+)?transition$/i.test(evidence)) {
+    return false;
+  }
+  return hint.confidence >= 0.45 || /\b(dissolve|fade|wipe|push|zoom|magic|morph)\b/i.test(evidence);
+}
+
+function nativeTransitionMetadata(hint: NativeIwaAnimationHint, fallback: string): JSONRecord {
+  return {
+    nativeSource: "keynote-iwa-animation-hint",
+    nativeTransitionFallback: fallback,
+    nativeAnimationHintKind: hint.kind,
+    nativeAnimationHintEvidence: hint.evidence,
+    nativeAnimationHintSource: hint.source,
+    nativeAnimationHintConfidence: hint.confidence,
+    ...(hint.fieldPath ? { nativeAnimationHintFieldPath: hint.fieldPath } : {})
   };
 }
 
@@ -4384,6 +4456,13 @@ function scanProtobufFields(
       for (const hint of detectAnimationHints(text, "protobuf", depth > 0 ? 0.6 : 0.54, fieldPath)) {
         addBestAnimationHint(state.animationHints, hint);
       }
+    } else {
+      const rawText = decodeAnimationHintText(field.value);
+      if (rawText) {
+        for (const hint of detectAnimationHints(rawText, "protobuf", depth > 0 ? 0.48 : 0.42, fieldPath)) {
+          addBestAnimationHint(state.animationHints, hint);
+        }
+      }
     }
 
     const reference = decodeReferenceCandidate(field.value);
@@ -4942,6 +5021,13 @@ function scanRawStrings(data: Uint8Array, orderBase: number): {
         for (const hint of detectAnimationHints(text, "raw", 0.36)) {
           addBestAnimationHint(animationHints, hint);
         }
+      } else {
+        const rawText = decodeAnimationHintText(bytes);
+        if (rawText) {
+          for (const hint of detectAnimationHints(rawText, "raw", 0.3)) {
+            addBestAnimationHint(animationHints, hint);
+          }
+        }
       }
 
       const reference = decodeReferenceCandidate(bytes);
@@ -4974,6 +5060,15 @@ function decodeReferenceCandidate(bytes: Uint8Array): string | undefined {
     return undefined;
   }
   return text;
+}
+
+function decodeAnimationHintText(bytes: Uint8Array): string | undefined {
+  const decoded = decodeUtf8(bytes);
+  if (!decoded || decoded.includes("\ufffd")) {
+    return undefined;
+  }
+  const text = stripInvalidTextChars(decoded).replace(/\u0000/g, " ").replace(/\s+/g, " ").trim();
+  return text.length >= 4 && text.length <= 512 ? text : undefined;
 }
 
 function matchAssetReference(candidate: IwaReferenceCandidate, assets: NativeAssetCatalog): NativeAssetMatch[] {
@@ -5751,6 +5846,9 @@ function isLikelyNativeNoiseText(text: string): boolean {
   if (hasInternalKeynoteToken(text)) {
     return true;
   }
+  if (isNativeAnimationOnlyText(text)) {
+    return true;
+  }
   if (hasNativeLocaleResidue(text)) {
     return true;
   }
@@ -5787,6 +5885,15 @@ function isLikelyNativeNoiseText(text: string): boolean {
 
 function isAllowedNativeShortAsciiTail(value: string): boolean {
   return new Set(["AI", "API", "App", "Demo", "MVP", "NOM", "UI", "V1", "V2", "Web"]).has(value);
+}
+
+function isNativeAnimationOnlyText(text: string): boolean {
+  const words = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  if (words.length === 0) {
+    return false;
+  }
+  const animationWords = new Set(["apple", "xbo", "magic", "move", "magicmove", "morph", "morphing", "transition", "motion", "path", "implied"]);
+  return words.some((word) => ["magic", "magicmove", "morph", "transition", "motion", "path"].includes(word)) && words.every((word) => animationWords.has(word));
 }
 
 function hasNativeLocaleResidue(text: string): boolean {

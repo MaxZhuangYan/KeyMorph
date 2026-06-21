@@ -295,6 +295,7 @@ describe("Keynote bridge", () => {
     assert.equal(deck.deck.slides[0]?.metadata?.nativeGeometryCandidateCount, 1);
     assert.equal(deck.deck.slides[0]?.metadata?.nativeGroupingHintCount, 1);
     assert.ok((deck.deck.slides[0]?.metadata?.nativeAnimationHintCount as number) >= 2);
+    assert.equal(deck.deck.slides[0]?.transition, undefined);
     assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-geometry-candidates-detected"), true);
     assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-animation-hints-detected"), true);
     assert.equal(deck.conversion?.uncertainMappings?.some((mapping) => mapping.code === "keynote-native-geometry-candidate-scan"), true);
@@ -305,6 +306,42 @@ describe("Keynote bridge", () => {
     assert.equal(deck.conversion?.metadata?.lossReport?.automationUsed, false);
     assert.equal(deck.conversion?.metadata?.lossReport?.evidenceCounts?.geometryCandidateCount, 1);
     assert.equal(deck.conversion?.metadata?.lossReport?.evidenceCounts?.quickLookPreviewWithDimensionsCount, 1);
+  });
+
+  test("maps native Magic Move hints to conservative slide transitions", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-magic-move-transition-"));
+    const keyPath = path.join(dir, "magic.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("Intro slide"));
+    await writeFile(path.join(keyPath, "Index", "Slide-2.iwa"), protoString("Magic Move morph transition"));
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.slides[0]?.transition, undefined);
+    const transition = deck.deck.slides[1]?.transition;
+    assert.equal(transition?.type, "magicMove");
+    assert.equal(transition?.fromSlideId, "slide-1");
+    assert.equal(transition?.toSlideId, "slide-2");
+    assert.equal(transition?.morph?.strategy, "magicMove");
+    assert.deepEqual(transition?.morph?.matching?.matchBy, ["morphKey", "objectId", "name", "geometry"]);
+    assert.deepEqual(transition?.morph?.properties, ["bounds", "transform", "opacity"]);
+    assert.equal(transition?.metadata?.nativeAnimationHintKind, "magicMove");
+    assert.equal(deck.deck.slides[1]?.metadata?.nativeMagicMoveHintCount, 1);
+    assert.equal(deck.deck.slides[1]?.objects.some((object) => object.type === "text" && /magic|morph|transition/i.test(object.text.plainText)), false);
+  });
+
+  test("keeps generic native transition hints without inventing a slide transition", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-transition-hint-"));
+    const keyPath = path.join(dir, "transition.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("Intro slide"));
+    await writeFile(path.join(keyPath, "Index", "Slide-2.iwa"), protoString("XBO Transition"));
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.slides[1]?.transition, undefined);
+    assert.equal(deck.deck.slides[1]?.metadata?.nativeAnimationHintCount, 1);
+    assert.equal(deck.deck.slides[1]?.objects.some((object) => object.type === "text" && /transition/i.test(object.text.plainText)), false);
   });
 
   test("filters Keynote internal tokens and binary residue out of recovered slide text", async () => {
