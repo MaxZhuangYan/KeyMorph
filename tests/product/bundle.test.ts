@@ -14,6 +14,7 @@ import {
   createProductApiResponse,
   createProductBundle,
   benchmarkKeynoteDeck,
+  createProductFrameFidelityInsights,
   exportProductBundleBaseline,
   exportProductBundleKeynote,
   inspectProductInput,
@@ -342,6 +343,68 @@ describe("product bundle workflow", () => {
     assert.ok(summary.nextRecommendedActions.some((action: string) => /worstFrames/.test(action)));
   });
 
+  test("creates product fidelity insights for UI worst-frame triage", async () => {
+    const report = {
+      frames: [
+        {
+          frame: 0,
+          timeMs: 0,
+          referencePath: "/tmp/ref-0.png",
+          actualPath: "/tmp/actual-0.png",
+          outputPath: "frame-000000.png",
+          resolution: { slideIndex: 0, slideId: "slide-a", slideTimeMs: 0, inTransition: false, transitionProgress: 0 },
+          pixelFidelityScore: 0.98,
+          mismatchRatio: 0.02,
+          width: 1,
+          height: 1,
+          totalPixels: 1,
+          comparedPixels: 1,
+          mismatchedPixels: 0,
+          missingPixels: 0,
+          meanAbsoluteError: 0,
+          rootMeanSquareError: 0,
+          maxDelta: 0,
+          threshold: 0.1,
+          dimensionsMatch: true
+        },
+        {
+          frame: 1,
+          timeMs: 1000,
+          referencePath: "/tmp/ref-1.png",
+          actualPath: "/tmp/actual-1.png",
+          outputPath: "frame-000001.png",
+          resolution: { slideIndex: 1, slideId: "slide-b", slideTimeMs: 0, inTransition: false, transitionProgress: 0 },
+          pixelFidelityScore: 0.42,
+          mismatchRatio: 0.68,
+          diffPath: "/tmp/diff-1.png",
+          width: 1,
+          height: 1,
+          totalPixels: 1,
+          comparedPixels: 1,
+          mismatchedPixels: 1,
+          missingPixels: 0,
+          meanAbsoluteError: 1,
+          rootMeanSquareError: 1,
+          maxDelta: 1,
+          threshold: 0.1,
+          dimensionsMatch: true
+        }
+      ],
+      summary: {
+        bySlide: [
+          { slideIndex: 0, slideId: "slide-a", frameCount: 1, transitionFrameCount: 0, totalPixels: 1, mismatchedPixels: 0, mismatchRatio: 0.02, meanPixelFidelityScore: 0.98, worstFrame: 0 },
+          { slideIndex: 1, slideId: "slide-b", frameCount: 1, transitionFrameCount: 0, totalPixels: 1, mismatchedPixels: 1, mismatchRatio: 0.68, meanPixelFidelityScore: 0.42, worstFrame: 1 }
+        ]
+      }
+    } as never;
+
+    const insights = createProductFrameFidelityInsights(report, { frameLimit: 1, slideLimit: 1 });
+
+    assert.equal(insights.worstFrames[0].frame, 1);
+    assert.equal(insights.worstFrames[0].slideId, "slide-b");
+    assert.equal(insights.worstSlides[0].slideIndex, 1);
+  });
+
   test("CLI benchmark copies a Keynote source without running baseline by default", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-benchmark-cli-"));
     const inputPath = path.join(dir, "source.key");
@@ -410,6 +473,10 @@ describe("product bundle workflow", () => {
     assert.match(source, /renderBaseline" type="button"' \+ \(baselineCanRun \? '' : ' disabled'\)/);
     assert.match(source, /keynoteEndpoint \+ '\?allowKeynote=1'/);
     assert.match(source, /downloadLink\(payload\.diffUrl, t\('openBaselineDiffs'\), true\)/);
+    assert.match(source, /createProductFrameFidelityInsights/);
+    assert.match(source, /worstFramesTitle/);
+    assert.match(source, /最差帧/);
+    assert.match(source, /最差影格/);
   });
 });
 

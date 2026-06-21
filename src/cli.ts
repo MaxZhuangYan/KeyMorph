@@ -107,6 +107,11 @@ export interface ProductBenchmarkSlideSummary {
   worstFrame?: number;
 }
 
+export interface ProductFrameFidelityInsights {
+  worstFrames: ProductBenchmarkFrameSummary[];
+  worstSlides: ProductBenchmarkSlideSummary[];
+}
+
 export interface ProductBaselineExportOptions {
   allowKeynoteAutomation?: boolean;
   keynoteAutomationTimeoutMs?: number;
@@ -471,6 +476,16 @@ export async function benchmarkKeynoteDeck(inputPath: string, options: ProductKe
   return { inputPath: resolvedInput, copiedSourcePath, bundleDir, summaryPath, bundle, baseline, summary };
 }
 
+export function createProductFrameFidelityInsights(
+  report: VideoFrameFidelityReport,
+  options: { frameLimit?: number; slideLimit?: number } = {}
+): ProductFrameFidelityInsights {
+  return {
+    worstFrames: summarizeWorstBenchmarkFrames(report, options.frameLimit ?? 12),
+    worstSlides: summarizeWorstBenchmarkSlides(report, options.slideLimit ?? 8)
+  };
+}
+
 export async function exportProductBundleKeynote(
   jobDir: string,
   options: Pick<ProductBundleOptions, "allowKeynoteAutomation" | "keynoteAutomationTimeoutMs"> = {}
@@ -770,8 +785,9 @@ async function createKeyBenchmarkSummary(input: {
   const baselineMessage =
     input.baseline?.message ??
     (fidelityReport ? "Keynote golden baseline pixel fidelity report is ready." : "Baseline was not run. Pass --allow-keynote to run it.");
-  const worstFrames = fidelityReport ? summarizeWorstBenchmarkFrames(fidelityReport, 12) : [];
-  const worstSlides = fidelityReport ? summarizeWorstBenchmarkSlides(fidelityReport, 8) : [];
+  const insights = fidelityReport ? createProductFrameFidelityInsights(fidelityReport, { frameLimit: 12, slideLimit: 8 }) : null;
+  const worstFrames = insights?.worstFrames ?? [];
+  const worstSlides = insights?.worstSlides ?? [];
   const nextRecommendedActions = createBenchmarkRecommendations(input.bundle, baselineStatus, fidelityReport);
 
   return {

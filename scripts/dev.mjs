@@ -1,5 +1,5 @@
 import { createReadStream } from "node:fs";
-import { mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import { renderHtmlDocument } from "../src/runtime/index.ts";
 import {
   createProductApiResponse,
   createProductBundle,
+  createProductFrameFidelityInsights,
   exportProductBundleBaseline,
   exportProductBundleKeynote,
   exportProductBundleVideo
@@ -187,6 +188,9 @@ async function handleBaselineExport(jobId, url, response) {
     );
     return;
   }
+  const insightReport = JSON.parse(await readFile(path.join(jobDir, "baseline-fidelity.json"), "utf8"));
+  const insights = createProductFrameFidelityInsights(insightReport, { frameLimit: 5, slideLimit: 5 });
+  const toJobUrl = (filePath) => filePath ? `/demo/out/jobs/${jobId}/${path.relative(jobDir, filePath).split(path.sep).join('/')}` : null;
 
   send(
     response,
@@ -200,6 +204,15 @@ async function handleBaselineExport(jobId, url, response) {
       actualFramesUrl: `/demo/out/jobs/${jobId}/frames/keymorph-baseline/`,
       reportUrl: `/demo/out/jobs/${jobId}/baseline-fidelity.json`,
       diffUrl: `/demo/out/jobs/${jobId}/baseline-diffs/`,
+      insights: {
+        worstFrames: insights.worstFrames.map((frame) => ({
+          ...frame,
+          referenceUrl: toJobUrl(frame.referencePath),
+          actualUrl: toJobUrl(frame.actualPath),
+          diffUrl: toJobUrl(frame.diffPath)
+        })),
+        worstSlides: insights.worstSlides
+      },
       summary: result.summary
     }),
     "application/json; charset=utf-8"
@@ -421,6 +434,13 @@ function renderAppHtml() {
         openRuntimeFrames: 'Open runtime frames',
         baselineSource: 'Source: {source}.',
         baselineFidelityMean: 'Baseline mean score: {score}.',
+        worstFramesTitle: 'Worst frames',
+        worstSlidesTitle: 'Worst slides',
+        worstFrameLabel: 'Frame {frame} · slide {slide} · score {score}',
+        worstSlideLabel: 'Slide {slide} · mean {score} · worst frame {frame}',
+        openDiff: 'Diff',
+        openReference: 'Reference',
+        openRuntime: 'Runtime',
         keynoteExporting: 'Exporting Keynote via local Keynote automation...',
         keynoteUnavailable: 'Keynote export is unavailable.',
         keynoteReady: 'Keynote ready.',
@@ -493,6 +513,13 @@ function renderAppHtml() {
         openRuntimeFrames: '打开运行时帧',
         baselineSource: '来源：{source}。',
         baselineFidelityMean: '基准平均分：{score}。',
+        worstFramesTitle: '最差帧',
+        worstSlidesTitle: '最差页',
+        worstFrameLabel: '第 {frame} 帧 · 第 {slide} 页 · 分数 {score}',
+        worstSlideLabel: '第 {slide} 页 · 平均 {score} · 最差帧 {frame}',
+        openDiff: '差异图',
+        openReference: '参考帧',
+        openRuntime: '运行时帧',
         keynoteExporting: '正在通过本地 Keynote 自动化导出...',
         keynoteUnavailable: 'Keynote 导出不可用。',
         keynoteReady: 'Keynote 已就绪。',
@@ -565,6 +592,13 @@ function renderAppHtml() {
         openRuntimeFrames: '開啟執行時影格',
         baselineSource: '來源：{source}。',
         baselineFidelityMean: '基準平均分：{score}。',
+        worstFramesTitle: '最差影格',
+        worstSlidesTitle: '最差頁',
+        worstFrameLabel: '第 {frame} 幀 · 第 {slide} 頁 · 分數 {score}',
+        worstSlideLabel: '第 {slide} 頁 · 平均 {score} · 最差幀 {frame}',
+        openDiff: '差異圖',
+        openReference: '參考影格',
+        openRuntime: '執行時影格',
         keynoteExporting: '正在透過本機 Keynote 自動化匯出...',
         keynoteUnavailable: 'Keynote 匯出不可用。',
         keynoteReady: 'Keynote 已就緒。',
@@ -833,7 +867,8 @@ function renderAppHtml() {
             downloadLink(payload.baselineMovieUrl, t('downloadBaselineMovie')) +
             downloadLink(payload.baselineFramesUrl, t('openReferenceFrames'), true) +
             downloadLink(payload.actualFramesUrl, t('openRuntimeFrames'), true) +
-          '</div>';
+          '</div>' +
+          fidelityInsightsHtml(payload.insights);
       } catch (error) {
         baselineStatus.className = 'status error';
         baselineStatus.textContent = error instanceof Error ? error.message : String(error);
@@ -886,6 +921,29 @@ function renderAppHtml() {
     }
     function guidanceText(guidance) {
       return Array.isArray(guidance) && guidance.length ? ' ' + guidance.join(' ') : '';
+    }
+    function fidelityInsightsHtml(insights) {
+      const frames = insights?.worstFrames || [];
+      const slides = insights?.worstSlides || [];
+      if (!frames.length && !slides.length) return '';
+      const frameItems = frames.slice(0, 5).map((frame) => {
+        return '<li>' +
+          escapeHtml(t('worstFrameLabel', { frame: frame.frame, slide: Number(frame.slideIndex || 0) + 1, score: frame.pixelFidelityScore })) +
+          '<div class="link-row">' +
+            downloadLink(frame.diffUrl, t('openDiff'), true) +
+            downloadLink(frame.referenceUrl, t('openReference'), true) +
+            downloadLink(frame.actualUrl, t('openRuntime'), true) +
+          '</div>' +
+        '</li>';
+      }).join('');
+      const slideItems = slides.slice(0, 5).map((slide) => {
+        return '<li>' + escapeHtml(t('worstSlideLabel', {
+          slide: Number(slide.slideIndex || 0) + 1,
+          score: slide.meanPixelFidelityScore,
+          frame: slide.worstFrame ?? 'n/a'
+        })) + '</li>';
+      }).join('');
+      return '<div class="sub"><strong>' + t('worstFramesTitle') + '</strong><ul class="fixes">' + frameItems + '</ul><strong>' + t('worstSlidesTitle') + '</strong><ul class="fixes">' + slideItems + '</ul></div>';
     }
     function fidelityLinks(frameFidelity) {
       if (!frameFidelity) return '<div class="sub">' + t('frameReportPending') + '</div>';
