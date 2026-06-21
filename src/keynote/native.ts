@@ -229,8 +229,19 @@ export interface NativeIwaTextDrawableEvidence {
   textArchiveIds: string[];
   slideArchiveId?: string;
   bounds?: { x: number; y: number; width: number; height: number };
+  layout?: NativeTextDrawableLayoutEvidence;
   confidence: number;
   sourceFieldPaths: string[];
+}
+
+export interface NativeTextDrawableLayoutEvidence {
+  kind: "text";
+  frame: { x: number; y: number; width: number; height: number };
+  frameFieldPaths: string[];
+  schema: "typed-text-drawable-frame-1.1";
+  textArchiveIds: string[];
+  slideArchiveId?: string;
+  confidence: number;
 }
 
 export interface NativeIwaFieldSummary {
@@ -1983,9 +1994,20 @@ function createNativeTextDrawableObject(
       nativeTextContentConfidence: textEntry.confidence,
       nativeTextDrawableFieldPaths: drawable.sourceFieldPaths,
       nativeTextContentFieldPaths: textEntry.sourceFieldPaths,
+      ...(drawable.layout ? nativeTextDrawableLayoutMetadata(drawable.layout) : {}),
       ...(drawable.slideArchiveId ? { nativeTextDrawableSlideArchiveId: drawable.slideArchiveId } : {}),
       ...(drawable.bounds ? { nativeTextDrawableRawBounds: drawable.bounds } : {})
     }
+  };
+}
+
+function nativeTextDrawableLayoutMetadata(layout: NativeTextDrawableLayoutEvidence): JSONRecord {
+  return {
+    nativeTextDrawableLayout: layout,
+    nativeTextDrawableSchema: layout.schema,
+    nativeTextDrawableFrameFieldPaths: layout.frameFieldPaths,
+    nativeTextDrawableFrameConfidence: layout.confidence,
+    ...(layout.slideArchiveId ? { nativeTextDrawableParentSlideArchiveId: layout.slideArchiveId } : {})
   };
 }
 
@@ -4411,13 +4433,34 @@ function nativeTextDrawableEvidenceFromPayload(
     ...(height !== undefined ? ["1.3.5.2.2"] : []),
     ...(textArchiveIds.length > 0 ? ["2.1", "4.1"] : [])
   ];
+  const layout =
+    bounds && textArchiveIds.length > 0
+      ? nativeTextDrawableLayoutEvidence(bounds, textArchiveIds, slideArchiveId)
+      : undefined;
   return {
     kind: "textDrawable",
     textArchiveIds,
     ...(slideArchiveId ? { slideArchiveId } : {}),
     ...(bounds ? { bounds } : {}),
+    ...(layout ? { layout } : {}),
     confidence: roundConfidence(0.36 + (textArchiveIds.length > 0 ? 0.3 : 0) + (bounds ? 0.22 : 0) + (slideArchiveId ? 0.04 : 0)),
     sourceFieldPaths: uniqueStrings(sourceFieldPaths)
+  };
+}
+
+function nativeTextDrawableLayoutEvidence(
+  frame: { x: number; y: number; width: number; height: number },
+  textArchiveIds: string[],
+  slideArchiveId?: string
+): NativeTextDrawableLayoutEvidence {
+  return {
+    kind: "text",
+    frame,
+    frameFieldPaths: ["1.1.1.1.1", "1.1.1.1.2", "1.3.5.2.1", "1.3.5.2.2"],
+    schema: "typed-text-drawable-frame-1.1",
+    textArchiveIds,
+    ...(slideArchiveId ? { slideArchiveId } : {}),
+    confidence: roundConfidence(0.86 + (slideArchiveId ? 0.04 : 0))
   };
 }
 

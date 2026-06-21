@@ -807,6 +807,17 @@ describe("Keynote bridge", () => {
     assert.deepEqual(object.bounds, { x: 240, y: 180, width: 420, height: 96 });
     assert.equal(object.metadata?.nativeArchiveIdentifier, "1100");
     assert.equal(object.metadata?.nativeTextArchiveIdentifier, "1200");
+    assert.deepEqual(object.metadata?.nativeTextDrawableLayout, {
+      kind: "text",
+      frame: { x: 240, y: 180, width: 420, height: 96 },
+      frameFieldPaths: ["1.1.1.1.1", "1.1.1.1.2", "1.3.5.2.1", "1.3.5.2.2"],
+      schema: "typed-text-drawable-frame-1.1",
+      textArchiveIds: ["1200"],
+      slideArchiveId: "900",
+      confidence: 0.9
+    });
+    assert.equal(object.metadata?.nativeTextDrawableSchema, "typed-text-drawable-frame-1.1");
+    assert.equal(object.metadata?.nativeTextDrawableParentSlideArchiveId, "900");
 
     const events = deck.deck.slides[0]?.timeline?.events ?? [];
     const appear = events.find((event) => event.metadata?.nativeBuildId === "1300");
