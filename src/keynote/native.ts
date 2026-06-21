@@ -471,11 +471,13 @@ interface IwaScanResult {
 interface NativeTextStyleMap {
   styles: Map<string, NativeTextStyleRecord>;
   recordCount: number;
+  inheritanceResolvedCount: number;
 }
 
 interface NativeTextStyleRecord {
   styleId: string;
   type: number;
+  parentStyleId?: string;
   style: TextStyle;
   alignment?: TextParagraph["alignment"];
   sourceFieldPaths: string[];
@@ -2058,6 +2060,7 @@ function createTextObject(
       ...(textEntry
         ? {
             nativeTextStyleMapRecordCount: textStyleMap.recordCount,
+            nativeTextStyleInheritanceResolvedCount: textStyleMap.inheritanceResolvedCount,
             nativeParagraphStyleRunCount: textEntry.paragraphStyleRuns.length,
             nativeCharacterStyleRunCount: textEntry.characterStyleRuns.length,
             ...nativeTextStyleMetadata(textEntry, textContent)
@@ -2188,6 +2191,7 @@ function createNativeTextDrawableObject(
       nativeTextDrawableFieldPaths: drawable.sourceFieldPaths,
       nativeTextContentFieldPaths: textEntry.sourceFieldPaths,
       nativeTextStyleMapRecordCount: textStyleMap.recordCount,
+      nativeTextStyleInheritanceResolvedCount: textStyleMap.inheritanceResolvedCount,
       nativeParagraphStyleRunCount: textEntry.paragraphStyleRuns.length,
       nativeCharacterStyleRunCount: textEntry.characterStyleRuns.length,
       ...nativeTextStyleMetadata(textEntry, textContent),
@@ -3739,7 +3743,7 @@ function scanIwaEntry(data: Uint8Array): IwaScanResult {
 }
 
 function emptyNativeTextStyleMap(): NativeTextStyleMap {
-  return { styles: new Map(), recordCount: 0 };
+  return { styles: new Map(), recordCount: 0, inheritanceResolvedCount: 0 };
 }
 
 function readNativeTextStyleMap(iwaEntries: Array<{ path: string; data: Uint8Array }>): NativeTextStyleMap {
@@ -3768,7 +3772,8 @@ function readNativeTextStyleMap(iwaEntries: Array<{ path: string; data: Uint8Arr
     }
   }
 
-  return { styles, recordCount };
+  const inheritanceResolvedCount = resolveNativeTextStyleInheritance(styles);
+  return { styles, recordCount, inheritanceResolvedCount };
 }
 
 function nativeStylesheetArchiveRecords(payloads: ExpandedIwaPayload[]): IwaArchiveRecord[] {
@@ -3825,6 +3830,7 @@ function findArchiveMessagePayload(
 
 function nativeTextStyleRecordFromPayload(styleId: string, type: number, payload: Uint8Array): NativeTextStyleRecord | undefined {
   const style: TextStyle = {};
+  const parentStyleId = nativeIdFromNumber(numericValueAtFieldPath(payload, [1, 3, 1]));
   const fontSize = numericValueAtFieldPath(payload, [11, 3]);
   const fontFamily = stringValueAtFieldPath(payload, [11, 5]);
   const color = nativeColorAtFieldPath(payload, [11, 7]) ?? nativeColorAtFieldPath(payload, [11, 46, 1]);
@@ -3837,6 +3843,7 @@ function nativeTextStyleRecordFromPayload(styleId: string, type: number, payload
   if (lineHeight !== undefined && lineHeight > 0 && lineHeight < 10) style.lineHeight = lineHeight;
 
   const sourceFieldPaths = [
+    ...(parentStyleId ? ["1.3.1"] : []),
     ...(fontSize !== undefined ? ["11.3"] : []),
     ...(fontFamily ? ["11.5"] : []),
     ...(color ? ["11.7", "11.46.1"] : []),
@@ -3850,9 +3857,61 @@ function nativeTextStyleRecordFromPayload(styleId: string, type: number, payload
   return {
     styleId,
     type,
+    ...(parentStyleId ? { parentStyleId } : {}),
     style,
     ...(alignment ? { alignment } : {}),
     sourceFieldPaths: uniqueStrings(sourceFieldPaths)
+  };
+}
+
+function resolveNativeTextStyleInheritance(styles: Map<string, NativeTextStyleRecord>): number {
+  let resolvedCount = 0;
+  for (const style of styles.values()) {
+    const inherited = inheritedNativeTextStyleRecord(style, styles);
+    if (!inherited) {
+      continue;
+    }
+    const inheritedStyle = compactTextStyle({
+      ...inherited.style,
+      ...style.style
+    });
+    if (JSON.stringify(inheritedStyle) !== JSON.stringify(style.style)) {
+      style.style = inheritedStyle;
+      resolvedCount += 1;
+    }
+    if (!style.alignment && inherited.alignment) {
+      style.alignment = inherited.alignment;
+    }
+    style.sourceFieldPaths = uniqueStrings([...inherited.sourceFieldPaths.map((fieldPath) => `parent.${fieldPath}`), ...style.sourceFieldPaths]);
+  }
+  return resolvedCount;
+}
+
+function inheritedNativeTextStyleRecord(
+  style: NativeTextStyleRecord,
+  styles: Map<string, NativeTextStyleRecord>,
+  visited = new Set<string>()
+): NativeTextStyleRecord | undefined {
+  if (!style.parentStyleId || visited.has(style.parentStyleId)) {
+    return undefined;
+  }
+  visited.add(style.styleId);
+  const parent = styles.get(style.parentStyleId);
+  if (!parent) {
+    return undefined;
+  }
+  const grandparent = inheritedNativeTextStyleRecord(parent, styles, visited);
+  if (!grandparent) {
+    return parent;
+  }
+  return {
+    ...parent,
+    style: compactTextStyle({
+      ...grandparent.style,
+      ...parent.style
+    }),
+    alignment: parent.alignment ?? grandparent.alignment,
+    sourceFieldPaths: uniqueStrings([...grandparent.sourceFieldPaths.map((fieldPath) => `parent.${fieldPath}`), ...parent.sourceFieldPaths])
   };
 }
 

@@ -1082,6 +1082,60 @@ describe("Keynote bridge", () => {
     assert.deepEqual(object.metadata?.nativeTextStyleIds, ["9300"]);
   });
 
+  test("inherits native text style properties through stylesheet parent links", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-style-inheritance-"));
+    const keyPath = path.join(dir, "style-inheritance.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "DocumentStylesheet.iwa"),
+      concat([
+        iwaArchiveRecord(9400, [
+          {
+            type: 2022,
+            payload: nativeParagraphStylePayload({
+              fontFamily: "HelveticaNeue-Medium",
+              fontSize: 106,
+              color: { red: 1, green: 1, blue: 1, alpha: 1 },
+              alignment: 2
+            }),
+            objectReferences: [9400]
+          }
+        ]),
+        iwaArchiveRecord(9401, [
+          {
+            type: 2022,
+            payload: nativeParagraphStylePayload({
+              parentStyleId: 9400,
+              fontSize: 46,
+              alignment: 0
+            }),
+            objectReferences: [9401]
+          }
+        ])
+      ])
+    );
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      iwaArchiveRecord(1200, [
+        { type: 2001, payload: nativeStyledTextContentPayload("Inherited title", { paragraphStyleId: 9401 }) }
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.type === "text");
+    assert.equal(object?.type, "text");
+    if (object?.type !== "text") throw new Error("Expected fallback text.");
+    assert.deepEqual(object.text.runs?.[0]?.style, {
+      fontFamily: "HelveticaNeue-Medium",
+      fontSize: 46,
+      color: "#ffffff"
+    });
+    assert.equal(object.text.paragraphs?.[0]?.alignment, "left");
+    assert.equal(object.metadata?.nativeTextStyleInheritanceResolvedCount, 1);
+  });
+
   test("preserves character-level dissolve build semantics when degrading to object opacity", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-character-dissolve-"));
     const keyPath = path.join(dir, "character-dissolve.key");
@@ -1708,13 +1762,15 @@ function nativeTextStyleRunPayload(start: number, styleId: number): Uint8Array {
 }
 
 function nativeParagraphStylePayload(values: {
-  fontFamily: string;
-  fontSize: number;
-  color: { red: number; green: number; blue: number; alpha: number };
+  parentStyleId?: number;
+  fontFamily?: string;
+  fontSize?: number;
+  color?: { red: number; green: number; blue: number; alpha: number };
   alignment?: number;
   lineHeight?: number;
 }): Uint8Array {
   return concat([
+    ...(values.parentStyleId !== undefined ? [protoBytes(protoBytes(protoVarint(1, values.parentStyleId), 3), 1)] : []),
     protoBytes(nativeTextStylePayload(values), 11),
     protoBytes(
       concat([
