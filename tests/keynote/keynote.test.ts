@@ -1168,7 +1168,7 @@ describe("Keynote bridge", () => {
     assert.equal(object.text.plainText, "声望记录");
     assert.deepEqual(object.text.runs?.[0]?.style, {
       fontFamily: "Helvetica Neue",
-      fontSize: 34,
+      fontSize: 38,
       color: "#1a334d"
     });
     assert.deepEqual(object.metadata?.nativeTextStyleIds, ["9250", "9251"]);
@@ -1402,6 +1402,50 @@ describe("Keynote bridge", () => {
       fontSize: 48,
       color: "#d97857"
     });
+  });
+
+  test("keeps native style records with zero-length fields", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-zero-length-style-"));
+    const keyPath = path.join(dir, "zero-length-style.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    const stylePayload = concat([
+      nativeParagraphStylePayload({
+        fontFamily: "Produkt-Regular",
+        fontSize: 80,
+        color: { red: 0.1, green: 0.1, blue: 0.1, alpha: 1 },
+        alignment: 0
+      }),
+      protoBytes(new Uint8Array(), 12)
+    ]);
+    await writeFile(
+      path.join(keyPath, "Index", "DocumentStylesheet.iwa"),
+      iwaArchiveRecord(9470, [
+        {
+          type: 2022,
+          payload: stylePayload,
+          objectReferences: [9470]
+        }
+      ])
+    );
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      iwaArchiveRecord(1200, [
+        { type: 2001, payload: nativeStyledTextContentPayload("Demo 演示", { paragraphStyleId: 9470 }) }
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.type === "text");
+    assert.equal(object?.type, "text");
+    if (object?.type !== "text") throw new Error("Expected fallback text.");
+    assert.deepEqual(object.text.runs?.[0]?.style, {
+      fontFamily: "Produkt-Regular",
+      fontSize: 80,
+      color: "#1a1a1a"
+    });
+    assert.equal(object.metadata?.nativeTextStyleMapRecordCount, 1);
   });
 
   test("infers missing native local style ids from aligned peer text", async () => {
@@ -1911,6 +1955,8 @@ describe("Keynote bridge", () => {
     assert.equal(events.length, 2);
     assert.equal(events[0]?.metadata?.nativeBuildFallback, "anvil-in");
     assert.equal(events[1]?.metadata?.nativeBuildFallback, "crumble-out");
+    assert.equal(events[0]?.fill, "both");
+    assert.equal(events[1]?.fill, "forwards");
     assert.equal(typeof events[0]?.metadata?.nativeBuildDegradation, "string");
     assert.equal(typeof events[1]?.metadata?.nativeBuildDegradation, "string");
     assert.deepEqual(events[0]?.kind === "keyframes" ? events[0].tracks.find((track) => track.property === "transform.translateY")?.keyframes : undefined, [

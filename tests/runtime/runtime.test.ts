@@ -34,6 +34,8 @@ describe("HTML runtime rendering", () => {
     assert.match(html, /seekFrame/);
     assert.match(html, /createTimingPlan/);
     assert.match(html, /setPlaybackRate/);
+    assert.match(html, /stepToNextTimelineEvent/);
+    assert.match(html, /stepButton\?\.addEventListener\("click", \(\) => stepToNextTimelineEvent\(\)\)/);
     assert.match(html, /id="stage-shell"/);
     assert.match(html, /stageShell\.style\.width/);
     assert.match(html, /body \{ margin: 0; height: 100vh; overflow: hidden/);
@@ -254,6 +256,19 @@ describe("HTML runtime rendering", () => {
     assert.deepEqual(state?.crop, { x: 0.1, y: 0.2, width: 0.65, height: 0.75, unit: "ratio" });
     assert.deepEqual(state?.style?.fill, { type: "solid", color: "#808000" });
     assert.deepEqual(state?.style?.stroke, { color: "#808080", width: 6 });
+  });
+
+  test("does not let future native build-out events override build-in initial state", () => {
+    const deck = createNativeBuildFillDeck();
+    const slide = deck.deck.slides[0];
+
+    assert.equal(resolveSlideObjectStates(deck, slide, 0).get("target")?.opacity, 0);
+    assert.equal(resolveSlideObjectStates(deck, slide, 500).get("target")?.opacity, 1);
+    assert.equal(resolveSlideObjectStates(deck, slide, 1000).get("target")?.opacity, 1);
+    assert.equal(resolveSlideObjectStates(deck, slide, 1500).get("target")?.opacity, 0);
+
+    const diagnostics = resolveTimelineEventDiagnostics(slide, 0);
+    assert.equal(diagnostics.find((event) => event.eventId === "out")?.appliedProgress, undefined);
   });
 
   test("supports cubic-bezier, steps, and named easing during evaluation", () => {
@@ -560,6 +575,54 @@ function createInterpolationDeck(): DeckIR {
                 to: { x: 0.2, y: 0.4, width: 0.3, height: 0.5, unit: "ratio" },
                 durationMs: 1000,
                 fill: "both"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  };
+}
+
+function createNativeBuildFillDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "native-build-fill",
+      size: { width: 200, height: 200, unit: "px" },
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "target",
+              type: "shape",
+              shape: "rect",
+              bounds: { x: 10, y: 10, width: 40, height: 40 },
+              initialState: { opacity: 0 }
+            }
+          ],
+          timeline: {
+            durationMs: 2000,
+            events: [
+              {
+                id: "in",
+                kind: "keyframes",
+                targetId: "target",
+                durationMs: 500,
+                fill: "both",
+                tracks: [{ property: "opacity", keyframes: [{ offset: 0, value: 0 }, { offset: 1, value: 1 }] }],
+                metadata: { nativeSource: "keynote-iwa-build", nativeBuildDirection: "In", nativeBuildFallback: "dissolve-in" }
+              },
+              {
+                id: "out",
+                kind: "keyframes",
+                targetId: "target",
+                start: { type: "absolute", atMs: 1000 },
+                durationMs: 500,
+                fill: "both",
+                tracks: [{ property: "opacity", keyframes: [{ offset: 0, value: 1 }, { offset: 1, value: 0 }] }],
+                metadata: { nativeSource: "keynote-iwa-build", nativeBuildDirection: "Out", nativeBuildFallback: "dissolve-out" }
               }
             ]
           }

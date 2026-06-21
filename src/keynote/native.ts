@@ -3497,7 +3497,7 @@ function nativeBuildEventFromEvidence(
         targetId: resolution.object.id,
         start: { type: "absolute", atMs: startMs },
         durationMs,
-        fill: "both",
+        fill: "forwards",
         easing: "easeInOut",
         tracks: [
           {
@@ -3548,7 +3548,7 @@ function nativeBuildEventFromEvidence(
     targetId: resolution.object.id,
     start: { type: "absolute", atMs: startMs },
     durationMs,
-    fill: "both",
+    fill: nativeBuildFill(direction),
     easing: "easeInOut",
     tracks: [
       {
@@ -3584,7 +3584,7 @@ function nativeAppearBuildEventFromEvidence(
     targetId: resolution.object.id,
     start: { type: "absolute", atMs: startMs },
     durationMs,
-    fill: "both",
+    fill: nativeBuildFill(direction),
     easing: { type: "steps", count: 1, position: "end" },
     tracks: [
       {
@@ -3625,7 +3625,7 @@ function nativeBlurBuildEventFromEvidence(
     targetId: resolution.object.id,
     start: { type: "absolute", atMs: startMs },
     durationMs,
-    fill: "both",
+    fill: nativeBuildFill(direction),
     easing: "easeInOut",
     tracks: [
       twoPointTrack("opacity", fromOpacity, toOpacity),
@@ -3658,7 +3658,7 @@ function nativeDissolveBuildEventFromEvidence(
     targetId: resolution.object.id,
     start: { type: "absolute", atMs: startMs },
     durationMs,
-    fill: "both",
+    fill: nativeBuildFill(direction),
     easing: "easeInOut",
     tracks: [twoPointTrack("opacity", from, to)],
     metadata: {
@@ -3692,7 +3692,7 @@ function nativeCrumbleBuildEventFromEvidence(
     targetId: resolution.object.id,
     start: { type: "absolute", atMs: startMs },
     durationMs,
-    fill: "both",
+    fill: nativeBuildFill(direction),
     easing: "easeInOut",
     tracks: [
       twoPointTrack("opacity", entering ? 0 : 1, entering ? 1 : 0),
@@ -3726,7 +3726,7 @@ function nativeAnvilBuildEventFromEvidence(
     targetId: resolution.object.id,
     start: { type: "absolute", atMs: startMs },
     durationMs,
-    fill: "both",
+    fill: nativeBuildFill(direction),
     easing: entering ? "backOut" : "easeInOut",
     tracks: [
       twoPointTrack("opacity", entering ? 0 : 1, entering ? 1 : 0),
@@ -3752,6 +3752,10 @@ function twoPointTrack(property: string, from: number, to: number): KeyframeTrac
   };
 }
 
+function nativeBuildFill(direction: "in" | "out"): AnimationEvent["fill"] {
+  return direction === "out" ? "forwards" : "both";
+}
+
 function nativeWipeBuildEventFromEvidence(
   slideId: string,
   index: number,
@@ -3772,7 +3776,7 @@ function nativeWipeBuildEventFromEvidence(
     targetId: resolution.object.id,
     start: { type: "absolute", atMs: startMs },
     durationMs,
-    fill: "both",
+    fill: nativeBuildFill(direction),
     easing: "easeInOut",
     tracks: [
       {
@@ -5695,7 +5699,7 @@ function readProtobufFieldAt(
   }
 
   const lengthInfo = readVarint(data, key.nextOffset);
-  if (!lengthInfo || lengthInfo.value <= 0 || lengthInfo.value > MAX_NESTED_PROTOBUF_BYTES) {
+  if (!lengthInfo || lengthInfo.value < 0 || lengthInfo.value > MAX_NESTED_PROTOBUF_BYTES) {
     return undefined;
   }
   const valueStart = lengthInfo.nextOffset;

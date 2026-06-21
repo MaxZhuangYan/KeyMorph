@@ -796,13 +796,17 @@ function runtimeScript(): string {
     const run = statePatch?.text?.runs?.[0] || object.text?.runs?.[0];
     return run?.style || statePatch?.style?.textStyle || object.initialState?.style?.textStyle || object.style?.textStyle || {};
   };
+  const outerTextColor = (object, statePatch, style) => {
+    const text = statePatch?.text || object.text;
+    return text?.runs && text.runs.length > 1 ? "inherit" : colorCss(style.color) || "#111827";
+  };
   const textStyleCss = (object, statePatch) => {
     const style = textStyleOf(object, statePatch);
     return [
       "font-family:" + (style.fontFamily || "Inter, Arial, sans-serif"),
       "font-size:" + Number(style.fontSize || 32) + "px",
       "font-weight:" + (style.fontWeight || 400),
-      "color:" + (colorCss(style.color) || "#111827"),
+      "color:" + outerTextColor(object, statePatch, style),
       "line-height:" + (style.lineHeight || 1.15),
       "letter-spacing:" + Number(style.letterSpacing || 0) + "px"
     ].join(";");
@@ -812,7 +816,7 @@ function runtimeScript(): string {
     el.style.fontFamily = style.fontFamily || "Inter, Arial, sans-serif";
     el.style.fontSize = Number(style.fontSize || 32) + "px";
     el.style.fontWeight = String(style.fontWeight || 400);
-    el.style.color = colorCss(style.color) || "#111827";
+    el.style.color = outerTextColor(object, statePatch, style);
     el.style.lineHeight = String(style.lineHeight || 1.15);
     el.style.letterSpacing = Number(style.letterSpacing || 0) + "px";
   };
@@ -1352,9 +1356,16 @@ function runtimeScript(): string {
     const duration = eventDuration(event);
     const end = start + duration;
     if (duration === 0) return timeMs >= start ? 1 : undefined;
+    if (timeMs < start && isNativeBuildForwardOnlyBeforeStart(event)) return undefined;
     if (timeMs < start) return event.fill === "backwards" || event.fill === "both" ? 0 : undefined;
     if (timeMs > end) return event.fill === "forwards" || event.fill === "both" ? 1 : undefined;
     return easeProgress(event.easing, (timeMs - start) / duration);
+  };
+  const isNativeBuildForwardOnlyBeforeStart = (event) => {
+    if (event?.metadata?.nativeSource !== "keynote-iwa-build") return false;
+    const direction = String(event.metadata.nativeBuildDirection || "").toLowerCase();
+    const fallback = String(event.metadata.nativeBuildFallback || "").toLowerCase();
+    return direction === "out" || direction === "action" || /-(out)$/.test(fallback) || fallback === "motion-path";
   };
   const keyframeValue = (track, progress) => {
     const frames = [...(track.keyframes || [])].sort((a, b) => Number(a.offset) - Number(b.offset));
@@ -1841,6 +1852,28 @@ function runtimeScript(): string {
     emitRuntimeEvent("step", { frames: frameCount, fps: frameRate, resolution });
     return resolution;
   };
+  const timelineEventBoundaryTimes = (slide) => {
+    const starts = computeEventStarts(slide);
+    const times = new Set([0]);
+    for (const event of slide?.timeline?.events || []) {
+      const start = Math.max(0, Math.round(starts.get(event.id) || 0));
+      const end = Math.max(start, Math.round(start + eventDuration(event)));
+      times.add(start);
+      times.add(end);
+    }
+    return Array.from(times).sort((a, b) => a - b);
+  };
+  const stepToNextTimelineEvent = () => {
+    pause();
+    const slide = deck.deck.slides[state.slideIndex];
+    const nextTime = timelineEventBoundaryTimes(slide).find((time) => time > state.slideTimeMs + 16);
+    if (nextTime !== undefined) {
+      const resolution = seekSlide(state.slideIndex, nextTime);
+      emitRuntimeEvent("stepEvent", { resolution, slideTimeMs: nextTime });
+      return resolution;
+    }
+    return nextSlide();
+  };
   const setPlaybackRate = (rate) => {
     const next = Math.max(0.01, Number(rate) || 1);
     state.playbackRate = next;
@@ -2024,7 +2057,7 @@ function runtimeScript(): string {
   playButton?.addEventListener("click", () => state.playing ? pause() : play());
   prevButton?.addEventListener("click", previousSlide);
   nextButton?.addEventListener("click", nextSlide);
-  stepButton?.addEventListener("click", () => step(1, 30));
+  stepButton?.addEventListener("click", () => stepToNextTimelineEvent());
   scrub?.addEventListener("input", () => seekGlobal(Number(scrub.value)));
   window.addEventListener("resize", resize);
   timeline = createTimeline();
@@ -2035,6 +2068,7 @@ function runtimeScript(): string {
     seekSlide,
     seekFrame,
     step,
+    stepToNextTimelineEvent,
     setPlaybackRate,
     play,
     pause,
@@ -2063,6 +2097,7 @@ function runtimeScript(): string {
       getGlobalSnapshot,
       getDomSnapshot,
       captureFrame,
+      stepToNextTimelineEvent,
       easeProgress
     }
   };
@@ -2210,7 +2245,7 @@ function objectStyle(object: IRObject, deck?: DeckIR): string {
     style.push(`font-family:${textStyle.fontFamily ?? "Inter, Arial, sans-serif"}`);
     style.push(`font-size:${textStyle.fontSize ?? 32}px`);
     style.push(`font-weight:${textStyle.fontWeight ?? 400}`);
-    style.push(`color:${colorToCss(textStyle.color) ?? "#111827"}`);
+    style.push(`color:${outerTextColor(object, textStyle)}`);
     style.push(`line-height:${textStyle.lineHeight ?? 1.15}`);
     style.push(`letter-spacing:${textStyle.letterSpacing ?? 0}px`);
     style.push("white-space:pre-wrap");
@@ -2227,6 +2262,14 @@ function objectStyle(object: IRObject, deck?: DeckIR): string {
   }
 
   return style.join(";");
+}
+
+function outerTextColor(object: IRObject, textStyle: TextStyle): string {
+  const text = "text" in object ? object.text : undefined;
+  if (text?.runs && text.runs.length > 1) {
+    return "inherit";
+  }
+  return colorToCss(textStyle.color) ?? "#111827";
 }
 
 function imageContentStyle(object: Extract<IRObject, { type: "image" }>, state?: ObjectStateProperties): string {
@@ -2623,9 +2666,17 @@ function eventProgress(event: AnimationEvent, start: number, timeMs: number): nu
   const duration = eventDuration(event);
   const end = start + duration;
   if (duration === 0) return timeMs >= start ? 1 : undefined;
+  if (timeMs < start && isNativeBuildForwardOnlyBeforeStart(event)) return undefined;
   if (timeMs < start) return event.fill === "backwards" || event.fill === "both" ? 0 : undefined;
   if (timeMs > end) return event.fill === "forwards" || event.fill === "both" ? 1 : undefined;
   return easeProgressValue(event.easing, (timeMs - start) / duration);
+}
+
+function isNativeBuildForwardOnlyBeforeStart(event: AnimationEvent): boolean {
+  if (event.metadata?.nativeSource !== "keynote-iwa-build") return false;
+  const direction = String(event.metadata.nativeBuildDirection ?? "").toLowerCase();
+  const fallback = String(event.metadata.nativeBuildFallback ?? "").toLowerCase();
+  return direction === "out" || direction === "action" || /-out$/.test(fallback) || fallback === "motion-path";
 }
 
 function keyframeTrackValue(track: KeyframeTrack, progress: number): unknown {
