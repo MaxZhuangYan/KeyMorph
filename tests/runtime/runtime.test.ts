@@ -61,6 +61,18 @@ describe("HTML runtime rendering", () => {
     assert.doesNotMatch(markup, /class="km-text-char"/);
   });
 
+  test("renders shape text with text layout class and styles", () => {
+    const deck = createShapeTextDeck();
+    const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);
+
+    assert.match(markup, /class="km-object km-shape km-shape-text"/);
+    assert.match(markup, /font-size:22px/);
+    assert.match(markup, /line-height:1\.35/);
+    assert.match(markup, /color:#123456/);
+    assert.match(markup, /white-space:pre-wrap/);
+    assert.match(markup, /First\nSecond/);
+  });
+
   test("converts keyframe event tracks to CSS frames", () => {
     const event = createDemoDeck().deck.slides[0].timeline?.events[0];
 
@@ -711,6 +723,39 @@ function createCharacterBuildDeck(fallback = "dissolve-in"): DeckIR {
               }
             ]
           }
+        }
+      ]
+    }
+  };
+}
+
+function createShapeTextDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "shape-text",
+      size: { width: 400, height: 200, unit: "px" },
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "shape-title",
+              type: "shape",
+              shape: "rect",
+              bounds: { x: 10, y: 20, width: 260, height: 90 },
+              text: {
+                plainText: "First\nSecond",
+                runs: [
+                  {
+                    text: "First\nSecond",
+                    style: { fontSize: 22, lineHeight: 1.35, color: "#123456" }
+                  }
+                ]
+              }
+            }
+          ],
+          timeline: { durationMs: 1000, events: [] }
         }
       ]
     }

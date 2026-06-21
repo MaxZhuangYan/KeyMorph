@@ -881,7 +881,8 @@ function runtimeScript(): string {
     return parts.join(";");
   };
   const objectHtml = (object) => {
-    const common = 'class="km-object km-' + esc(object.type) + '" data-object-id="' + esc(object.id) + '" style="' + boxStyle(object) + ';';
+    const className = "km-object km-" + object.type + (object.type === "shape" && object.text ? " km-shape-text" : "");
+    const common = 'class="' + esc(className) + '" data-object-id="' + esc(object.id) + '" style="' + boxStyle(object) + ';';
     if (object.type === "text") return '<div ' + common + textStyleCss(object) + '">' + (hasCharacterBuild(object) ? characterTextHtml(textOf(object)) : esc(textOf(object))) + '</div>';
     if (object.type === "image") return '<img ' + common + '" src="' + esc(sourceUrl(object.source)) + '" alt="' + esc(object.altText || object.name || "") + '">';
     if (object.type === "media") {
@@ -1929,7 +1930,8 @@ function runtimeScript(): string {
 
 function renderObjectMarkup(object: IRObject, deck?: DeckIR): string {
   const style = objectStyle(object);
-  const common = `class="km-object km-${object.type}" data-object-id="${escapeHtml(object.id)}" style="${style}"`;
+  const className = `km-object km-${object.type}${object.type === "shape" && object.text ? " km-shape-text" : ""}`;
+  const common = `class="${className}" data-object-id="${escapeHtml(object.id)}" style="${style}"`;
 
   if (object.type === "text") {
     return `<div ${common}>${renderTextObjectContent(object, deck)}</div>`;
@@ -2012,12 +2014,13 @@ function objectStyle(object: IRObject): string {
     `filter:${filterToCss(state.filter)}`
   ];
 
-  if (object.type === "text") {
+  if (object.type === "text" || (object.type === "shape" && object.text)) {
     const textStyle = firstTextStyle(object, state);
     style.push(`font-family:${textStyle.fontFamily ?? "Inter, Arial, sans-serif"}`);
     style.push(`font-size:${textStyle.fontSize ?? 32}px`);
     style.push(`font-weight:${textStyle.fontWeight ?? 400}`);
     style.push(`color:${colorToCss(textStyle.color) ?? "#111827"}`);
+    style.push(`line-height:${textStyle.lineHeight ?? 1.15}`);
     style.push(`letter-spacing:${textStyle.letterSpacing ?? 0}px`);
     style.push("white-space:pre-wrap");
   }
