@@ -315,9 +315,17 @@ describe("Keynote bridge", () => {
       path.join(keyPath, "Index", "Slide-1.iwa"),
       concat([
         protoString("Transition"),
+        protoString("path"),
+        protoString("1B/ Transition"),
+        protoString("zh-Hans zh-Hans"),
+        protoString("S5=D+WC C"),
+        protoString("T DBD"),
+        protoString("9PD ĒDDD &"),
+        protoString("C & VCBVC"),
         protoString("apple:magic-move-implied-motion-path"),
         protoString("XBO Transition\u0012$a"),
         protoString("AI Agent 社会模拟游戏"),
+        protoString("Epoch 1 $NOM 上链 Agent 链上身份 资产可交易"),
         protoString("图片 8"),
         protoString("E.l"),
         protoString("decimal"),
@@ -330,7 +338,7 @@ describe("Keynote bridge", () => {
     assert.equal(validateIR(deck).valid, true);
     const text = deck.deck.slides[0]?.objects.filter((object) => object.type === "text").map((object) => object.text.plainText);
 
-    assert.deepEqual(text, ["AI Agent 社会模拟游戏"]);
+    assert.deepEqual(text, ["AI Agent 社会模拟游戏", "Epoch 1 $NOM 上链 Agent 链上身份 资产可交易"]);
   });
 
   test("uses native snapshot images instead of low-confidence text fallback", async () => {
@@ -413,10 +421,13 @@ describe("Keynote bridge", () => {
     assert.equal(event?.kind === "keyframes" ? event.targetId : undefined, object?.id);
     assert.equal(event?.durationMs, 500);
     assert.equal(event?.metadata?.nativeBuildEffect, "apple:bc-appear");
+    assert.equal(event?.metadata?.nativeBuildFallback, "appear-in");
+    assert.equal(event?.easing && typeof event.easing === "object" ? event.easing.type : undefined, "steps");
     assert.deepEqual(event?.kind === "keyframes" ? event.tracks[0]?.keyframes : undefined, [
       { offset: 0, value: 0 },
       { offset: 1, value: 1 }
     ]);
+    assert.equal(event?.kind === "keyframes" ? event.tracks[0]?.interpolation : undefined, "discrete");
     assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationRecoveredCount, 1);
     assert.equal(deck.conversion?.statistics.animationCount, 1);
     assert.equal(deck.conversion?.metadata?.totalTypedArchiveMessageCount, 4);

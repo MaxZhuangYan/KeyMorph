@@ -2638,6 +2638,9 @@ function nativeBuildEventFromEvidence(
   if (build.effect && /motion-path|movie-start/i.test(build.effect)) {
     return undefined;
   }
+  if (isNativeAppearEffect(build.effect)) {
+    return nativeAppearBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs, direction);
+  }
   if (build.effect && /wipe/i.test(build.effect) && resolution.object.bounds) {
     return nativeWipeBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs, direction);
   }
@@ -2675,6 +2678,45 @@ function nativeBuildEventFromEvidence(
       }
     ],
     metadata: nativeBuildEventMetadata(build, timing, resolution, `opacity-${direction}`)
+  };
+}
+
+function nativeAppearBuildEventFromEvidence(
+  slideId: string,
+  index: number,
+  targetIndex: number,
+  build: NativeIwaBuildEvidence,
+  timing: NativeIwaBuildTimingEvidence | undefined,
+  resolution: { object: IRObject; method: string; nativeTargetId?: string },
+  startMs: number,
+  durationMs: number,
+  direction: "in" | "out"
+): AnimationEvent {
+  const from = direction === "out" ? 1 : 0;
+  const to = direction === "out" ? 0 : 1;
+  return {
+    id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, `appear-${direction}`),
+    kind: "keyframes",
+    label: `Keynote appear ${direction}`,
+    targetId: resolution.object.id,
+    start: { type: "absolute", atMs: startMs },
+    durationMs,
+    fill: "both",
+    easing: { type: "steps", count: 1, position: "end" },
+    tracks: [
+      {
+        property: "opacity",
+        interpolation: "discrete",
+        keyframes: [
+          { offset: 0, value: from },
+          { offset: 1, value: to }
+        ]
+      }
+    ],
+    metadata: {
+      ...nativeBuildEventMetadata(build, timing, resolution, `appear-${direction}`),
+      nativeBuildDegradation: "Keynote Appear is represented as a discrete opacity step instead of a fade."
+    }
   };
 }
 
@@ -2935,6 +2977,10 @@ function nativeBuildGranularity(effect: string | undefined): "character" | "word
   if (/\bline\b/.test(normalized)) return "line";
   if (normalized) return "object";
   return undefined;
+}
+
+function isNativeAppearEffect(effect: string | undefined): boolean {
+  return /\b(?:bc-)?appear\b/i.test(effect ?? "");
 }
 
 function normalizeNativeBuildDirection(direction: string | undefined, effect: string | undefined): "in" | "out" | "action" | undefined {
@@ -5697,6 +5743,18 @@ function isLikelyNativeNoiseText(text: string): boolean {
   if (hasInternalKeynoteToken(text)) {
     return true;
   }
+  if (hasNativeLocaleResidue(text)) {
+    return true;
+  }
+  if (hasInternalKeynoteTextResidue(text)) {
+    return true;
+  }
+  if (hasConcatenatedNativeTextResidue(text)) {
+    return true;
+  }
+  if (isLowSignalNativeAsciiResidue(text)) {
+    return true;
+  }
   if (/\b(decimal|double|float|string|boolean|integer|uint|sint|fixed|sfixed)\b/.test(lower) && /[.$*@\\]/.test(text)) {
     return true;
   }
@@ -5713,6 +5771,68 @@ function isLikelyNativeNoiseText(text: string): boolean {
     return true;
   }
   if (/[\p{Script=Han}]/u.test(text) && /["'“”‘’]?[A-Za-z0-9+&()]{1,4}$/.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function hasNativeLocaleResidue(text: string): boolean {
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) {
+    return false;
+  }
+  const localeTokens = tokens.filter(isNativeLocaleToken);
+  if (localeTokens.length >= 2 && localeTokens.length / tokens.length >= 0.5) {
+    return true;
+  }
+  return localeTokens.length > 0 && tokens.some((token) => /[=+&]/.test(token) || isLowSignalNativeAsciiResidue(token));
+}
+
+function isNativeLocaleToken(token: string): boolean {
+  return /^[a-z]{2,3}(?:-[a-z0-9]{2,8})+$/i.test(token);
+}
+
+function hasInternalKeynoteTextResidue(text: string): boolean {
+  const lower = text.toLowerCase();
+  const hasTransitionResidue = /(?:^|\s)(?:xbo\s+)?(?:t|r)?ansition\b/i.test(text);
+  if (
+    hasTransitionResidue &&
+    (hasNativeLocaleResidue(text) || /\b\d+[A-Z]?\/\s*transition\b/i.test(text) || /[$*@\\]/.test(text) || /\bmagic[- ]move\b/i.test(lower))
+  ) {
+    return true;
+  }
+  return /(?:^|\s|[a-z])nsition\$[a-z]\b/i.test(text);
+}
+
+function hasConcatenatedNativeTextResidue(text: string): boolean {
+  if (!/[\p{Script=Han}]/u.test(text)) {
+    return false;
+  }
+  return /\s+\d+[A-Z][A-Za-z]/.test(text) || /(?:^|\s|[a-z])nsition\$[a-z]\b/i.test(text);
+}
+
+function isLowSignalNativeAsciiResidue(text: string): boolean {
+  if (text.length > 18 || /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text)) {
+    return false;
+  }
+  const chars = Array.from(text.replace(/\s+/g, ""));
+  if (chars.length < 3) {
+    return false;
+  }
+  const letters = chars.filter((char) => /[A-Za-z]/.test(char)).length;
+  const digits = chars.filter((char) => /\d/.test(char)).length;
+  const symbols = chars.filter((char) => /[^A-Za-z0-9]/.test(char)).length;
+  const vowels = chars.filter((char) => /[AEIOUaeiou]/.test(char)).length;
+  if (letters >= 4 && vowels === 0 && /\s/.test(text) && /^[A-Z0-9\s]+$/.test(text)) {
+    return true;
+  }
+  if (symbols >= 2 && digits + symbols >= letters) {
+    return true;
+  }
+  if (symbols >= 1 && digits >= 1 && vowels <= 1 && letters <= 8) {
+    return true;
+  }
+  if (symbols >= 1 && vowels === 0 && letters >= 4) {
     return true;
   }
   return false;
