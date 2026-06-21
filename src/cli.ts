@@ -17,10 +17,12 @@ import {
   type KeynoteAutomationOptions
 } from "./keynote/index.ts";
 import {
+  captureVideoFrames,
   createVideoExportPlan,
   createVideoFrameFidelityReport,
   describeVideoDependencies,
   exportIrToVideo,
+  extractVideoFramesFromVideo,
   type VideoDependencyStatus,
   type VideoExportOptions,
   type VideoFrameFidelityReport,
@@ -38,6 +40,20 @@ export interface ProductBundleOptions {
   keynoteBridgeExport?: (keynotePath: string, pptxPath: string, options: KeynoteAutomationOptions) => Promise<void>;
   keynoteHtmlExport?: (keynotePath: string, outputDir: string, options: KeynoteAutomationOptions) => Promise<void>;
   keynoteMovieExport?: (keynotePath: string, moviePath: string, options: KeynoteAutomationOptions) => Promise<void>;
+  video?: Pick<VideoExportOptions, "fps" | "scale" | "ffmpegPath">;
+}
+
+export interface ProductBaselineExportOptions {
+  allowKeynoteAutomation?: boolean;
+  keynoteAutomationTimeoutMs?: number;
+  keynoteMovieExport?: (keynotePath: string, moviePath: string, options: KeynoteAutomationOptions) => Promise<void>;
+  keynoteFrameExport?: (
+    keynotePath: string,
+    framesDir: string,
+    plan: VideoExportPlan,
+    options: KeynoteAutomationOptions & VideoExportOptions
+  ) => Promise<void>;
+  runtimeFrameExport?: (deck: DeckIR, framesDir: string, plan: VideoExportPlan, options: VideoExportOptions) => Promise<void>;
   video?: Pick<VideoExportOptions, "fps" | "scale" | "ffmpegPath">;
 }
 
@@ -60,6 +76,12 @@ export interface ProductBundlePaths {
   framesLatest: string;
   frameFidelity: string;
   frameDiffs: string;
+  baselineStatus: string;
+  baselineMovie: string;
+  baselineFrames: string;
+  baselineActualFrames: string;
+  baselineFidelity: string;
+  baselineDiffs: string;
 }
 
 export interface ProductBundleManifest {
@@ -83,6 +105,12 @@ export interface ProductBundleManifest {
     rebuiltKeynote: string | null;
     renderVideo: string | null;
     frameFidelity: string | null;
+    baselineStatus: string;
+    keynoteBaselineMovie: string | null;
+    baselineFrames: string | null;
+    baselineActualFrames: string | null;
+    baselineFrameFidelity: string | null;
+    baselineFrameDiffs: string | null;
   };
   report: {
     fidelityScore: number;
@@ -94,6 +122,7 @@ export interface ProductBundleManifest {
   };
   runtime: ProductRuntimeSummary;
   video: ProductVideoSummary;
+  baseline: ProductBaselineSummary;
   keynote: ProductDeferredExportSummary;
 }
 
@@ -112,6 +141,19 @@ export interface ProductVideoSummary {
   dependencies: VideoDependencyStatus;
   endpoint: string | null;
   statusPath: string;
+}
+
+export interface ProductBaselineSummary {
+  available: boolean | null;
+  endpoint: string | null;
+  message: string;
+  statusPath: string;
+  referenceMoviePath: string | null;
+  referenceFramesPath: string | null;
+  actualFramesPath: string | null;
+  fidelityReportPath: string | null;
+  diffPath: string | null;
+  summary?: ProductFrameFidelitySummary;
 }
 
 export interface ProductDeferredExportSummary {
@@ -146,6 +188,27 @@ export interface ProductVideoExportResult {
 }
 
 export type ProductFrameFidelitySummary = VideoFrameFidelityReport["summary"];
+
+export interface ProductBaselineExportReady {
+  status: "ready";
+  source: "keynote-movie" | "keynote-reference-frames";
+  referenceMoviePath: string | null;
+  referenceFramesDir: string;
+  actualFramesDir: string;
+  reportPath: string;
+  diffDir: string;
+  plan: Omit<VideoExportPlan, "frames">;
+  summary: ProductFrameFidelitySummary;
+}
+
+export interface ProductBaselineExportUnavailable {
+  status: "unsupported" | "dependency-missing";
+  message: string;
+  missing?: string[];
+  guidance?: string[];
+}
+
+export type ProductBaselineExportResult = ProductBaselineExportReady | ProductBaselineExportUnavailable;
 
 export interface ProductDeferredExportUnavailable {
   status: "dependency-missing";
@@ -232,6 +295,12 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
     dependencies: videoDependencies,
     plan: summarizeVideoPlan(videoPlan),
     outputPath: paths.renderVideo
+  });
+  await writeJson(paths.baselineStatus, {
+    generatedAt: createdAt,
+    status: sourceKind === "keynote" ? "not-run" : "unsupported",
+    message: manifest.baseline.message,
+    plan: summarizeVideoPlan(videoPlan)
   });
   await writeJson(paths.manifest, manifest);
 
@@ -394,6 +463,129 @@ export async function exportProductBundleVideo(
   }
 }
 
+export async function exportProductBundleBaseline(
+  jobDir: string,
+  options: ProductBaselineExportOptions = {}
+): Promise<ProductBaselineExportResult> {
+  const paths = createExistingBundlePaths(jobDir);
+  const manifest = await readJson<ProductBundleManifest>(paths.manifest);
+  const sourcePath = path.join(paths.jobDir, manifest.artifacts.source);
+  const renderOptions: VideoExportOptions = {
+    fps: options.video?.fps ?? 30,
+    scale: options.video?.scale ?? 4,
+    ffmpegPath: options.video?.ffmpegPath
+  };
+  const deck = await readJson<DeckIR>(paths.deckIr);
+  const plan = createVideoExportPlan(deck, renderOptions);
+
+  if (manifest.sourceKind !== "keynote") {
+    const message = "Keynote golden baseline is only available for original .key source decks.";
+    await writeBaselineUnavailable(paths, "unsupported", message, summarizeVideoPlan(plan));
+    return { status: "unsupported", message };
+  }
+
+  await rm(paths.baselineMovie, { force: true });
+  await rm(paths.baselineFrames, { recursive: true, force: true });
+  await rm(paths.baselineActualFrames, { recursive: true, force: true });
+  await rm(paths.baselineDiffs, { recursive: true, force: true });
+
+  try {
+    const source: ProductBaselineExportReady["source"] = options.keynoteFrameExport ? "keynote-reference-frames" : "keynote-movie";
+    if (options.keynoteFrameExport) {
+      await options.keynoteFrameExport(sourcePath, paths.baselineFrames, plan, {
+        allowAutomation: options.allowKeynoteAutomation,
+        automationTimeoutMs: options.keynoteAutomationTimeoutMs,
+        ...renderOptions
+      });
+    } else {
+      await (options.keynoteMovieExport ?? exportKeynoteToMovie)(sourcePath, paths.baselineMovie, {
+        allowAutomation: options.allowKeynoteAutomation,
+        automationTimeoutMs: options.keynoteAutomationTimeoutMs
+      });
+      await extractVideoFramesFromVideo(deck, paths.baselineMovie, {
+        ...renderOptions,
+        framesDir: paths.baselineFrames
+      });
+    }
+
+    if (options.runtimeFrameExport) {
+      await options.runtimeFrameExport(deck, paths.baselineActualFrames, plan, renderOptions);
+    } else {
+      await captureVideoFrames(deck, {
+        ...renderOptions,
+        outputDir: paths.baselineActualFrames
+      });
+    }
+
+    const report = await createVideoFrameFidelityReport(deck, paths.baselineFrames, paths.baselineActualFrames, {
+      ...renderOptions,
+      diffDir: paths.baselineDiffs,
+      reportPath: paths.baselineFidelity
+    });
+    const referenceMoviePath = source === "keynote-movie" ? paths.baselineMovie : null;
+    const result: ProductBaselineExportReady = {
+      status: "ready",
+      source,
+      referenceMoviePath,
+      referenceFramesDir: paths.baselineFrames,
+      actualFramesDir: paths.baselineActualFrames,
+      reportPath: paths.baselineFidelity,
+      diffDir: paths.baselineDiffs,
+      plan: summarizeVideoPlan(plan),
+      summary: report.summary
+    };
+
+    await writeJson(paths.baselineStatus, {
+      generatedAt: new Date().toISOString(),
+      status: "ready",
+      source,
+      referenceMoviePath,
+      referenceFramesDir: paths.baselineFrames,
+      actualFramesDir: paths.baselineActualFrames,
+      reportPath: paths.baselineFidelity,
+      diffDir: paths.baselineDiffs,
+      plan: result.plan,
+      summary: report.summary
+    });
+    await patchBundleManifest(paths.jobDir, (current) => ({
+      ...current,
+      artifacts: {
+        ...current.artifacts,
+        keynoteBaselineMovie: referenceMoviePath ? "baseline/keynote-reference.m4v" : current.artifacts.keynoteBaselineMovie,
+        baselineFrames: "frames/baseline",
+        baselineActualFrames: "frames/keymorph-baseline",
+        baselineFrameFidelity: "baseline-fidelity.json",
+        baselineFrameDiffs: "baseline-diffs"
+      },
+      baseline: {
+        ...current.baseline,
+        available: true,
+        message: "Keynote golden baseline pixel fidelity report is ready.",
+        referenceMoviePath: referenceMoviePath ? "baseline/keynote-reference.m4v" : null,
+        referenceFramesPath: "frames/baseline",
+        actualFramesPath: "frames/keymorph-baseline",
+        fidelityReportPath: "baseline-fidelity.json",
+        diffPath: "baseline-diffs",
+        summary: report.summary
+      }
+    }));
+    return result;
+  } catch (error) {
+    const dependencyError = error instanceof VideoExportDependencyError ? error : null;
+    const message = `Keynote golden baseline unavailable: ${errorMessage(error)}`;
+    await writeBaselineUnavailable(paths, "dependency-missing", message, summarizeVideoPlan(plan), {
+      missing: dependencyError?.missing,
+      guidance: dependencyError?.guidance
+    });
+    return {
+      status: "dependency-missing",
+      message,
+      missing: dependencyError?.missing,
+      guidance: dependencyError?.guidance
+    };
+  }
+}
+
 export function createProductApiResponse(bundle: ProductBundleResult, basePath: string): Record<string, unknown> {
   const base = stripTrailingSlash(basePath);
   return {
@@ -412,6 +604,7 @@ export function createProductApiResponse(bundle: ProductBundleResult, basePath: 
     videoPlan: summarizeVideoPlan(bundle.videoPlan),
     videoDependencies: bundle.videoDependencies,
     videoEndpoint: `/api/jobs/${bundle.jobId}/video`,
+    baselineEndpoint: `/api/jobs/${bundle.jobId}/baseline`,
     keynoteEndpoint: `/api/jobs/${bundle.jobId}/keynote`,
     downloads: {
       source: `${base}/${encodeURIComponent(bundle.sourceName)}`,
@@ -423,8 +616,13 @@ export function createProductApiResponse(bundle: ProductBundleResult, basePath: 
       manifest: `${base}/manifest.json`,
       videoPlan: `${base}/video-plan.json`,
       videoStatus: `${base}/video-status.json`,
-      video: bundle.manifest.artifacts.renderVideo ? `${base}/${bundle.manifest.artifacts.renderVideo}` : null
+      video: bundle.manifest.artifacts.renderVideo ? `${base}/${bundle.manifest.artifacts.renderVideo}` : null,
+      baselineStatus: `${base}/baseline-status.json`,
+      baselineFidelity: bundle.manifest.artifacts.baselineFrameFidelity ? `${base}/${bundle.manifest.artifacts.baselineFrameFidelity}` : null,
+      baselineDiffs: bundle.manifest.artifacts.baselineFrameDiffs ? `${base}/${bundle.manifest.artifacts.baselineFrameDiffs}/` : null
     },
+    baselineAvailable: bundle.manifest.baseline.available,
+    baselineMessage: bundle.manifest.baseline.message,
     keynoteAvailable: null,
     keynoteMessage: bundle.manifest.keynote.message
   };
@@ -507,6 +705,27 @@ async function main(): Promise<void> {
       );
       return;
     }
+    case "bundle-baseline": {
+      if (!input) {
+        throw new Error("Usage: bundle-baseline <job-dir> [--allow-keynote] [--fps N] [--scale N] [--ffmpeg PATH]");
+      }
+      const flags = parseFlags(args);
+      console.log(
+        JSON.stringify(
+          await exportProductBundleBaseline(input, {
+            allowKeynoteAutomation: flags["allow-keynote"] === true,
+            video: {
+              fps: parsePositiveNumber(flags.fps),
+              scale: parsePositiveNumber(flags.scale),
+              ffmpegPath: typeof flags.ffmpeg === "string" ? flags.ffmpeg : undefined
+            }
+          }),
+          null,
+          2
+        )
+      );
+      return;
+    }
     case "pptx-to-ir": {
       if (!input || !output) throw new Error("Usage: pptx-to-ir <input.pptx> <output.ir.json>");
       await writeJson(output, await parsePptxToIr(input));
@@ -563,7 +782,7 @@ async function main(): Promise<void> {
     }
     default:
       throw new Error(
-        "Usage: keymorph <demo|convert|inspect|bundle-keynote|bundle-video|pptx-to-ir|key-to-ir|keyhtml-to-ir|ir-to-html|ir-to-pptx|ir-to-key|ir-to-video|ir-report|png-fidelity> [input] [output]"
+        "Usage: keymorph <demo|convert|inspect|bundle-keynote|bundle-video|bundle-baseline|pptx-to-ir|key-to-ir|keyhtml-to-ir|ir-to-html|ir-to-pptx|ir-to-key|ir-to-video|ir-report|png-fidelity> [input] [output]"
       );
   }
 }
@@ -763,7 +982,13 @@ function createBundlePaths(jobDir: string, sourceName: string): ProductBundlePat
     renderVideo: path.join(jobDir, "render.mp4"),
     framesLatest: path.join(jobDir, "frames", "latest"),
     frameFidelity: path.join(jobDir, "frame-fidelity.json"),
-    frameDiffs: path.join(jobDir, "frame-diffs")
+    frameDiffs: path.join(jobDir, "frame-diffs"),
+    baselineStatus: path.join(jobDir, "baseline-status.json"),
+    baselineMovie: path.join(jobDir, "baseline", "keynote-reference.m4v"),
+    baselineFrames: path.join(jobDir, "frames", "baseline"),
+    baselineActualFrames: path.join(jobDir, "frames", "keymorph-baseline"),
+    baselineFidelity: path.join(jobDir, "baseline-fidelity.json"),
+    baselineDiffs: path.join(jobDir, "baseline-diffs")
   };
 }
 
@@ -802,7 +1027,13 @@ function createBundleManifest(input: {
       videoStatus: "video-status.json",
       rebuiltKeynote: null,
       renderVideo: null,
-      frameFidelity: null
+      frameFidelity: null,
+      baselineStatus: "baseline-status.json",
+      keynoteBaselineMovie: null,
+      baselineFrames: null,
+      baselineActualFrames: null,
+      baselineFrameFidelity: null,
+      baselineFrameDiffs: null
     },
     report: {
       fidelityScore: input.lossReport.fidelityScore,
@@ -826,6 +1057,20 @@ function createBundleManifest(input: {
       dependencies: input.videoDependencies,
       endpoint: null,
       statusPath: "video-status.json"
+    },
+    baseline: {
+      available: null,
+      endpoint: null,
+      message:
+        input.sourceKind === "keynote"
+          ? "Keynote golden baseline is available on demand and may ask macOS for Keynote automation permission."
+          : "Keynote golden baseline requires an original .key source deck.",
+      statusPath: "baseline-status.json",
+      referenceMoviePath: null,
+      referenceFramesPath: null,
+      actualFramesPath: null,
+      fidelityReportPath: null,
+      diffPath: null
     },
     keynote: {
       available: null,
@@ -874,6 +1119,31 @@ async function patchBundleManifest(jobDir: string, patch: (manifest: ProductBund
   const manifestPath = path.join(jobDir, "manifest.json");
   const manifest = await readJson<ProductBundleManifest>(manifestPath);
   await writeJson(manifestPath, patch(manifest));
+}
+
+async function writeBaselineUnavailable(
+  paths: ProductBundlePaths,
+  status: ProductBaselineExportUnavailable["status"],
+  message: string,
+  plan: Omit<VideoExportPlan, "frames">,
+  details: Pick<ProductBaselineExportUnavailable, "missing" | "guidance"> = {}
+): Promise<void> {
+  await writeJson(paths.baselineStatus, {
+    generatedAt: new Date().toISOString(),
+    status,
+    message,
+    missing: details.missing,
+    guidance: details.guidance,
+    plan
+  });
+  await patchBundleManifest(paths.jobDir, (manifest) => ({
+    ...manifest,
+    baseline: {
+      ...manifest.baseline,
+      available: false,
+      message
+    }
+  }));
 }
 
 async function readJson<T>(filePath: string): Promise<T> {

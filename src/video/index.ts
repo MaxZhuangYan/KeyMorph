@@ -45,6 +45,12 @@ export interface VideoFrameCaptureResult {
   cleanup?: () => Promise<void>;
 }
 
+export interface VideoFrameExtractionResult {
+  plan: VideoExportPlan;
+  framesDir: string;
+  frames: VideoFramePlan[];
+}
+
 export interface CapturedVideoFrame extends VideoFramePlan {
   filePath: string;
   runtimeSnapshot?: RuntimeFrameSnapshot;
@@ -392,6 +398,41 @@ export async function exportIrToVideo(
   }
 }
 
+export async function extractVideoFramesFromVideo(
+  deck: DeckIR,
+  inputVideoPath: string,
+  options: VideoExportOptions = {}
+): Promise<VideoFrameExtractionResult> {
+  const ffmpeg = options.ffmpegPath ?? "ffmpeg";
+  const missing = await missingFfmpegDependencies(ffmpeg);
+  if (missing.length) throw new VideoExportDependencyError(missing);
+
+  const plan = createVideoExportPlan(deck, options);
+  const ownsFramesDir = !options.framesDir;
+  const framesDir = path.resolve(options.framesDir ?? (await mkdtemp(path.join(tmpdir(), "keymorph-extracted-frames-"))));
+  await rm(framesDir, { recursive: true, force: true });
+  await mkdir(framesDir, { recursive: true });
+
+  try {
+    await run(ffmpeg, [
+      "-y",
+      "-i",
+      inputVideoPath,
+      "-vf",
+      `fps=${plan.fps},scale=${plan.outputWidth}:${plan.outputHeight}:flags=lanczos`,
+      "-frames:v",
+      String(plan.totalFrames),
+      "-start_number",
+      "0",
+      path.join(framesDir, "frame-%06d.png")
+    ]);
+    return { plan, framesDir, frames: plan.frames };
+  } catch (error) {
+    if (ownsFramesDir) await rm(framesDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 function summarizePlan(plan: VideoExportPlan): Omit<VideoExportPlan, "frames"> {
   return {
     width: plan.width,
@@ -495,16 +536,21 @@ async function missingVideoDependencies(ffmpegPath = "ffmpeg"): Promise<string[]
   } catch {
     missing.push("playwright");
   }
+  missing.push(...(await missingFfmpegDependencies(ffmpegPath)));
+  return missing;
+}
+
+async function missingFfmpegDependencies(ffmpegPath = "ffmpeg"): Promise<string[]> {
   if (ffmpegPath.includes(path.sep)) {
     try {
       await access(ffmpegPath);
     } catch {
-      missing.push("ffmpeg");
+      return ["ffmpeg"];
     }
   } else if (!(await commandAvailable(ffmpegPath))) {
-    missing.push("ffmpeg");
+    return ["ffmpeg"];
   }
-  return missing;
+  return [];
 }
 
 export async function resolveVideoDependencies(ffmpegPath = "ffmpeg"): Promise<string[]> {

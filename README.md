@@ -31,6 +31,8 @@ npm run convert -- deck.pptx demo/out/jobs/manual
 npm run inspect -- demo/out/source.ir.json
 npm run bundle:key -- demo/out/jobs/manual
 npm run bundle:video -- demo/out/jobs/manual
+npm run bundle:baseline -- demo/out/jobs/manual --allow-keynote
+npm run keyhtml:to-ir -- keynote-html-export deck.ir.json
 npm run ir:report -- demo/out/imported.ir.json demo/out/conversion-report.json
 npm run png:fidelity -- reference.png actual.png fidelity-report.json
 ```
@@ -46,12 +48,15 @@ npm run png:fidelity -- reference.png actual.png fidelity-report.json
 - `loss-report.json`
 - `video-plan.json`
 - `video-status.json`
+- `baseline-status.json`
 - `manifest.json`
 
-`npm run inspect -- <input>` parses the input and prints validation, conversion-risk, and video dependency status without writing a bundle. `npm run bundle:key -- <output-dir>` and `npm run bundle:video -- <output-dir>` run the deferred Keynote and MP4 exports for an existing bundle. Keynote automation is disabled by default; pass `--allow-keynote` or set `KEYMORPH_ALLOW_KEYNOTE_AUTOMATION=1` when you intentionally want AppleScript automation.
+`npm run inspect -- <input>` parses the input and prints validation, conversion-risk, and video dependency status without writing a bundle. `npm run bundle:key -- <output-dir>`, `npm run bundle:video -- <output-dir>`, and `npm run bundle:baseline -- <output-dir>` run the deferred Keynote, MP4, and Keynote golden-baseline exports for an existing bundle. Keynote automation is disabled by default; pass `--allow-keynote` or set `KEYMORPH_ALLOW_KEYNOTE_AUTOMATION=1` when you intentionally want AppleScript automation.
+
+`npm run bundle:baseline -- <bundle-dir> --allow-keynote --fps 30 --scale 4` is for original `.key` bundles. It uses the copied `.key` inside the bundle, exports a high-resolution Keynote reference movie, extracts `frames/baseline`, captures the KeyMorph HTML runtime into `frames/keymorph-baseline`, and writes `baseline-fidelity.json` plus `baseline-diffs`.
 
 `npm run dev` starts the local product UI for drag-and-drop conversion. Drop a `.pptx`, `.key`, or `.ir.json`, and it returns an HTML runtime preview plus downloadable HTML, PPTX, Keynote when available, IR, loss report, and an MP4 render action. The server starts at `http://127.0.0.1:4173/` or the next available port.
-The `POST /api/convert` route calls the same bundle workflow as `npm run convert`, and `/api/jobs/:id/keynote` plus `/api/jobs/:id/video` perform the optional on-demand exports against that bundle.
+The `POST /api/convert` route calls the same bundle workflow as `npm run convert`, and `/api/jobs/:id/keynote`, `/api/jobs/:id/video`, plus `/api/jobs/:id/baseline` perform the optional on-demand exports against that bundle.
 On macOS with Keynote installed, `.key` input and `.key` export are handled through local Keynote automation as a PPTX bridge. If the bridge is unavailable, KeyMorph can inspect native directory-style or ZIP-backed `.key` packages and recover approximate text slides with explicit loss-report warnings. macOS may prompt for automation permission the first time.
 
 ## Current conversion coverage
@@ -60,6 +65,7 @@ On macOS with Keynote installed, `.key` input and `.key` export are handled thro
 - HTML runtime: plays a deck-level timeline with global scrubbing, slide stepping, basic keyframes, visibility/property events, and best-effort transitions/morph-style numeric interpolation.
 - Video export: renders the HTML runtime through Playwright and encodes with `ffmpeg` when both are available. Missing local dependencies are reported in the UI instead of failing silently.
 - Pixel fidelity: compares rendered PNG frames against reference frames and reports mismatch ratio, error metrics, and a pixel fidelity score.
+- Keynote golden baseline: for original `.key` bundles, compares Keynote-rendered reference frames against KeyMorph HTML runtime frames and writes a per-frame fidelity report plus diff PNGs.
 
 This checkpoint intentionally has no external npm runtime dependencies. It uses Node 24's built-in TypeScript transform.
 

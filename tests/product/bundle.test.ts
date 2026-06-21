@@ -9,9 +9,11 @@ import { promisify } from "node:util";
 import { createDemoDeck } from "../../src/demo/createDemoDeck.ts";
 import { validateIR } from "../../src/ir/index.ts";
 import { exportIrToPptx } from "../../src/pptx/index.ts";
+import { encodePng, type RgbaImage } from "../../src/report/fidelity.ts";
 import {
   createProductApiResponse,
   createProductBundle,
+  exportProductBundleBaseline,
   exportProductBundleKeynote,
   inspectProductInput,
   type ProductBundleManifest
@@ -43,6 +45,8 @@ describe("product bundle workflow", () => {
     assert.equal(manifest.artifacts.lossReport, "loss-report.json");
     assert.equal(manifest.artifacts.videoPlan, "video-plan.json");
     assert.equal(manifest.artifacts.videoStatus, "video-status.json");
+    assert.equal(manifest.artifacts.baselineStatus, "baseline-status.json");
+    assert.equal(manifest.artifacts.baselineFrameFidelity, null);
     assert.equal(manifest.slideCount, createDemoDeck().deck.slides.length);
     assert.equal(report.generatedAt.length > 0, true);
     assert.equal(videoPlan.frames.length, bundle.videoPlan.totalFrames);
@@ -63,6 +67,7 @@ describe("product bundle workflow", () => {
       manifestUrl: string;
       downloads: Record<string, string | null>;
       videoEndpoint: string;
+      baselineEndpoint: string;
       keynoteEndpoint: string;
     };
 
@@ -71,7 +76,10 @@ describe("product bundle workflow", () => {
     assert.equal(response.downloads.source, "/demo/out/jobs/api-job/source.ir.json");
     assert.equal(response.downloads.videoPlan, "/demo/out/jobs/api-job/video-plan.json");
     assert.equal(response.downloads.videoStatus, "/demo/out/jobs/api-job/video-status.json");
+    assert.equal(response.downloads.baselineStatus, "/demo/out/jobs/api-job/baseline-status.json");
+    assert.equal(response.downloads.baselineFidelity, null);
     assert.equal(response.videoEndpoint, "/api/jobs/api-job/video");
+    assert.equal(response.baselineEndpoint, "/api/jobs/api-job/baseline");
     assert.equal(response.keynoteEndpoint, "/api/jobs/api-job/keynote");
   });
 
@@ -198,6 +206,76 @@ describe("product bundle workflow", () => {
     assert.match(await readFile(path.join(bundleDir, "keynote-movie.m4v"), "utf8"), /movie completed/);
   });
 
+  test("exports a Keynote golden baseline from the bundle copy and compares runtime frames", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-baseline-"));
+    const inputPath = path.join(dir, "original-source.key");
+    const bundleDir = path.join(dir, "bundle");
+    await writeFile(inputPath, "stub keynote package", "utf8");
+
+    await createProductBundle(inputPath, bundleDir, {
+      jobId: "baseline-job",
+      allowKeynoteAutomation: true,
+      keynoteBridgeExport: async (_keynotePath, pptxPath) => {
+        await exportIrToPptx(createDemoDeck(), pptxPath);
+      },
+      keynoteMovieExport: async (_keynotePath, moviePath) => {
+        await writeFile(moviePath, "stub movie", "utf8");
+      }
+    });
+
+    let keynoteFrameSource = "";
+    const result = await exportProductBundleBaseline(bundleDir, {
+      allowKeynoteAutomation: true,
+      video: { fps: 1, scale: 1 },
+      keynoteFrameExport: async (keynotePath, framesDir, plan) => {
+        keynoteFrameSource = keynotePath;
+        await mkdir(framesDir, { recursive: true });
+        for (const frame of plan.frames) {
+          await writeFile(path.join(framesDir, frame.outputPath), encodePng(image(1, 1, [255, 255, 255, 255])));
+        }
+      },
+      runtimeFrameExport: async (_deck, framesDir, plan) => {
+        await mkdir(framesDir, { recursive: true });
+        for (const frame of plan.frames) {
+          await writeFile(
+            path.join(framesDir, frame.outputPath),
+            encodePng(frame.frame === 1 ? image(1, 1, [0, 0, 0, 255]) : image(1, 1, [255, 255, 255, 255]))
+          );
+        }
+      }
+    });
+
+    const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
+    const status = JSON.parse(await readFile(path.join(bundleDir, "baseline-status.json"), "utf8"));
+    const report = JSON.parse(await readFile(path.join(bundleDir, "baseline-fidelity.json"), "utf8"));
+
+    assert.equal(result.status, "ready");
+    assert.equal(keynoteFrameSource, path.join(bundleDir, "original-source.key"));
+    assert.notEqual(keynoteFrameSource, inputPath);
+    assert.equal(manifest.baseline.available, true);
+    assert.equal(manifest.artifacts.baselineFrames, "frames/baseline");
+    assert.equal(manifest.artifacts.baselineActualFrames, "frames/keymorph-baseline");
+    assert.equal(manifest.artifacts.baselineFrameFidelity, "baseline-fidelity.json");
+    assert.equal(manifest.artifacts.baselineFrameDiffs, "baseline-diffs");
+    assert.equal(status.status, "ready");
+    assert.equal(report.summary.mismatchedFrames, 1);
+  });
+
+  test("reports Keynote baseline as unsupported for non-Keynote bundles", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-baseline-unsupported-"));
+    const inputPath = path.join(dir, "source.ir.json");
+    const bundleDir = path.join(dir, "bundle");
+    await writeFile(inputPath, `${JSON.stringify(createDemoDeck(), null, 2)}\n`, "utf8");
+    await createProductBundle(inputPath, bundleDir, { jobId: "baseline-unsupported-job" });
+
+    const result = await exportProductBundleBaseline(bundleDir, { video: { fps: 1, scale: 1 } });
+    const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
+
+    assert.equal(result.status, "unsupported");
+    assert.match(result.message, /original \.key source/);
+    assert.equal(manifest.baseline.available, false);
+  });
+
   test("CLI convert writes the same bundle shape", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-cli-"));
     const inputPath = path.join(dir, "source.ir.json");
@@ -222,5 +300,11 @@ describe("product bundle workflow", () => {
     assert.match(source, /<option value="zh-Hant">繁體中文<\/option>/);
     assert.match(source, /把演示文稿拖到这里/);
     assert.match(source, /把簡報拖到這裡/);
+    assert.match(source, /运行 Keynote 基准对比/);
+    assert.match(source, /執行 Keynote 基準對比/);
   });
 });
+
+function image(width: number, height: number, data: number[]): RgbaImage {
+  return { width, height, data: new Uint8Array(data) };
+}
