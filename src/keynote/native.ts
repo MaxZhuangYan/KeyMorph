@@ -1654,6 +1654,7 @@ function buildNativeSlides(
     );
     applyNativePlacementGroupMetadata(assetObjects);
     const nativeTextObjects = createNativeTextDrawableObjects(slideId, scan.archiveMessages, entry.path, deckSize, textStyleMap);
+    applyNativePeerTextStyleInference(nativeTextObjects, textStyleMap);
     const textObjectsToKeep = suppressDuplicateFallbackTextObjects(textObjects, nativeTextObjects);
     const objects =
       usePreviewFallback && previewFallback
@@ -2212,6 +2213,99 @@ function nativeTextDrawableLayoutMetadata(layout: NativeTextDrawableLayoutEviden
     nativeTextDrawableFrameConfidence: layout.confidence,
     ...(layout.slideArchiveId ? { nativeTextDrawableParentSlideArchiveId: layout.slideArchiveId } : {})
   };
+}
+
+function applyNativePeerTextStyleInference(objects: IRObject[], textStyleMap: NativeTextStyleMap): void {
+  const textObjects = objects.filter((object): object is Extract<IRObject, { type: "text" }> => object.type === "text");
+  const groups = new Map<string, Array<Extract<IRObject, { type: "text" }>>>();
+  for (const object of textObjects) {
+    const key = nativePeerTextStyleGroupKey(object.bounds);
+    if (!key) continue;
+    const group = groups.get(key) ?? [];
+    group.push(object);
+    groups.set(key, group);
+  }
+
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const sourceStyle = nativePeerTextStyleSource(group, textStyleMap);
+    if (!sourceStyle) continue;
+    for (const object of group) {
+      if (!nativeTextObjectHasMissingStyleRecord(object, textStyleMap)) continue;
+      if (!nativeTextObjectNeedsPeerStyle(object, sourceStyle)) continue;
+      applyTextStyleToAllRuns(object.text, sourceStyle);
+      object.metadata = {
+        ...(object.metadata ?? {}),
+        nativeTextStylePeerInferred: true,
+        nativeTextStylePeerInferredProperties: Object.keys(sourceStyle),
+        nativeTextStylePeerGroupSize: group.length
+      };
+    }
+  }
+}
+
+function nativePeerTextStyleGroupKey(bounds: { x: number; y: number; width: number; height: number } | undefined): string | undefined {
+  if (!bounds || bounds.width <= 0 || bounds.height <= 0) return undefined;
+  return `${Math.round(bounds.y / 8)}:${Math.round(bounds.width / 16)}:${Math.round(bounds.height / 8)}`;
+}
+
+function nativePeerTextStyleSource(
+  group: Array<Extract<IRObject, { type: "text" }>>,
+  textStyleMap: NativeTextStyleMap
+): TextStyle | undefined {
+  const candidates = group
+    .filter((object) => !nativeTextObjectHasMissingStyleRecord(object, textStyleMap))
+    .map((object) => object.text.runs?.[0]?.style ?? {})
+    .filter((style) => style.fontSize !== undefined || style.fontFamily !== undefined || style.color !== undefined);
+  if (candidates.length === 0) return undefined;
+  return compactTextStyle({
+    fontSize: mostFrequentNumber(candidates.map((style) => style.fontSize).filter((value): value is number => value !== undefined && Number.isFinite(value))),
+    fontFamily: mostFrequentString(candidates.map((style) => style.fontFamily).filter((value): value is string => Boolean(value))),
+    color: mostFrequentString(candidates.map((style) => style.color).filter((value): value is string => Boolean(value)))
+  });
+}
+
+function nativeTextObjectHasMissingStyleRecord(object: Extract<IRObject, { type: "text" }>, textStyleMap: NativeTextStyleMap): boolean {
+  const styleIds = nativeTextObjectStyleIds(object);
+  return styleIds.length > 0 && styleIds.every((styleId) => !textStyleMap.styles.has(styleId));
+}
+
+function nativeTextObjectStyleIds(object: Extract<IRObject, { type: "text" }>): string[] {
+  const value = object.metadata?.nativeTextStyleIds;
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
+}
+
+function nativeTextObjectNeedsPeerStyle(object: Extract<IRObject, { type: "text" }>, sourceStyle: TextStyle): boolean {
+  const current = object.text.runs?.[0]?.style ?? {};
+  return (
+    (sourceStyle.fontSize !== undefined && (current.fontSize === undefined || Math.abs(sourceStyle.fontSize - current.fontSize) >= 4)) ||
+    (sourceStyle.fontFamily !== undefined && current.fontFamily === undefined) ||
+    (sourceStyle.color !== undefined && current.color === undefined)
+  );
+}
+
+function applyTextStyleToAllRuns(text: TextContent, style: TextStyle): void {
+  const runs = text.runs ?? [{ text: text.plainText, style: {} }];
+  for (const run of runs) {
+    run.style = compactTextStyle({
+      ...(run.style ?? {}),
+      ...style
+    });
+  }
+  text.runs = runs;
+}
+
+function mostFrequentNumber(values: number[]): number | undefined {
+  const value = mostFrequentString(values.map((item) => String(item)));
+  return value === undefined ? undefined : Number(value);
+}
+
+function mostFrequentString(values: string[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+  return Array.from(counts.entries()).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0];
 }
 
 function nativeStyledTextContent(

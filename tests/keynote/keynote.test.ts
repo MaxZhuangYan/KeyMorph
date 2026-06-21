@@ -1404,6 +1404,66 @@ describe("Keynote bridge", () => {
     });
   });
 
+  test("infers missing native local style ids from aligned peer text", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-peer-style-"));
+    const keyPath = path.join(dir, "peer-style.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "DocumentStylesheet.iwa"),
+      iwaArchiveRecord(9480, [
+        {
+          type: 2022,
+          payload: nativeParagraphStylePayload({
+            fontFamily: "HelveticaNeue-Medium",
+            paragraphFontSize: 36,
+            paragraphColor: { red: 0, green: 0, blue: 0, alpha: 1 }
+          }),
+          objectReferences: [9480]
+        }
+      ])
+    );
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(1200, [{ type: 2001, payload: nativeStyledTextContentPayload("经济资产", { paragraphStyleId: 9999 }) }]),
+        iwaArchiveRecord(1201, [{ type: 2001, payload: nativeStyledTextContentPayload("声望记录", { paragraphStyleId: 9480 }) }]),
+        iwaArchiveRecord(1100, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1200,
+              bounds: { x: 100, y: 500, width: 169, height: 64 }
+            })
+          }
+        ]),
+        iwaArchiveRecord(1101, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1201,
+              bounds: { x: 400, y: 500, width: 169, height: 64 }
+            })
+          }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const missingStyleObject = deck.deck.slides[0]?.objects.find(
+      (candidate) => candidate.type === "text" && candidate.text.plainText === "经济资产"
+    );
+    assert.equal(missingStyleObject?.type, "text");
+    if (missingStyleObject?.type !== "text") throw new Error("Expected peer-inferred text.");
+    assert.equal(missingStyleObject.text.runs?.[0]?.style?.fontSize, 36);
+    assert.equal(missingStyleObject.text.runs?.[0]?.style?.fontFamily, "HelveticaNeue-Medium");
+    assert.equal(missingStyleObject.text.runs?.[0]?.style?.color, "#000000");
+    assert.equal(missingStyleObject.metadata?.nativeTextStylePeerInferred, true);
+  });
+
   test("preserves character-level dissolve build semantics when degrading to object opacity", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-character-dissolve-"));
     const keyPath = path.join(dir, "character-dissolve.key");
