@@ -1309,6 +1309,101 @@ describe("Keynote bridge", () => {
     assert.equal(object.metadata?.nativeTextStyleInheritanceResolvedCount, 1);
   });
 
+  test("reads native paragraph font size from Keynote 12.4 style field", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-paragraph-font-size-"));
+    const keyPath = path.join(dir, "paragraph-font-size.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "DocumentStylesheet.iwa"),
+      iwaArchiveRecord(9450, [
+        {
+          type: 2022,
+          payload: nativeParagraphStylePayload({
+            fontFamily: "Times-Roman",
+            paragraphFontSize: 36
+          }),
+          objectReferences: [9450]
+        }
+      ])
+    );
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(1200, [{ type: 2001, payload: nativeStyledTextContentPayload("声望记录", { paragraphStyleId: 9450 }) }]),
+        iwaArchiveRecord(1100, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1200,
+              bounds: { x: 100, y: 120, width: 300, height: 64 }
+            })
+          }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.metadata?.nativeExtraction === "typed-iwa-text-drawable");
+    assert.equal(object?.type, "text");
+    if (object?.type !== "text") throw new Error("Expected native text drawable.");
+    assert.deepEqual(object.text.runs?.[0]?.style, {
+      fontFamily: "Helvetica Neue",
+      fontSize: 36,
+      color: "#111827"
+    });
+  });
+
+  test("normalizes oversized native character font units", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-character-font-units-"));
+    const keyPath = path.join(dir, "character-font-units.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "DocumentStylesheet.iwa"),
+      iwaArchiveRecord(9460, [
+        {
+          type: 2021,
+          payload: nativeCharacterStylePayload({
+            fontFamily: "Times-Roman",
+            fontSize: 120,
+            color: { red: 0.85, green: 0.47, blue: 0.34, alpha: 1 }
+          }),
+          objectReferences: [9460]
+        }
+      ])
+    );
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(1200, [{ type: 2001, payload: nativeStyledTextContentPayload("平台关了?", { characterStyleId: 9460 }) }]),
+        iwaArchiveRecord(1100, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1200,
+              bounds: { x: 100, y: 120, width: 400, height: 96 }
+            })
+          }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.metadata?.nativeExtraction === "typed-iwa-text-drawable");
+    assert.equal(object?.type, "text");
+    if (object?.type !== "text") throw new Error("Expected native text drawable.");
+    assert.deepEqual(object.text.runs?.[0]?.style, {
+      fontFamily: "Helvetica Neue",
+      fontSize: 48,
+      color: "#d97857"
+    });
+  });
+
   test("preserves character-level dissolve build semantics when degrading to object opacity", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-character-dissolve-"));
     const keyPath = path.join(dir, "character-dissolve.key");
@@ -1938,6 +2033,7 @@ function nativeParagraphStylePayload(values: {
   parentStyleId?: number;
   fontFamily?: string;
   fontSize?: number;
+  paragraphFontSize?: number;
   color?: { red: number; green: number; blue: number; alpha: number };
   paragraphColor?: { red: number; green: number; blue: number; alpha: number };
   alignment?: number;
@@ -1949,6 +2045,7 @@ function nativeParagraphStylePayload(values: {
     protoBytes(
       concat([
         ...(values.alignment !== undefined ? [protoVarint(1, values.alignment)] : []),
+        ...(values.paragraphFontSize !== undefined ? [protoFixed32(4, values.paragraphFontSize)] : []),
         ...(values.paragraphColor ? [protoBytes(protoBytes(nativeColorPayload(values.paragraphColor), 1), 32)] : []),
         ...(values.lineHeight !== undefined ? [protoFixed32(13, values.lineHeight), protoBytes(protoFixed32(2, values.lineHeight), 13)] : [])
       ]),

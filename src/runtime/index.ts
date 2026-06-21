@@ -2055,7 +2055,7 @@ function runtimeScript(): string {
 }
 
 function renderObjectMarkup(object: IRObject, deck?: DeckIR): string {
-  const style = objectStyle(object);
+  const style = objectStyle(object, deck);
   const className = `km-object km-${object.type}${object.type === "shape" && object.text ? " km-shape-text" : ""}`;
   const common = `class="${className}" data-object-id="${escapeHtml(object.id)}" style="${style}"`;
 
@@ -2174,7 +2174,7 @@ function resolveObjectSourceUrl(source: ObjectSource | undefined, deck: DeckIR |
   return asset?.uri ?? asset?.dataUri ?? "";
 }
 
-function objectStyle(object: IRObject): string {
+function objectStyle(object: IRObject, deck?: DeckIR): string {
   const state = initialObjectState(object);
   const bounds = state.bounds ?? { x: 0, y: 0, width: 100, height: 100 };
   const transform = state.transform ?? {};
@@ -2201,7 +2201,7 @@ function objectStyle(object: IRObject): string {
   }
 
   if (object.type === "shape" || object.type === "placeholder") {
-    style.push(...backgroundStyleEntries(state.style?.fill, "#e2e8f0"));
+    style.push(...backgroundStyleEntries(state.style?.fill, "#e2e8f0", deck));
     const stroke = state.style?.stroke;
     if (stroke) {
       style.push(`border:${stroke.width ?? 1}px solid ${colorToCss(stroke.color) ?? "transparent"}`);
@@ -3139,7 +3139,7 @@ function textContent(object: TextObject | ShapeObject): string {
   return text?.plainText ?? text?.runs?.map((run) => run.text).join("") ?? "";
 }
 
-function fillToCss(fill: Fill | undefined): string | undefined {
+function fillToCss(fill: Fill | undefined, deck?: DeckIR): string | undefined {
   if (!fill) return undefined;
   if (fill.type === "solid") return colorToCss(fill.color);
   if (fill.type === "none") return "transparent";
@@ -3150,14 +3150,14 @@ function fillToCss(fill: Fill | undefined): string | undefined {
     return `linear-gradient(${fill.angleDeg ?? 180}deg, ${stops})`;
   }
   if (fill.type === "image") {
-    const source = fill.source.dataUri ?? fill.source.uri;
+    const source = resolveObjectSourceUrl(fill.source, deck);
     return source ? `url("${source.replaceAll('"', "%22")}")` : undefined;
   }
   return undefined;
 }
 
-function backgroundStyleEntries(fill: Fill | undefined, fallback: string): string[] {
-  const background = fillToCss(fill) ?? fallback;
+function backgroundStyleEntries(fill: Fill | undefined, fallback: string, deck?: DeckIR): string[] {
+  const background = fillToCss(fill, deck) ?? fallback;
   if (fill?.type !== "image") return [`background:${background}`];
   const parts = imageFillCssParts(fill);
   return [
@@ -3169,9 +3169,9 @@ function backgroundStyleEntries(fill: Fill | undefined, fallback: string): strin
   ];
 }
 
-function backgroundStyleRecord(fill: Fill | undefined, fallback: string): Record<string, string> {
+function backgroundStyleRecord(fill: Fill | undefined, fallback: string, deck?: DeckIR): Record<string, string> {
   const record: Record<string, string> = {};
-  for (const entry of backgroundStyleEntries(fill, fallback)) {
+  for (const entry of backgroundStyleEntries(fill, fallback, deck)) {
     const separatorIndex = entry.indexOf(":");
     if (separatorIndex <= 0) continue;
     record[entry.slice(0, separatorIndex)] = entry.slice(separatorIndex + 1);

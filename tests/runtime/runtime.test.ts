@@ -122,6 +122,14 @@ describe("HTML runtime rendering", () => {
     assert.match(markup, /background-position:center center/);
   });
 
+  test("resolves image fill backgrounds through deck asset ids", () => {
+    const deck = createShapeImageFillDeck("cover", "asset");
+    const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);
+
+    assert.match(markup, /background-image:url\("data:image\/jpeg;base64,ASSET=="\)/);
+    assert.doesNotMatch(markup, /background-image:#e2e8f0/);
+  });
+
   test("converts image fill keyframes to explicit background fit CSS", () => {
     const frames = keyframeEventToCssFrames({
       id: "fill",
@@ -906,12 +914,13 @@ function createStaticCropDeck(): DeckIR {
   };
 }
 
-function createShapeImageFillDeck(fit: "cover" | "contain" | "stretch" | "tile"): DeckIR {
+function createShapeImageFillDeck(fit: "cover" | "contain" | "stretch" | "tile", sourceKind: "inline" | "asset" = "inline"): DeckIR {
   return {
     irVersion: "keymorph.ir.v1",
     deck: {
       id: "image-background",
       size: { width: 400, height: 200, unit: "px" },
+      assets: sourceKind === "asset" ? [{ id: "background", name: "background.jpg", mimeType: "image/jpeg", dataUri: "data:image/jpeg;base64,ASSET==" }] : [],
       slides: [
         {
           id: "slide",
@@ -925,7 +934,7 @@ function createShapeImageFillDeck(fit: "cover" | "contain" | "stretch" | "tile")
                 fill: {
                   type: "image",
                   fit,
-                  source: { dataUri: "data:image/jpeg;base64,AA==" }
+                  source: sourceKind === "asset" ? { assetId: "background" } : { dataUri: "data:image/jpeg;base64,AA==" }
                 }
               }
             }

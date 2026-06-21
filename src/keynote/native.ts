@@ -3866,7 +3866,7 @@ function readNativeTextStyleMap(iwaEntries: Array<{ path: string; data: Uint8Arr
         }
         const styleId = messageInfo.objectReferences[0] ?? record.identifier ?? `${entry.path}:${record.archiveOffset}:${messageIndex}`;
         const styleRecord = nativeTextStyleRecordFromPayload(styleId, messageInfo.type, payload);
-        if (styleRecord && Object.keys(styleRecord.style).length > 0) {
+        if (styleRecord && (Object.keys(styleRecord.style).length > 0 || styleRecord.parentStyleId || styleRecord.alignment)) {
           styles.set(styleRecord.styleId, styleRecord);
         }
       }
@@ -3932,29 +3932,29 @@ function findArchiveMessagePayload(
 function nativeTextStyleRecordFromPayload(styleId: string, type: number, payload: Uint8Array): NativeTextStyleRecord | undefined {
   const style: TextStyle = {};
   const parentStyleId = nativeIdFromNumber(numericValueAtFieldPath(payload, [1, 3, 1]));
-  const fontSize = numericValueAtFieldPath(payload, [11, 3]);
+  const fontSize = nativeTextFontSizeFromPayload(payload, type);
   const fontFamily = stringValueAtFieldPath(payload, [11, 5]);
   const color =
     nativeColorAtFieldPath(payload, [11, 7]) ??
     nativeColorAtFieldPath(payload, [11, 46, 1]) ??
     nativeColorAtFieldPath(payload, [12, 32, 1]);
   const alignment = type === 2022 ? nativeParagraphAlignment(numericValueAtFieldPath(payload, [12, 1])) : undefined;
-  const lineHeight = numericValueAtFieldPath(payload, [12, 13, 2]) ?? numericValueAtFieldPath(payload, [12, 4]);
+  const lineHeight = nativeTextLineHeightFromPayload(payload, fontSize?.value);
 
   if (fontFamily) style.fontFamily = fontFamily;
-  if (fontSize !== undefined && fontSize > 0 && fontSize <= 400) style.fontSize = fontSize;
-  if (color) style.color = color;
+  if (fontSize && fontSize.value > 0 && fontSize.value <= 400) style.fontSize = fontSize.value;
+  if (color !== undefined) style.color = color;
   if (lineHeight !== undefined && lineHeight > 0 && lineHeight < 10) style.lineHeight = lineHeight;
 
   const sourceFieldPaths = [
     ...(parentStyleId ? ["1.3.1"] : []),
-    ...(fontSize !== undefined ? ["11.3"] : []),
+    ...(fontSize ? [fontSize.fieldPath] : []),
     ...(fontFamily ? ["11.5"] : []),
-    ...(color ? ["11.7", "11.46.1", "12.32.1"] : []),
+    ...(color !== undefined ? ["11.7", "11.46.1", "12.32.1"] : []),
     ...(alignment ? ["12.1"] : []),
     ...(lineHeight !== undefined ? ["12.13.2", "12.4"] : [])
   ];
-  if (Object.keys(style).length === 0 && !alignment) {
+  if (Object.keys(style).length === 0 && !alignment && !parentStyleId) {
     return undefined;
   }
 
@@ -3966,6 +3966,54 @@ function nativeTextStyleRecordFromPayload(styleId: string, type: number, payload
     ...(alignment ? { alignment } : {}),
     sourceFieldPaths: uniqueStrings(sourceFieldPaths)
   };
+}
+
+function nativeTextFontSizeFromPayload(
+  payload: Uint8Array,
+  type: number
+): { value: number; fieldPath: string } | undefined {
+  const directFontSize = numericValueAtFieldPath(payload, [11, 3]);
+  if (directFontSize !== undefined) {
+    return {
+      value: normalizeNativeTextFontSize(directFontSize, "11.3"),
+      fieldPath: "11.3"
+    };
+  }
+  if (type === 2022) {
+    const paragraphFontSize = numericValueAtFieldPath(payload, [12, 4]);
+    if (paragraphFontSize !== undefined) {
+      return {
+        value: normalizeNativeTextFontSize(paragraphFontSize, "12.4"),
+        fieldPath: "12.4"
+      };
+    }
+  }
+  return undefined;
+}
+
+function normalizeNativeTextFontSize(value: number, fieldPath: "11.3" | "12.4"): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return value;
+  }
+  if (fieldPath === "11.3" && value >= 110) {
+    return Math.round(value * 0.4);
+  }
+  return value;
+}
+
+function nativeTextLineHeightFromPayload(payload: Uint8Array, fontSize: number | undefined): number | undefined {
+  const explicitLineHeight = numericValueAtFieldPath(payload, [12, 13, 2]);
+  if (explicitLineHeight !== undefined) {
+    return explicitLineHeight;
+  }
+  const legacyLineHeight = numericValueAtFieldPath(payload, [12, 4]);
+  if (legacyLineHeight === undefined) {
+    return undefined;
+  }
+  if (fontSize !== undefined && Math.abs(legacyLineHeight - fontSize) < 0.001) {
+    return undefined;
+  }
+  return legacyLineHeight;
 }
 
 function resolveNativeTextStyleInheritance(styles: Map<string, NativeTextStyleRecord>): number {
@@ -4037,7 +4085,8 @@ function nativeColorAtFieldPath(payload: Uint8Array, fieldPath: number[]): strin
   if (red === undefined || green === undefined || blue === undefined) {
     return undefined;
   }
-  return nativeRgbaToCss(red, green, blue, alpha);
+  const color = nativeRgbaToCss(red, green, blue, alpha);
+  return color === "" ? undefined : color;
 }
 
 function nativeRgbaToCss(red: number, green: number, blue: number, alpha = 1): string | undefined {
