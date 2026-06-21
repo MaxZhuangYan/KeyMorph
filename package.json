@@ -11,6 +11,7 @@
     "demo": "node --experimental-transform-types src/cli.ts demo",
     "convert": "node --experimental-transform-types src/cli.ts convert",
     "inspect": "node --experimental-transform-types src/cli.ts inspect",
+    "benchmark:key": "node --experimental-transform-types src/cli.ts benchmark-key",
     "bundle:key": "node --experimental-transform-types src/cli.ts bundle-keynote",
     "bundle:video": "node --experimental-transform-types src/cli.ts bundle-video",
     "bundle:baseline": "node --experimental-transform-types src/cli.ts bundle-baseline",

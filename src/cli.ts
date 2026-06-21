@@ -44,6 +44,69 @@ export interface ProductBundleOptions {
   video?: Pick<VideoExportOptions, "fps" | "scale" | "ffmpegPath">;
 }
 
+export interface ProductKeyBenchmarkOptions extends ProductBundleOptions {
+  outputDir?: string;
+  runBaseline?: boolean;
+  baseline?: ProductBaselineExportOptions;
+}
+
+export interface ProductKeyBenchmarkResult {
+  inputPath: string;
+  copiedSourcePath: string;
+  bundleDir: string;
+  summaryPath: string;
+  bundle: ProductBundleResult;
+  baseline?: ProductBaselineExportResult;
+  summary: ProductKeyBenchmarkSummary;
+}
+
+export interface ProductKeyBenchmarkSummary {
+  generatedAt: string;
+  inputPath: string;
+  copiedSourcePath: string;
+  bundleDir: string;
+  sourceName: string;
+  slideCount: number;
+  objectCount: number;
+  runtime: ProductRuntimeSummary;
+  conversion: ProductBundleManifest["report"];
+  videoPlan: Omit<VideoExportPlan, "frames">;
+  videoDependencies: VideoDependencyStatus;
+  baseline: {
+    status: ProductBaselineExportResult["status"] | "not-run";
+    message: string;
+    reportPath: string | null;
+    diffPath: string | null;
+    referenceFramesPath: string | null;
+    actualFramesPath: string | null;
+    summary?: ProductFrameFidelitySummary;
+    worstFrames: ProductBenchmarkFrameSummary[];
+    worstSlides: ProductBenchmarkSlideSummary[];
+  };
+  nextRecommendedActions: string[];
+}
+
+export interface ProductBenchmarkFrameSummary {
+  frame: number;
+  slideIndex: number;
+  slideId: string;
+  timeMs: number;
+  pixelFidelityScore: number;
+  mismatchRatio: number;
+  referencePath: string;
+  actualPath: string;
+  diffPath?: string;
+}
+
+export interface ProductBenchmarkSlideSummary {
+  slideIndex: number;
+  slideId: string;
+  frameCount: number;
+  meanPixelFidelityScore: number;
+  mismatchRatio: number;
+  worstFrame?: number;
+}
+
 export interface ProductBaselineExportOptions {
   allowKeynoteAutomation?: boolean;
   keynoteAutomationTimeoutMs?: number;
@@ -361,6 +424,53 @@ export async function inspectProductInput(inputPath: string): Promise<{
   };
 }
 
+export async function benchmarkKeynoteDeck(inputPath: string, options: ProductKeyBenchmarkOptions = {}): Promise<ProductKeyBenchmarkResult> {
+  const resolvedInput = path.resolve(inputPath);
+  const sourceName = sanitizeFileName(options.sourceName ?? path.basename(resolvedInput));
+  if (detectInputKind(sourceName) !== "keynote") {
+    throw new Error("benchmark-key requires an original .key source deck.");
+  }
+
+  const outputDir = path.resolve(options.outputDir ?? path.join("demo", "out", "benchmarks", createJobId(sourceName)));
+  const sourceCopyDir = path.join(outputDir, "source-copy");
+  const copiedSourcePath = path.join(sourceCopyDir, sourceName);
+  const bundleDir = path.join(outputDir, "bundle");
+  const summaryPath = path.join(outputDir, "benchmark-summary.json");
+
+  await rm(sourceCopyDir, { recursive: true, force: true });
+  await mkdir(sourceCopyDir, { recursive: true });
+  await copySource(resolvedInput, copiedSourcePath);
+
+  const bundle = await createProductBundle(copiedSourcePath, bundleDir, {
+    ...options,
+    sourceName,
+    jobId: options.jobId ?? createJobId(sourceName)
+  });
+  const runBaseline = options.runBaseline ?? Boolean(options.allowKeynoteAutomation);
+  const baseline = runBaseline
+    ? await exportProductBundleBaseline(bundleDir, {
+        ...options.baseline,
+        allowKeynoteAutomation: options.baseline?.allowKeynoteAutomation ?? options.allowKeynoteAutomation,
+        keynoteAutomationTimeoutMs: options.baseline?.keynoteAutomationTimeoutMs ?? options.keynoteAutomationTimeoutMs,
+        video: {
+          ...options.video,
+          ...options.baseline?.video
+        }
+      })
+    : undefined;
+
+  const summary = await createKeyBenchmarkSummary({
+    generatedAt: new Date().toISOString(),
+    inputPath: resolvedInput,
+    copiedSourcePath,
+    bundle,
+    bundleDir,
+    baseline
+  });
+  await writeJson(summaryPath, summary);
+  return { inputPath: resolvedInput, copiedSourcePath, bundleDir, summaryPath, bundle, baseline, summary };
+}
+
 export async function exportProductBundleKeynote(
   jobDir: string,
   options: Pick<ProductBundleOptions, "allowKeynoteAutomation" | "keynoteAutomationTimeoutMs"> = {}
@@ -647,6 +757,110 @@ export function createProductApiResponse(bundle: ProductBundleResult, basePath: 
   };
 }
 
+async function createKeyBenchmarkSummary(input: {
+  generatedAt: string;
+  inputPath: string;
+  copiedSourcePath: string;
+  bundle: ProductBundleResult;
+  bundleDir: string;
+  baseline?: ProductBaselineExportResult;
+}): Promise<ProductKeyBenchmarkSummary> {
+  const fidelityReport = await readOptionalFrameFidelityReport(path.join(input.bundleDir, "baseline-fidelity.json"));
+  const baselineStatus = input.baseline?.status ?? "not-run";
+  const baselineMessage =
+    input.baseline?.message ??
+    (fidelityReport ? "Keynote golden baseline pixel fidelity report is ready." : "Baseline was not run. Pass --allow-keynote to run it.");
+  const worstFrames = fidelityReport ? summarizeWorstBenchmarkFrames(fidelityReport, 12) : [];
+  const worstSlides = fidelityReport ? summarizeWorstBenchmarkSlides(fidelityReport, 8) : [];
+  const nextRecommendedActions = createBenchmarkRecommendations(input.bundle, baselineStatus, fidelityReport);
+
+  return {
+    generatedAt: input.generatedAt,
+    inputPath: input.inputPath,
+    copiedSourcePath: input.copiedSourcePath,
+    bundleDir: input.bundleDir,
+    sourceName: input.bundle.sourceName,
+    slideCount: input.bundle.manifest.slideCount,
+    objectCount: input.bundle.manifest.objectCount,
+    runtime: input.bundle.manifest.runtime,
+    conversion: input.bundle.manifest.report,
+    videoPlan: summarizeVideoPlan(input.bundle.videoPlan),
+    videoDependencies: input.bundle.videoDependencies,
+    baseline: {
+      status: baselineStatus,
+      message: baselineMessage,
+      reportPath: fidelityReport?.reportPath ?? null,
+      diffPath: fidelityReport ? path.join(input.bundleDir, "baseline-diffs") : null,
+      referenceFramesPath: fidelityReport ? path.join(input.bundleDir, "frames", "baseline") : null,
+      actualFramesPath: fidelityReport ? path.join(input.bundleDir, "frames", "keymorph-baseline") : null,
+      summary: fidelityReport?.summary,
+      worstFrames,
+      worstSlides
+    },
+    nextRecommendedActions
+  };
+}
+
+async function readOptionalFrameFidelityReport(reportPath: string): Promise<VideoFrameFidelityReport | null> {
+  try {
+    return await readJson<VideoFrameFidelityReport>(reportPath);
+  } catch {
+    return null;
+  }
+}
+
+function summarizeWorstBenchmarkFrames(report: VideoFrameFidelityReport, limit: number): ProductBenchmarkFrameSummary[] {
+  return [...report.frames]
+    .sort((left, right) => left.pixelFidelityScore - right.pixelFidelityScore || right.mismatchRatio - left.mismatchRatio)
+    .slice(0, limit)
+    .map((frame) => ({
+      frame: frame.frame,
+      slideIndex: frame.resolution.slideIndex,
+      slideId: frame.resolution.slideId,
+      timeMs: frame.timeMs,
+      pixelFidelityScore: frame.pixelFidelityScore,
+      mismatchRatio: frame.mismatchRatio,
+      referencePath: frame.referencePath,
+      actualPath: frame.actualPath,
+      diffPath: frame.diffPath
+    }));
+}
+
+function summarizeWorstBenchmarkSlides(report: VideoFrameFidelityReport, limit: number): ProductBenchmarkSlideSummary[] {
+  return [...report.summary.bySlide]
+    .sort((left, right) => left.meanPixelFidelityScore - right.meanPixelFidelityScore || right.mismatchRatio - left.mismatchRatio)
+    .slice(0, limit)
+    .map((slide) => ({
+      slideIndex: slide.slideIndex,
+      slideId: slide.slideId,
+      frameCount: slide.frameCount,
+      meanPixelFidelityScore: slide.meanPixelFidelityScore,
+      mismatchRatio: slide.mismatchRatio,
+      worstFrame: slide.worstFrame
+    }));
+}
+
+function createBenchmarkRecommendations(
+  bundle: ProductBundleResult,
+  baselineStatus: ProductKeyBenchmarkSummary["baseline"]["status"],
+  fidelityReport: VideoFrameFidelityReport | null
+): string[] {
+  const recommendations = new Set<string>(bundle.lossReport.recommendedFixes);
+  if (baselineStatus === "not-run") {
+    recommendations.add("Run benchmark-key with --allow-keynote to generate Keynote reference frames and pixel diffs.");
+  }
+  if (baselineStatus === "dependency-missing") {
+    recommendations.add("Install or authorize the missing local dependencies reported in baseline-status.json, then rerun benchmark-key.");
+  }
+  if (fidelityReport?.summary.worstFrame !== undefined) {
+    recommendations.add("Start fixes from baseline.worstFrames[0]; it identifies the lowest-scoring frame, slide, and diff PNG.");
+  }
+  if ((fidelityReport?.summary.meanPixelFidelityScore ?? 1) < 0.92) {
+    recommendations.add("Prioritize HTML asset resolution, crop handling, text metrics, and native animation mappings before PPTX export.");
+  }
+  return Array.from(recommendations);
+}
+
 async function runDemo(): Promise<void> {
   const outDir = path.resolve("demo/out");
   await mkdir(outDir, { recursive: true });
@@ -701,6 +915,24 @@ async function main(): Promise<void> {
     case "inspect": {
       if (!input) throw new Error("Usage: inspect <input.pptx|input.key|input.ir.json>");
       console.log(JSON.stringify(await inspectProductInput(input), null, 2));
+      return;
+    }
+    case "benchmark-key": {
+      if (!input) {
+        throw new Error("Usage: benchmark-key <input.key> [output-dir] [--allow-keynote] [--fps N] [--scale N] [--ffmpeg PATH]");
+      }
+      const flags = parseFlags(args);
+      const result = await benchmarkKeynoteDeck(input, {
+        outputDir: output,
+        allowKeynoteAutomation: flags["allow-keynote"] === true,
+        runBaseline: flags["allow-keynote"] === true,
+        video: {
+          fps: parsePositiveNumber(flags.fps),
+          scale: parsePositiveNumber(flags.scale),
+          ffmpegPath: typeof flags.ffmpeg === "string" ? flags.ffmpeg : undefined
+        }
+      });
+      printBenchmarkSummary(result);
       return;
     }
     case "bundle-keynote": {
@@ -801,7 +1033,7 @@ async function main(): Promise<void> {
     }
     default:
       throw new Error(
-        "Usage: keymorph <demo|convert|inspect|bundle-keynote|bundle-video|bundle-baseline|pptx-to-ir|key-to-ir|keyhtml-to-ir|ir-to-html|ir-to-pptx|ir-to-key|ir-to-video|ir-report|png-fidelity> [input] [output]"
+        "Usage: keymorph <demo|convert|inspect|benchmark-key|bundle-keynote|bundle-video|bundle-baseline|pptx-to-ir|key-to-ir|keyhtml-to-ir|ir-to-html|ir-to-pptx|ir-to-key|ir-to-video|ir-report|png-fidelity> [input] [output]"
       );
   }
 }
@@ -1316,6 +1548,24 @@ function printBundleSummary(bundle: ProductBundleResult): void {
   console.log(`  manifest: ${bundle.paths.manifest}`);
   console.log(`  video plan: ${bundle.paths.videoPlan}`);
   console.log(`  video deps: ${bundle.videoDependencies.missing.length ? `missing ${bundle.videoDependencies.missing.join(", ")}` : "ready"}`);
+}
+
+function printBenchmarkSummary(result: ProductKeyBenchmarkResult): void {
+  console.log("Keynote benchmark generated:");
+  console.log(`  copied source: ${result.copiedSourcePath}`);
+  console.log(`  bundle: ${result.bundleDir}`);
+  console.log(`  HTML runtime: ${pathToFileURL(result.bundle.paths.runtimeHtml).toString()}`);
+  console.log(`  summary: ${result.summaryPath}`);
+  console.log(`  baseline: ${result.summary.baseline.status}`);
+  if (result.summary.baseline.reportPath) {
+    console.log(`  baseline report: ${result.summary.baseline.reportPath}`);
+  }
+  const worstFrame = result.summary.baseline.worstFrames[0];
+  if (worstFrame) {
+    console.log(
+      `  worst frame: #${worstFrame.frame} slide ${worstFrame.slideIndex + 1} score ${worstFrame.pixelFidelityScore} diff ${worstFrame.diffPath ?? "n/a"}`
+    );
+  }
 }
 
 function errorMessage(error: unknown): string {

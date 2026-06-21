@@ -13,6 +13,7 @@ import { encodePng, type RgbaImage } from "../../src/report/fidelity.ts";
 import {
   createProductApiResponse,
   createProductBundle,
+  benchmarkKeynoteDeck,
   exportProductBundleBaseline,
   exportProductBundleKeynote,
   inspectProductInput,
@@ -290,6 +291,74 @@ describe("product bundle workflow", () => {
     assert.equal(manifest.artifacts.baselineFrameDiffs, "baseline-diffs");
     assert.equal(status.status, "ready");
     assert.equal(report.summary.mismatchedFrames, 1);
+  });
+
+  test("benchmarks a Keynote copy and ranks the lowest-fidelity frames", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-benchmark-"));
+    const inputPath = path.join(dir, "source.key");
+    const benchmarkDir = path.join(dir, "benchmark");
+    await writeFile(inputPath, "stub keynote package", "utf8");
+
+    const result = await benchmarkKeynoteDeck(inputPath, {
+      outputDir: benchmarkDir,
+      jobId: "benchmark-job",
+      allowKeynoteAutomation: true,
+      runBaseline: true,
+      video: { fps: 1, scale: 1 },
+      keynoteBridgeExport: async (_keynotePath, pptxPath) => {
+        await exportIrToPptx(createDemoDeck(), pptxPath);
+      },
+      keynoteMovieExport: async (_keynotePath, moviePath) => {
+        await writeFile(moviePath, "stub movie", "utf8");
+      },
+      baseline: {
+        keynoteFrameExport: async (_keynotePath, framesDir, plan) => {
+          await mkdir(framesDir, { recursive: true });
+          for (const frame of plan.frames) {
+            await writeFile(path.join(framesDir, frame.outputPath), encodePng(image(1, 1, [255, 255, 255, 255])));
+          }
+        },
+        runtimeFrameExport: async (_deck, framesDir, plan) => {
+          await mkdir(framesDir, { recursive: true });
+          for (const frame of plan.frames) {
+            await writeFile(
+              path.join(framesDir, frame.outputPath),
+              encodePng(frame.frame === 2 ? image(1, 1, [0, 0, 0, 255]) : image(1, 1, [255, 255, 255, 255]))
+            );
+          }
+        }
+      }
+    });
+
+    const summary = JSON.parse(await readFile(result.summaryPath, "utf8"));
+
+    assert.equal(result.copiedSourcePath, path.join(benchmarkDir, "source-copy", "source.key"));
+    assert.notEqual(result.copiedSourcePath, inputPath);
+    assert.equal(summary.baseline.status, "ready");
+    assert.equal(summary.baseline.worstFrames[0].frame, 2);
+    assert.equal(summary.baseline.worstFrames[0].slideIndex, 0);
+    assert.match(summary.baseline.worstFrames[0].diffPath, /baseline-diffs/);
+    assert.equal(summary.baseline.worstSlides[0].slideIndex, 0);
+    assert.ok(summary.nextRecommendedActions.some((action: string) => /worstFrames/.test(action)));
+  });
+
+  test("CLI benchmark copies a Keynote source without running baseline by default", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-benchmark-cli-"));
+    const inputPath = path.join(dir, "source.key");
+    const benchmarkDir = path.join(dir, "benchmark");
+    await mkdir(path.join(inputPath, "Index"), { recursive: true });
+    await writeFile(path.join(inputPath, "Index", "Slide-1.iwa"), concat([protoString("Benchmark slide")]));
+
+    const result = await execFileAsync(process.execPath, ["--experimental-transform-types", "src/cli.ts", "benchmark-key", inputPath, benchmarkDir], {
+      cwd: path.resolve("."),
+      timeout: 30000
+    });
+    const summary = JSON.parse(await readFile(path.join(benchmarkDir, "benchmark-summary.json"), "utf8"));
+
+    assert.match(result.stdout, /Keynote benchmark generated:/);
+    assert.equal(summary.copiedSourcePath, path.join(benchmarkDir, "source-copy", "source.key"));
+    assert.notEqual(summary.copiedSourcePath, inputPath);
+    assert.equal(summary.baseline.status, "not-run");
   });
 
   test("reports Keynote baseline as unsupported for non-Keynote bundles", async () => {

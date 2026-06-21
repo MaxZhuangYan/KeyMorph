@@ -29,6 +29,7 @@ npm run dev
 npm run demo
 npm run convert -- deck.pptx demo/out/jobs/manual
 npm run inspect -- demo/out/source.ir.json
+npm run benchmark:key -- deck.key demo/out/benchmarks/deck --allow-keynote --fps 30 --scale 4
 npm run bundle:key -- demo/out/jobs/manual
 npm run bundle:video -- demo/out/jobs/manual
 npm run bundle:baseline -- demo/out/jobs/manual --allow-keynote
@@ -52,6 +53,8 @@ npm run png:fidelity -- reference.png actual.png fidelity-report.json
 - `manifest.json`
 
 `npm run inspect -- <input>` parses the input and prints validation, conversion-risk, and video dependency status without writing a bundle. `npm run bundle:key -- <output-dir>`, `npm run bundle:video -- <output-dir>`, and `npm run bundle:baseline -- <output-dir>` run the deferred Keynote, MP4, and Keynote golden-baseline exports for an existing bundle. Keynote automation is disabled by default; pass `--allow-keynote` or set `KEYMORPH_ALLOW_KEYNOTE_AUTOMATION=1` when you intentionally want AppleScript automation.
+
+`npm run benchmark:key -- <input.key> <output-dir> --allow-keynote --fps 30 --scale 4` copies the original `.key` into `<output-dir>/source-copy`, builds the product bundle from that copy, then writes `benchmark-summary.json`. With `--allow-keynote`, it also runs the Keynote golden baseline and lists the lowest-scoring frames and slides so fidelity work can start from concrete PNG diffs. Without `--allow-keynote`, it still creates the copied-source bundle and records that the baseline has not run.
 
 `npm run bundle:baseline -- <bundle-dir> --allow-keynote --fps 30 --scale 4` is for original `.key` bundles. It uses the copied `.key` inside the bundle, exports a high-resolution Keynote reference movie, extracts `frames/baseline`, captures the KeyMorph HTML runtime into `frames/keymorph-baseline`, and writes `baseline-fidelity.json` plus `baseline-diffs`.
 
