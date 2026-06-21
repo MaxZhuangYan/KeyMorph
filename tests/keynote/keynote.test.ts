@@ -493,6 +493,48 @@ describe("Keynote bridge", () => {
     assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-build-animations-recovered"), true);
   });
 
+  test("maps typed visual field 5 opacity evidence onto native images", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-typed-opacity-"));
+    const keyPath = path.join(dir, "typed-opacity.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      iwaArchiveRecord(777, [
+        {
+          type: 3005,
+          payload: concat([nativeImagePlacementPayload(42, { x: 100, y: 120, width: 320, height: 180 }), protoFixed32(5, 0.5)]),
+          dataReferences: [42],
+          objectReferences: [777]
+        }
+      ])
+    );
+
+    const detection = await detectNativeKeynotePackage(keyPath);
+    const typedMessage = detection.iwaStreams?.[0]?.typedArchiveMessages.find((message) => message.type === 3005);
+    assert.equal(
+      typedMessage?.fieldSummaries.some(
+        (summary) =>
+          summary.fieldPath === "5" &&
+          summary.sampleNumericValue === 0.5 &&
+          summary.sampleNumericEncoding === "fixed32-float"
+      ),
+      true
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects[0];
+    assert.equal(object?.type, "image");
+    assert.deepEqual(object?.bounds, { x: 100, y: 120, width: 320, height: 180 });
+    assert.equal(object?.type === "image" ? object.opacity : undefined, 0.5);
+    assert.equal(object?.metadata?.nativeTypedVisualOpacity, 0.5);
+    assert.equal(object?.metadata?.nativeTypedVisualOpacityFieldPath, "5");
+    assert.equal(object?.metadata?.nativeTypedVisualOpacitySchema, "typed-visual-opacity-field-5");
+  });
+
   test("assigns stable native morph keys for unique repeated text and assets", async () => {
     const textDir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-native-text-morph-keys-"));
     const textKeyPath = path.join(textDir, "morph-text.key");

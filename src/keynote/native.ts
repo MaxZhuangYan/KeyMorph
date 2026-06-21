@@ -188,6 +188,13 @@ export interface NativeTypedVisualLayoutEvidence {
   confidence: number;
 }
 
+export interface NativeTypedVisualOpacityEvidence {
+  value: number;
+  fieldPath: "5";
+  schema: "typed-visual-opacity-field-5";
+  confidence: number;
+}
+
 export interface NativeIwaBuildEvidence {
   kind: "build";
   buildId?: string;
@@ -2270,6 +2277,7 @@ function createAssetObject(
   const height = aspect && aspect > 0 ? Math.round(width / aspect) : Math.round(deckSize.height * 0.38);
   const column = objectIndex % 2;
   const row = Math.floor(objectIndex / 2);
+  const typedOpacity = match.archiveMessage ? nativeTypedVisualOpacityEvidence(match.archiveMessage) : undefined;
   const bounds = geometryCandidate
     ? match.geometryCandidate === geometryCandidate
       ? geometryCandidate.bounds
@@ -2307,6 +2315,7 @@ function createAssetObject(
     ...(match.archiveMessage
       ? nativeTypedVisualLayoutMetadata(nativeTypedVisualLayoutEvidence(match.archiveMessage))
       : {}),
+    ...(typedOpacity ? nativeTypedVisualOpacityMetadata(typedOpacity) : {}),
     ...(match.suppressedAssets && match.suppressedAssets.length > 0
       ? {
           nativeSuppressedAssetVariantCount: match.suppressedAssets.length,
@@ -2351,7 +2360,7 @@ function createAssetObject(
       type: "image",
       name: asset.name,
       bounds,
-      opacity: 1,
+      opacity: typedOpacity?.value ?? 1,
       source: {
         assetId: asset.assetId,
         metadata: {
@@ -2423,6 +2432,42 @@ function nativeTypedVisualLayoutMetadata(layout: NativeTypedVisualLayoutEvidence
     nativeTypedVisualFrameFieldPaths: layout.frameFieldPaths,
     nativeTypedVisualFrameConfidence: layout.confidence
   };
+}
+
+function nativeTypedVisualOpacityMetadata(opacity: NativeTypedVisualOpacityEvidence): JSONRecord {
+  return {
+    nativeTypedVisualOpacity: opacity.value,
+    nativeTypedVisualOpacityFieldPath: opacity.fieldPath,
+    nativeTypedVisualOpacitySchema: opacity.schema,
+    nativeTypedVisualOpacityConfidence: opacity.confidence
+  };
+}
+
+function nativeTypedVisualOpacityEvidence(message: NativeIwaArchiveMessageEvidence | undefined): NativeTypedVisualOpacityEvidence | undefined {
+  if (!message || (message.type !== 3005 && message.type !== 3006)) {
+    return undefined;
+  }
+  const summary = message.fieldSummaries.find(
+    (candidate) =>
+      candidate.fieldPath === "5" &&
+      candidate.sampleNumericEncoding === "fixed32-float" &&
+      candidate.sampleNumericValue !== undefined &&
+      candidate.sampleNumericValue >= 0 &&
+      candidate.sampleNumericValue <= 1
+  );
+  if (!summary) {
+    return undefined;
+  }
+  return {
+    value: roundOpacityNumber(summary.sampleNumericValue!),
+    fieldPath: "5",
+    schema: "typed-visual-opacity-field-5",
+    confidence: 0.82
+  };
+}
+
+function roundOpacityNumber(value: number): number {
+  return Number(value.toFixed(4));
 }
 
 function applyNativePlacementGroupMetadata(objects: IRObject[]): void {
