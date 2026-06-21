@@ -614,6 +614,10 @@ export function createProductApiResponse(bundle: ProductBundleResult, basePath: 
     recommendedFixes: bundle.lossReport.recommendedFixes,
     previewUrl: `${base}/runtime.html`,
     manifestUrl: `${base}/manifest.json`,
+    runtime: bundle.manifest.runtime,
+    runtimeMode: bundle.manifest.runtime.mode,
+    runtimeFidelity: bundle.manifest.runtime.fidelity,
+    runtimeMessage: bundle.manifest.runtime.message,
     videoPlan: summarizeVideoPlan(bundle.videoPlan),
     videoDependencies: bundle.videoDependencies,
     videoEndpoint: `/api/jobs/${bundle.jobId}/video`,
@@ -634,8 +638,10 @@ export function createProductApiResponse(bundle: ProductBundleResult, basePath: 
       baselineFidelity: bundle.manifest.artifacts.baselineFrameFidelity ? `${base}/${bundle.manifest.artifacts.baselineFrameFidelity}` : null,
       baselineDiffs: bundle.manifest.artifacts.baselineFrameDiffs ? `${base}/${bundle.manifest.artifacts.baselineFrameDiffs}/` : null
     },
+    baselineCanRun: bundle.sourceKind === "keynote",
     baselineAvailable: bundle.manifest.baseline.available,
     baselineMessage: bundle.manifest.baseline.message,
+    baselineSummary: bundle.manifest.baseline.summary ?? null,
     keynoteAvailable: null,
     keynoteMessage: bundle.manifest.keynote.message
   };

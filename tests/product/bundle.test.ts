@@ -65,6 +65,9 @@ describe("product bundle workflow", () => {
     const response = createProductApiResponse(bundle, "/demo/out/jobs/api-job") as {
       previewUrl: string;
       manifestUrl: string;
+      runtimeMode: string;
+      runtimeFidelity: string;
+      baselineCanRun: boolean;
       downloads: Record<string, string | null>;
       videoEndpoint: string;
       baselineEndpoint: string;
@@ -73,6 +76,9 @@ describe("product bundle workflow", () => {
 
     assert.equal(response.previewUrl, "/demo/out/jobs/api-job/runtime.html");
     assert.equal(response.manifestUrl, "/demo/out/jobs/api-job/manifest.json");
+    assert.equal(response.runtimeMode, "keymorph-ir");
+    assert.equal(response.runtimeFidelity, "ir-reconstructed");
+    assert.equal(response.baselineCanRun, false);
     assert.equal(response.downloads.source, "/demo/out/jobs/api-job/source.ir.json");
     assert.equal(response.downloads.videoPlan, "/demo/out/jobs/api-job/video-plan.json");
     assert.equal(response.downloads.videoStatus, "/demo/out/jobs/api-job/video-status.json");
@@ -327,6 +333,14 @@ describe("product bundle workflow", () => {
     assert.match(source, /把簡報拖到這裡/);
     assert.match(source, /运行 Keynote 基准对比/);
     assert.match(source, /執行 Keynote 基準對比/);
+    assert.match(source, /转换保真度/);
+    assert.match(source, /轉換保真度/);
+    assert.match(source, /Keynote 基准对比需要原始 \.key 源文件/);
+    assert.match(source, /Keynote 基準對比需要原始 \.key 來源檔/);
+    assert.match(source, /baselineCanRun/);
+    assert.match(source, /renderBaseline" type="button"' \+ \(baselineCanRun \? '' : ' disabled'\)/);
+    assert.match(source, /keynoteEndpoint \+ '\?allowKeynote=1'/);
+    assert.match(source, /downloadLink\(payload\.diffUrl, t\('openBaselineDiffs'\), true\)/);
   });
 });
 

@@ -61,7 +61,7 @@ const server = http.createServer(async (request, response) => {
 
     const keynoteMatch = /^\/api\/jobs\/([a-f0-9-]+)\/keynote$/.exec(url.pathname);
     if (request.method === "POST" && keynoteMatch) {
-      await handleKeynoteExport(keynoteMatch[1], response);
+      await handleKeynoteExport(keynoteMatch[1], url, response);
       return;
     }
 
@@ -98,9 +98,11 @@ async function handleConvert(request, response) {
   );
 }
 
-async function handleKeynoteExport(jobId, response) {
+async function handleKeynoteExport(jobId, url, response) {
   const jobDir = safeJobDir(jobId);
-  const result = await exportProductBundleKeynote(jobDir);
+  const result = await exportProductBundleKeynote(jobDir, {
+    allowKeynoteAutomation: url.searchParams.get("allowKeynote") === "1" || process.env.KEYMORPH_ALLOW_KEYNOTE_AUTOMATION === "1"
+  });
   send(
     response,
     result.status === "ready" ? 200 : 424,
@@ -308,7 +310,7 @@ function renderAppHtml() {
     input[type=file] { display: none; }
     button, .file-button, a.download { border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; color: #0f172a; padding: 9px 11px; font: inherit; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
     select.lang-select { border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; color: #0f172a; padding: 8px 10px; font: inherit; }
-    button:disabled { opacity: .58; cursor: wait; }
+    button:disabled { opacity: .58; cursor: not-allowed; }
     button.primary, .file-button { background: #0f766e; color: #fff; border-color: #0f766e; }
     .row { display: flex; gap: 10px; flex-wrap: wrap; }
     .language-row { align-items: center; justify-content: space-between; }
@@ -318,7 +320,10 @@ function renderAppHtml() {
     .metric { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 9px 0; border-bottom: 1px solid #e2e8f0; }
     .metric:last-child { border-bottom: 0; }
     .metric span:first-child { color: #64748b; }
-    .downloads { display: grid; gap: 8px; }
+    .downloads { display: grid; gap: 10px; }
+    .action-group { border: 1px solid #d8dee8; border-radius: 8px; background: #fff; padding: 10px; display: grid; gap: 8px; }
+    .action-title { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-weight: 650; font-size: 13px; }
+    .link-row { display: flex; gap: 8px; flex-wrap: wrap; }
     .fixes { margin: 0; padding-left: 18px; color: #475569; }
     .topbar { height: 56px; background: #ffffff; border-bottom: 1px solid #d8dee8; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; }
     iframe { width: 100%; height: 100%; border: 0; background: #202124; }
@@ -374,12 +379,14 @@ function renderAppHtml() {
         openPreview: 'Open preview',
         emptyPreview: 'Drop a deck to generate an interactive HTML runtime.',
         converting: 'Converting {name}...',
-        convertingDeck: 'Converting deck...',
+        convertingDeck: 'Converting locally. Preview and export actions will appear when ready.',
+        unsupportedFile: 'Unsupported file. Use .pptx, .key, or .ir.json.',
         conversionFailed: 'Conversion failed.',
         converted: 'Converted {name}.',
         slides: 'Slides',
         objects: 'Objects',
-        fidelityScore: 'Fidelity score',
+        conversionFidelity: 'Conversion fidelity',
+        runtimeMode: 'Runtime mode',
         lostAnimations: 'Lost animations',
         degradedAnimations: 'Degraded animations',
         uncertainMappings: 'Uncertain mappings',
@@ -387,24 +394,40 @@ function renderAppHtml() {
         frameCapture: 'Frame capture',
         mp4Encoder: 'MP4 encoder',
         recommendedFixes: 'Recommended fixes',
+        downloadsTitle: 'Downloads',
+        runtimeIr: 'KeyMorph IR reconstruction',
+        runtimeKeynoteHtml: 'Keynote native HTML',
+        runtimeKeynoteMovie: 'Keynote rendered movie',
         downloadHtml: 'Download HTML Runtime',
         downloadPptx: 'Download PPTX',
         exportKeynote: 'Export Keynote',
         downloadIr: 'Download IR',
         downloadReport: 'Download report',
         renderMp4: 'Render MP4',
+        downloadVideoStatus: 'Download video status',
+        openRenderedFrames: 'Open rendered frames',
+        openFrameDiffs: 'Open frame diffs',
         renderBaseline: 'Run Keynote baseline',
+        baselineHint: 'Compare Keynote reference frames against the HTML runtime. macOS may ask for Keynote automation permission.',
+        baselineRequiresKeynote: 'Keynote baseline requires an original .key source deck.',
         baselineRunning: 'Rendering Keynote reference frames and comparing the HTML runtime...',
         baselineFailed: 'Keynote baseline comparison failed.',
         baselineReady: 'Baseline fidelity ready.',
         baselineUnavailable: 'Keynote baseline is unavailable.',
         downloadBaselineReport: 'Download baseline report',
+        downloadBaselineMovie: 'Download reference movie',
+        openBaselineDiffs: 'Open baseline diffs',
+        openReferenceFrames: 'Open reference frames',
+        openRuntimeFrames: 'Open runtime frames',
+        baselineSource: 'Source: {source}.',
         baselineFidelityMean: 'Baseline mean score: {score}.',
         keynoteExporting: 'Exporting Keynote via local Keynote automation...',
         keynoteUnavailable: 'Keynote export is unavailable.',
         keynoteReady: 'Keynote ready.',
         downloadKeynote: 'Download Keynote',
         renderingVideo: 'Rendering {frames} frames at 4x resolution...',
+        videoReadyToRender: 'Ready to render {frames} frames at {fps} fps ({width}x{height}).',
+        videoMissingDependencies: 'MP4 render is unavailable. Missing: {items}.',
         videoFailed: 'Video export failed.',
         missing: 'Missing: {items}.',
         mp4Ready: 'MP4 ready.',
@@ -428,12 +451,14 @@ function renderAppHtml() {
         openPreview: '打开预览',
         emptyPreview: '拖入演示文稿后生成可交互 HTML 运行时。',
         converting: '正在转换 {name}...',
-        convertingDeck: '正在转换演示文稿...',
+        convertingDeck: '正在本地转换。预览和导出动作会在完成后出现。',
+        unsupportedFile: '不支持的文件。请使用 .pptx、.key 或 .ir.json。',
         conversionFailed: '转换失败。',
         converted: '已转换 {name}。',
         slides: '幻灯片',
         objects: '对象',
-        fidelityScore: '保真度评分',
+        conversionFidelity: '转换保真度',
+        runtimeMode: '运行时模式',
         lostAnimations: '丢失动画',
         degradedAnimations: '降级动画',
         uncertainMappings: '不确定映射',
@@ -441,24 +466,40 @@ function renderAppHtml() {
         frameCapture: '帧捕获',
         mp4Encoder: 'MP4 编码器',
         recommendedFixes: '建议修复',
+        downloadsTitle: '下载',
+        runtimeIr: 'KeyMorph IR 重建',
+        runtimeKeynoteHtml: 'Keynote 原生 HTML',
+        runtimeKeynoteMovie: 'Keynote 渲染影片',
         downloadHtml: '下载 HTML 运行时',
         downloadPptx: '下载 PPTX',
         exportKeynote: '导出 Keynote',
         downloadIr: '下载 IR',
         downloadReport: '下载报告',
         renderMp4: '渲染 MP4',
+        downloadVideoStatus: '下载视频状态',
+        openRenderedFrames: '打开渲染帧',
+        openFrameDiffs: '打开帧差异',
         renderBaseline: '运行 Keynote 基准对比',
+        baselineHint: '将 Keynote 官方参考帧与 HTML 运行时逐帧对比。macOS 可能会请求 Keynote 自动化权限。',
+        baselineRequiresKeynote: 'Keynote 基准对比需要原始 .key 源文件。',
         baselineRunning: '正在渲染 Keynote 官方基准帧，并与 HTML 运行时逐帧对比...',
         baselineFailed: 'Keynote 基准对比失败。',
         baselineReady: '基准保真度已生成。',
         baselineUnavailable: 'Keynote 基准对比不可用。',
         downloadBaselineReport: '下载基准报告',
+        downloadBaselineMovie: '下载参考影片',
+        openBaselineDiffs: '打开基准差异帧',
+        openReferenceFrames: '打开参考帧',
+        openRuntimeFrames: '打开运行时帧',
+        baselineSource: '来源：{source}。',
         baselineFidelityMean: '基准平均分：{score}。',
         keynoteExporting: '正在通过本地 Keynote 自动化导出...',
         keynoteUnavailable: 'Keynote 导出不可用。',
         keynoteReady: 'Keynote 已就绪。',
         downloadKeynote: '下载 Keynote',
         renderingVideo: '正在以 4x 分辨率渲染 {frames} 帧...',
+        videoReadyToRender: '可渲染 {frames} 帧，{fps} fps（{width}x{height}）。',
+        videoMissingDependencies: 'MP4 渲染不可用。缺少：{items}。',
         videoFailed: '视频导出失败。',
         missing: '缺少：{items}。',
         mp4Ready: 'MP4 已就绪。',
@@ -482,12 +523,14 @@ function renderAppHtml() {
         openPreview: '開啟預覽',
         emptyPreview: '拖入簡報後產生可互動 HTML 執行時。',
         converting: '正在轉換 {name}...',
-        convertingDeck: '正在轉換簡報...',
+        convertingDeck: '正在本機轉換。預覽和匯出動作會在完成後出現。',
+        unsupportedFile: '不支援的檔案。請使用 .pptx、.key 或 .ir.json。',
         conversionFailed: '轉換失敗。',
         converted: '已轉換 {name}。',
         slides: '投影片',
         objects: '物件',
-        fidelityScore: '保真度評分',
+        conversionFidelity: '轉換保真度',
+        runtimeMode: '執行時模式',
         lostAnimations: '遺失動畫',
         degradedAnimations: '降級動畫',
         uncertainMappings: '不確定映射',
@@ -495,24 +538,40 @@ function renderAppHtml() {
         frameCapture: '影格擷取',
         mp4Encoder: 'MP4 編碼器',
         recommendedFixes: '建議修復',
+        downloadsTitle: '下載',
+        runtimeIr: 'KeyMorph IR 重建',
+        runtimeKeynoteHtml: 'Keynote 原生 HTML',
+        runtimeKeynoteMovie: 'Keynote 渲染影片',
         downloadHtml: '下載 HTML 執行時',
         downloadPptx: '下載 PPTX',
         exportKeynote: '匯出 Keynote',
         downloadIr: '下載 IR',
         downloadReport: '下載報告',
         renderMp4: '渲染 MP4',
+        downloadVideoStatus: '下載影片狀態',
+        openRenderedFrames: '開啟渲染影格',
+        openFrameDiffs: '開啟影格差異',
         renderBaseline: '執行 Keynote 基準對比',
+        baselineHint: '將 Keynote 官方參考影格與 HTML 執行時逐幀對比。macOS 可能會要求 Keynote 自動化權限。',
+        baselineRequiresKeynote: 'Keynote 基準對比需要原始 .key 來源檔。',
         baselineRunning: '正在渲染 Keynote 官方基準影格，並與 HTML 執行時逐幀對比...',
         baselineFailed: 'Keynote 基準對比失敗。',
         baselineReady: '基準保真度已產生。',
         baselineUnavailable: 'Keynote 基準對比不可用。',
         downloadBaselineReport: '下載基準報告',
+        downloadBaselineMovie: '下載參考影片',
+        openBaselineDiffs: '開啟基準差異影格',
+        openReferenceFrames: '開啟參考影格',
+        openRuntimeFrames: '開啟執行時影格',
+        baselineSource: '來源：{source}。',
         baselineFidelityMean: '基準平均分：{score}。',
         keynoteExporting: '正在透過本機 Keynote 自動化匯出...',
         keynoteUnavailable: 'Keynote 匯出不可用。',
         keynoteReady: 'Keynote 已就緒。',
         downloadKeynote: '下載 Keynote',
         renderingVideo: '正在以 4x 解析度渲染 {frames} 影格...',
+        videoReadyToRender: '可渲染 {frames} 影格，{fps} fps（{width}x{height}）。',
+        videoMissingDependencies: 'MP4 渲染不可用。缺少：{items}。',
         videoFailed: '影片匯出失敗。',
         missing: '缺少：{items}。',
         mp4Ready: 'MP4 已就緒。',
@@ -574,6 +633,17 @@ function renderAppHtml() {
     });
 
     async function convertFile(file) {
+      if (!isSupportedFile(file.name)) {
+        lastResult = null;
+        statusEl.className = 'status error';
+        statusEl.textContent = t('unsupportedFile');
+        metricsEl.hidden = true;
+        recommendationsEl.hidden = true;
+        downloadsEl.hidden = true;
+        previewPane.className = 'empty';
+        previewPane.textContent = t('emptyPreview');
+        return;
+      }
       lastResult = null;
       statusEl.textContent = t('converting', { name: file.name });
       statusEl.className = 'status';
@@ -607,7 +677,8 @@ function renderAppHtml() {
       metricsEl.innerHTML = [
         [t('slides'), result.slideCount],
         [t('objects'), result.objectCount],
-        [t('fidelityScore'), result.fidelityScore],
+        [t('conversionFidelity'), result.fidelityScore],
+        [t('runtimeMode'), runtimeLabel(result.runtimeMode || result.runtime?.mode)],
         [t('lostAnimations'), result.animationLostCount],
         [t('degradedAnimations'), result.degradedAnimationCount],
         [t('uncertainMappings'), result.uncertainMappingCount],
@@ -621,16 +692,46 @@ function renderAppHtml() {
       } else {
         recommendationsEl.hidden = true;
       }
+      const baselineCanRun = result.baselineCanRun ?? result.sourceKind === 'keynote';
+      const baselineMessage = result.baselineMessage || (baselineCanRun ? t('baselineHint') : t('baselineRequiresKeynote'));
+      const baselineStatusClass = baselineCanRun ? 'status' : 'status warn';
+      const baselineStatusLinks = result.downloads.baselineFidelity
+        ? '<div class="link-row">' +
+          downloadLink(result.downloads.baselineFidelity, t('downloadBaselineReport')) +
+          downloadLink(result.downloads.baselineDiffs, t('openBaselineDiffs'), true) +
+          '</div>'
+        : '';
+      const videoMessage = result.videoDependencies?.canExportVideo
+        ? t('videoReadyToRender', {
+            frames: result.videoPlan.totalFrames,
+            fps: result.videoPlan.fps,
+            width: result.videoPlan.outputWidth,
+            height: result.videoPlan.outputHeight
+          })
+        : t('videoMissingDependencies', { items: result.videoDependencies?.missing?.join(', ') || t('unknown') });
       downloadsEl.hidden = false;
       downloadsEl.innerHTML =
-        '<a class="download" href="' + result.downloads.html + '" target="_blank">' + t('downloadHtml') + '</a>' +
-        '<a class="download" href="' + result.downloads.pptx + '">' + t('downloadPptx') + '</a>' +
-        '<button id="exportKeynote" type="button">' + t('exportKeynote') + '</button>' +
-        '<a class="download" href="' + result.downloads.ir + '">' + t('downloadIr') + '</a>' +
-        '<a class="download" href="' + result.downloads.report + '">' + t('downloadReport') + '</a>' +
-        '<button id="renderVideo" class="primary" type="button">' + t('renderMp4') + '</button>' +
-        '<button id="renderBaseline" type="button">' + t('renderBaseline') + '</button>' +
-        '<div id="keynoteStatus" class="status warn">' + escapeHtml(result.keynoteMessage || '') + '</div><div id="videoStatus" class="status" hidden></div><div id="baselineStatus" class="status" hidden></div>';
+        '<div class="action-group">' +
+          '<div class="action-title"><span>' + t('downloadsTitle') + '</span></div>' +
+          '<div class="link-row">' +
+            downloadLink(result.downloads.html, t('downloadHtml'), true) +
+            downloadLink(result.downloads.pptx, t('downloadPptx')) +
+            downloadLink(result.downloads.ir, t('downloadIr')) +
+            downloadLink(result.downloads.report, t('downloadReport')) +
+          '</div>' +
+        '</div>' +
+        '<div class="action-group">' +
+          '<div class="action-title"><span>' + t('renderMp4') + '</span><button id="renderVideo" class="primary" type="button">' + t('renderMp4') + '</button></div>' +
+          '<div id="videoStatus" class="' + (result.videoDependencies?.canExportVideo ? 'status' : 'status warn') + '">' + escapeHtml(videoMessage) + '</div>' +
+        '</div>' +
+        '<div class="action-group">' +
+          '<div class="action-title"><span>' + t('exportKeynote') + '</span><button id="exportKeynote" type="button">' + t('exportKeynote') + '</button></div>' +
+          '<div id="keynoteStatus" class="status warn">' + escapeHtml(result.keynoteMessage || '') + '</div>' +
+        '</div>' +
+        '<div class="action-group">' +
+          '<div class="action-title"><span>' + t('renderBaseline') + '</span><button id="renderBaseline" type="button"' + (baselineCanRun ? '' : ' disabled') + '>' + t('renderBaseline') + '</button></div>' +
+          '<div id="baselineStatus" class="' + baselineStatusClass + '">' + escapeHtml(baselineMessage) + baselineStatusLinks + '</div>' +
+        '</div>';
       document.getElementById('exportKeynote')?.addEventListener('click', () => exportKeynote(result));
       document.getElementById('renderVideo')?.addEventListener('click', () => renderVideo(result));
       document.getElementById('renderBaseline')?.addEventListener('click', () => renderBaseline(result));
@@ -647,11 +748,11 @@ function renderAppHtml() {
       keynoteStatus.className = 'status';
       keynoteStatus.textContent = t('keynoteExporting');
       try {
-        const response = await fetch(result.keynoteEndpoint, { method: 'POST' });
+        const response = await fetch(result.keynoteEndpoint + '?allowKeynote=1', { method: 'POST' });
         const payload = await response.json();
         if (!response.ok) {
           keynoteStatus.className = 'status warn';
-          keynoteStatus.textContent = payload.message || t('keynoteUnavailable');
+          keynoteStatus.textContent = (payload.message || t('keynoteUnavailable')) + guidanceText(payload.guidance);
           return;
         }
         keynoteStatus.className = 'status';
@@ -668,7 +769,6 @@ function renderAppHtml() {
       const button = document.getElementById('renderVideo');
       const videoStatus = document.getElementById('videoStatus');
       button.disabled = true;
-      videoStatus.hidden = false;
       videoStatus.className = 'status';
       videoStatus.textContent = t('renderingVideo', { frames: result.videoPlan.totalFrames });
       try {
@@ -676,14 +776,22 @@ function renderAppHtml() {
         const payload = await response.json();
         if (!response.ok) {
           videoStatus.className = response.status === 424 ? 'status warn' : 'status error';
-          videoStatus.textContent = payload.message || t('videoFailed');
+          videoStatus.textContent = (payload.message || t('videoFailed')) + guidanceText(payload.guidance);
           if (payload.missing?.length) {
             videoStatus.textContent += ' ' + t('missing', { items: payload.missing.join(', ') });
           }
           return;
         }
         videoStatus.className = 'status';
-        videoStatus.innerHTML = t('mp4Ready') + ' <a class="download" href="' + payload.videoUrl + '">' + t('downloadVideo') + '</a>' + fidelityLinks(payload.frameFidelity);
+        videoStatus.innerHTML =
+          t('mp4Ready') +
+          '<div class="link-row">' +
+            downloadLink(payload.videoUrl, t('downloadVideo')) +
+            downloadLink(result.downloads.videoStatus, t('downloadVideoStatus')) +
+            downloadLink(payload.framesUrl, t('openRenderedFrames'), true) +
+            downloadLink(payload.frameFidelity?.diffUrl, t('openFrameDiffs'), true) +
+          '</div>' +
+          fidelityLinks(payload.frameFidelity);
       } catch (error) {
         videoStatus.className = 'status error';
         videoStatus.textContent = error instanceof Error ? error.message : String(error);
@@ -695,8 +803,12 @@ function renderAppHtml() {
     async function renderBaseline(result) {
       const button = document.getElementById('renderBaseline');
       const baselineStatus = document.getElementById('baselineStatus');
+      if (!(result.baselineCanRun ?? result.sourceKind === 'keynote')) {
+        baselineStatus.className = 'status warn';
+        baselineStatus.textContent = result.baselineMessage || t('baselineRequiresKeynote');
+        return;
+      }
       button.disabled = true;
-      baselineStatus.hidden = false;
       baselineStatus.className = 'status';
       baselineStatus.textContent = t('baselineRunning');
       try {
@@ -704,7 +816,7 @@ function renderAppHtml() {
         const payload = await response.json();
         if (!response.ok) {
           baselineStatus.className = response.status === 424 || response.status === 400 ? 'status warn' : 'status error';
-          baselineStatus.textContent = payload.message || t('baselineFailed');
+          baselineStatus.textContent = (payload.message || t('baselineFailed')) + guidanceText(payload.guidance);
           if (payload.missing?.length) {
             baselineStatus.textContent += ' ' + t('missing', { items: payload.missing.join(', ') });
           }
@@ -713,8 +825,15 @@ function renderAppHtml() {
         baselineStatus.className = 'status';
         baselineStatus.innerHTML =
           t('baselineReady') + ' ' +
+          (payload.source ? t('baselineSource', { source: payload.source }) + ' ' : '') +
           t('baselineFidelityMean', { score: payload.summary?.meanPixelFidelityScore ?? 'n/a' }) +
-          ' <a class="download" href="' + payload.reportUrl + '">' + t('downloadBaselineReport') + '</a>';
+          '<div class="link-row">' +
+            downloadLink(payload.reportUrl, t('downloadBaselineReport')) +
+            downloadLink(payload.diffUrl, t('openBaselineDiffs'), true) +
+            downloadLink(payload.baselineMovieUrl, t('downloadBaselineMovie')) +
+            downloadLink(payload.baselineFramesUrl, t('openReferenceFrames'), true) +
+            downloadLink(payload.actualFramesUrl, t('openRuntimeFrames'), true) +
+          '</div>';
       } catch (error) {
         baselineStatus.className = 'status error';
         baselineStatus.textContent = error instanceof Error ? error.message : String(error);
@@ -725,6 +844,9 @@ function renderAppHtml() {
 
     function escapeHtml(value) {
       return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+    }
+    function isSupportedFile(fileName) {
+      return /\.(pptx|key|ir\.json|json)$/i.test(fileName);
     }
     function resolveInitialLanguage() {
       const stored = localStorage.getItem('keymorph-language');
@@ -752,10 +874,23 @@ function renderAppHtml() {
       const ready = keys.every((key) => status.available[key]);
       return ready ? t('ready') : t('missingValue');
     }
+    function runtimeLabel(mode) {
+      if (mode === 'keynote-html') return t('runtimeKeynoteHtml');
+      if (mode === 'keynote-movie') return t('runtimeKeynoteMovie');
+      return t('runtimeIr');
+    }
+    function downloadLink(href, label, newTab = false) {
+      if (!href) return '';
+      const target = newTab ? ' target="_blank"' : '';
+      return '<a class="download" href="' + href + '"' + target + '>' + label + '</a>';
+    }
+    function guidanceText(guidance) {
+      return Array.isArray(guidance) && guidance.length ? ' ' + guidance.join(' ') : '';
+    }
     function fidelityLinks(frameFidelity) {
       if (!frameFidelity) return '<div class="sub">' + t('frameReportPending') + '</div>';
       const score = frameFidelity.summary?.meanPixelFidelityScore ?? 'n/a';
-      return '<div class="sub">' + t('frameFidelityMean', { score }) + ' <a class="download" href="' + frameFidelity.reportUrl + '">' + t('downloadFrameReport') + '</a></div>';
+      return '<div class="sub">' + t('frameFidelityMean', { score }) + ' ' + downloadLink(frameFidelity.reportUrl, t('downloadFrameReport')) + '</div>';
     }
   </script>
 </body>
