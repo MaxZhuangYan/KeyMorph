@@ -513,6 +513,65 @@ describe("PPTX export", () => {
       )
     );
   });
+
+  test("parses media picture command animations as executable media events", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-media-command-"));
+    const out = path.join(dir, "media-command.pptx");
+
+    await exportIrToPptx(createImageDeck(), out);
+    await patchPptxXml(out, "ppt/slides/slide1.xml", (source) =>
+      source
+        .replace('<p:nvPr/></p:nvPicPr>', '<p:nvPr><a:videoFile r:link="rIdVideo"/><p:extLst><p:ext uri="{DAA4B4D4-6D71-4841-9C94-3DE7FCFBF4A5}"><p14:media xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main" r:embed="rIdMedia"/></p:ext></p:extLst></p:nvPr></p:nvPicPr>')
+        .replace(
+          "</p:sld>",
+          `<p:timing><p:tnLst><p:par>
+  <p:cTn id="1" fill="hold">
+    <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+    <p:childTnLst><p:seq><p:cTn id="2"><p:childTnLst>
+      <p:cmd type="call" cmd="playFrom(0.25)">
+        <p:cBhvr>
+          <p:cTn id="100" dur="1200" fill="hold"/>
+          <p:tgtEl><p:spTgt spid="2"/></p:tgtEl>
+        </p:cBhvr>
+      </p:cmd>
+      <p:cmd type="call" cmd="togglePause">
+        <p:cBhvr>
+          <p:cTn id="101" dur="1" fill="hold"/>
+          <p:tgtEl><p:spTgt spid="2"/></p:tgtEl>
+        </p:cBhvr>
+      </p:cmd>
+    </p:childTnLst></p:cTn></p:seq></p:childTnLst>
+  </p:cTn>
+</p:par></p:tnLst></p:timing></p:sld>`
+        )
+    );
+    await patchPptxEntries(out, (entries) => {
+      const relsPath = "ppt/slides/_rels/slide1.xml.rels";
+      const rels = new TextDecoder().decode(entries.get(relsPath));
+      entries.set(
+        relsPath,
+        new TextEncoder().encode(
+          rels.replace(
+            "</Relationships>",
+            '<Relationship Id="rIdVideo" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/video" Target="../media/media1.mp4"/><Relationship Id="rIdMedia" Type="http://schemas.microsoft.com/office/2007/relationships/media" Target="../media/media1.mp4"/></Relationships>'
+          )
+        )
+      );
+      entries.set("ppt/media/media1.mp4", new Uint8Array([0, 0, 0, 24, 102, 116, 121, 112, 109, 112, 52, 50]));
+    });
+
+    const parsed = await parsePptxToIr(out);
+    const mediaObject = parsed.deck.slides[0].objects.find((object) => object.type === "media");
+    const events = parsed.deck.slides[0].timeline?.events ?? [];
+    const unsupported = parsed.conversion?.unsupportedFeatures ?? [];
+
+    assert.equal(mediaObject?.type, "media");
+    assert.equal(mediaObject?.type === "media" ? mediaObject.mediaType : undefined, "video");
+    assert.equal(mediaObject?.metadata?.pptxShapeId, "2");
+    assert.ok(events.some((event) => event.kind === "media" && event.action === "play" && event.targetId === mediaObject?.id && event.seekMs === 250));
+    assert.ok(events.some((event) => event.kind === "media" && event.action === "pause" && event.targetId === mediaObject?.id));
+    assert.equal(unsupported.some((feature) => feature.code === "presentationml-cmd"), false);
+  });
 });
 
 function createAnimatedDeck(): DeckIR {
@@ -880,6 +939,12 @@ async function patchPptxXml(filePath: string, entryPath: string, patch: (source:
   const entry = entries.get(entryPath);
   if (!entry) throw new Error(`Missing PPTX entry ${entryPath}`);
   entries.set(entryPath, new TextEncoder().encode(patch(new TextDecoder().decode(entry))));
+  await writeFile(filePath, createZip(entries));
+}
+
+async function patchPptxEntries(filePath: string, patch: (entries: Map<string, Uint8Array>) => void): Promise<void> {
+  const entries = readZipEntries(await readFile(filePath));
+  patch(entries);
   await writeFile(filePath, createZip(entries));
 }
 

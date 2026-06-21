@@ -1,5 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 
 import { createDemoDeck } from "../../src/demo/createDemoDeck.ts";
 import {
@@ -35,7 +36,10 @@ describe("HTML runtime rendering", () => {
     assert.match(html, /createTimingPlan/);
     assert.match(html, /setPlaybackRate/);
     assert.match(html, /stepToNextTimelineEvent/);
+    assert.match(html, /normalizeMovieSegments/);
+    assert.match(html, /playMovieSegment/);
     assert.match(html, /stepButton\?\.addEventListener\("click", \(\) => stepToNextTimelineEvent\(\)\)/);
+    assert.match(html, /nextButton\?\.addEventListener\("click", \(\) => nextSlideOrMovieSegment\(\)\)/);
     assert.match(html, /id="stage-shell"/);
     assert.match(html, /stageShell\.style\.width/);
     assert.match(html, /body \{ margin: 0; height: 100vh; overflow: hidden/);
@@ -108,6 +112,46 @@ describe("HTML runtime rendering", () => {
     assert.match(markup, /color:#123456/);
     assert.match(markup, /white-space:pre-wrap/);
     assert.match(markup, /First\nSecond/);
+  });
+
+  test("steps through keynote movie segments before advancing slides", () => {
+    const { runtime, media, nextButton } = executeRenderedRuntime(createMovieSegmentDeck());
+
+    assert.equal(runtime.state.slideIndex, 0);
+    assert.equal(runtime.state.slideTimeMs, 0);
+
+    runtime.stepToNextTimelineEvent();
+
+    assert.equal(media.playCalls, 1);
+    assert.equal(media.currentTime, 0);
+    assert.deepEqual(
+      pickSegment(runtime.state.activeMovieSegment),
+      { clickIndex: 0, startMs: 0, endMs: 1000, objectId: "movie" }
+    );
+
+    media.currentTime = 1;
+    runNextAnimationFrame();
+
+    assert.equal(media.paused, true);
+    assert.equal(runtime.state.slideTimeMs, 1000);
+    assert.equal(runtime.state.activeMovieSegment, undefined);
+
+    nextButton.listeners.click();
+
+    assert.equal(media.playCalls, 2);
+    assert.equal(media.currentTime, 1);
+    assert.deepEqual(
+      pickSegment(runtime.state.activeMovieSegment),
+      { clickIndex: 1, startMs: 1000, endMs: 2100, objectId: "movie" }
+    );
+  });
+
+  test("applies media play and pause events to runtime object state", () => {
+    const deck = createMediaCommandDeck();
+    const slide = deck.deck.slides[0]!;
+
+    assert.deepEqual(resolveSlideObjectStates(deck, slide, 0).get("clip")?.media, { playing: true, startMs: 250 });
+    assert.deepEqual(resolveSlideObjectStates(deck, slide, 1000).get("clip")?.media, { playing: false, startMs: 250 });
   });
 
   test("renders image crop as inner image content geometry", () => {
@@ -1021,11 +1065,235 @@ function createShapeImageFillDeck(fit: "cover" | "contain" | "stretch" | "tile",
   };
 }
 
+function createMovieSegmentDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "movie-segments",
+      size: { width: 400, height: 300, unit: "px" },
+      slides: [
+        {
+          id: "movie-slide",
+          metadata: {
+            keynoteMovieSegments: [
+              { objectId: "movie", startMs: 1000, endMs: 2100, clickIndex: 1 },
+              { objectId: "movie", startMs: 0, endMs: 1000, clickIndex: 0 }
+            ]
+          },
+          objects: [
+            {
+              id: "movie",
+              type: "media",
+              mediaType: "video",
+              source: { dataUri: "data:video/mp4;base64,AA==" },
+              bounds: { x: 0, y: 0, width: 400, height: 300 }
+            }
+          ],
+          timeline: { durationMs: 2500, events: [] }
+        },
+        {
+          id: "after",
+          objects: [],
+          timeline: { durationMs: 1000, events: [] }
+        }
+      ]
+    }
+  };
+}
+
+function pickSegment(segment: unknown) {
+  const value = segment as { clickIndex?: number; startMs?: number; endMs?: number; objectId?: string };
+  return {
+    clickIndex: value?.clickIndex,
+    startMs: value?.startMs,
+    endMs: value?.endMs,
+    objectId: value?.objectId
+  };
+}
+
+function createMediaCommandDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "media-command",
+      size: { width: 400, height: 300, unit: "px" },
+      slides: [
+        {
+          id: "media-slide",
+          objects: [
+            {
+              id: "clip",
+              type: "media",
+              mediaType: "video",
+              source: { dataUri: "data:video/mp4;base64,AA==" },
+              bounds: { x: 0, y: 0, width: 400, height: 300 }
+            }
+          ],
+          timeline: {
+            durationMs: 1500,
+            events: [
+              {
+                id: "clip-play",
+                kind: "media",
+                targetId: "clip",
+                action: "play",
+                seekMs: 250,
+                start: { type: "absolute", atMs: 0 },
+                durationMs: 0,
+                fill: "forwards"
+              },
+              {
+                id: "clip-pause",
+                kind: "media",
+                targetId: "clip",
+                action: "pause",
+                start: { type: "absolute", atMs: 1000 },
+                durationMs: 0,
+                fill: "forwards"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  };
+}
+
 function pickResolution(resolution: ReturnType<typeof resolveDeckTime>) {
   return {
     slideIndex: resolution.slideIndex,
     slideTimeMs: resolution.slideTimeMs,
     inTransition: resolution.inTransition,
     transitionProgress: resolution.transitionProgress
+  };
+}
+
+let queuedAnimationFrame: FrameRequestCallback | undefined;
+
+function runNextAnimationFrame() {
+  const callback = queuedAnimationFrame;
+  queuedAnimationFrame = undefined;
+  callback?.(0);
+}
+
+function executeRenderedRuntime(deck: DeckIR) {
+  const html = renderHtmlDocument(deck);
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1] ?? "");
+  const runtimeSource = scripts.at(-1);
+  if (!runtimeSource) throw new Error("Runtime script was not rendered.");
+
+  const stage = createFakeElement("stage");
+  const stageShell = createFakeElement("stage-shell");
+  const viewport = createFakeElement("viewport");
+  viewport.clientWidth = 800;
+  viewport.clientHeight = 600;
+  const playButton = createFakeElement("play");
+  const prevButton = createFakeElement("prev");
+  const nextButton = createFakeElement("next");
+  const stepButton = createFakeElement("step");
+  const scrub = createFakeElement("scrub");
+  const status = createFakeElement("status");
+  const elements = new Map([
+    ["stage", stage],
+    ["stage-shell", stageShell],
+    ["viewport", viewport],
+    ["play", playButton],
+    ["prev", prevButton],
+    ["next", nextButton],
+    ["step", stepButton],
+    ["scrub", scrub],
+    ["status", status]
+  ]);
+  const document = {
+    getElementById: (id: string) => elements.get(id),
+    fonts: undefined
+  };
+  const window = {
+    __KEYMORPH_DECK__: deck,
+    __KEYMORPH_INITIAL_SLIDE__: 0,
+    __KEYMORPH_RUNTIME_OPTIONS__: {},
+    addEventListener: () => {},
+    dispatchEvent: () => true
+  };
+  const context = vm.createContext({
+    window,
+    document,
+    performance: { now: () => 0 },
+    requestAnimationFrame: (callback: FrameRequestCallback) => {
+      queuedAnimationFrame = callback;
+      return 1;
+    },
+    cancelAnimationFrame: () => {
+      queuedAnimationFrame = undefined;
+    },
+    getComputedStyle: () => ({ paddingLeft: "0", paddingRight: "0", paddingTop: "0", paddingBottom: "0" }),
+    CSS: { escape: (value: string) => value },
+    CustomEvent: class {
+      detail: unknown;
+      constructor(_type: string, init: { detail?: unknown } = {}) {
+        this.detail = init.detail;
+      }
+    }
+  });
+
+  vm.runInContext(runtimeSource, context);
+
+  return {
+    runtime: (window as typeof window & { __keyMorphRuntime: { state: { slideIndex: number; slideTimeMs: number; activeMovieSegment?: unknown }; stepToNextTimelineEvent: () => unknown } }).__keyMorphRuntime,
+    media: stage.mediaElement!,
+    nextButton
+  };
+}
+
+function createFakeElement(id: string) {
+  const element = {
+    id,
+    style: {} as Record<string, string>,
+    dataset: {} as Record<string, string>,
+    listeners: {} as Record<string, () => void>,
+    mediaElement: undefined as ReturnType<typeof createFakeMediaElement> | undefined,
+    clientWidth: 0,
+    clientHeight: 0,
+    textContent: "",
+    value: "",
+    max: "",
+    innerHTML: "",
+    addEventListener(type: string, listener: () => void) {
+      this.listeners[type] = listener;
+    },
+    querySelector(selector: string) {
+      if (selector === '[data-layer="current"]' || selector === '[data-layer="previous"]') return this;
+      if (selector === '[data-object-id="movie"]') {
+        this.mediaElement ??= createFakeMediaElement();
+        return this.mediaElement;
+      }
+      return undefined;
+    },
+    querySelectorAll(selector: string) {
+      if (selector === "video,audio" && this.mediaElement) return [this.mediaElement];
+      return [];
+    }
+  };
+  return element;
+}
+
+function createFakeMediaElement() {
+  return {
+    style: {} as Record<string, string>,
+    dataset: {} as Record<string, string>,
+    currentTime: 0,
+    muted: false,
+    paused: true,
+    playCalls: 0,
+    pauseCalls: 0,
+    play() {
+      this.playCalls += 1;
+      this.paused = false;
+      return { catch: () => undefined };
+    },
+    pause() {
+      this.pauseCalls += 1;
+      this.paused = true;
+    }
   };
 }

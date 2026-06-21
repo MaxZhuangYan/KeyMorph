@@ -357,6 +357,11 @@ export function resolveSlideObjectStates(
       if (progress === undefined) continue;
       const current = mergeObjectStateProperties(states.get(event.targetId) ?? {}, {});
       current.media = { ...(current.media || {}) };
+      if (event.action === "play") {
+        current.media.playing = true;
+        if (event.seekMs !== undefined) current.media.startMs = event.seekMs;
+      }
+      if (event.action === "pause" || event.action === "stop") current.media.playing = false;
       if (event.action === "seek") current.media.startMs = event.seekMs || 0;
       if (event.action === "mute") current.media.muted = true;
       if (event.action === "unmute") current.media.muted = false;
@@ -553,7 +558,9 @@ function runtimeScript(): string {
     playing: false,
     playbackRate: 1,
     raf: 0,
+    segmentRaf: 0,
     startedAt: 0,
+    activeMovieSegment: undefined,
     renderedKey: ""
   };
   const runtimeEvents = [];
@@ -1352,6 +1359,24 @@ function runtimeScript(): string {
     return { starts, order, warnings };
   };
   const computeEventStarts = (slide) => createTimingPlan(slide).starts;
+  const normalizeMovieSegments = (slide) => {
+    const candidates = slide?.metadata?.keynoteMovieSegments || slide?.mediaSegments || slide?.metadata?.mediaSegments || [];
+    if (!Array.isArray(candidates)) return [];
+    return candidates
+      .map((segment, index) => {
+        const startMs = Number(segment?.startMs ?? segment?.start ?? 0);
+        const endMs = Number(segment?.endMs ?? segment?.end ?? segment?.durationMs);
+        if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return undefined;
+        return {
+          ...segment,
+          startMs: Math.max(0, startMs),
+          endMs: Math.max(0, endMs),
+          clickIndex: Number.isFinite(Number(segment?.clickIndex)) ? Number(segment.clickIndex) : index
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.clickIndex - b.clickIndex || a.startMs - b.startMs || a.endMs - b.endMs);
+  };
   const eventProgress = (event, start, timeMs) => {
     const duration = eventDuration(event);
     const end = start + duration;
@@ -1502,6 +1527,11 @@ function runtimeScript(): string {
         if (progress !== undefined) {
           const current = merge(states.get(event.targetId), {});
           current.media = { ...(current.media || {}) };
+          if (event.action === "play") {
+            current.media.playing = true;
+            if (event.seekMs !== undefined) current.media.startMs = event.seekMs;
+          }
+          if (event.action === "pause" || event.action === "stop") current.media.playing = false;
           if (event.action === "seek") current.media.startMs = event.seekMs || 0;
           if (event.action === "mute") current.media.muted = true;
           if (event.action === "unmute") current.media.muted = false;
@@ -1607,6 +1637,31 @@ function runtimeScript(): string {
       el.style.border = Number(stroke.width || 0) + "px solid " + strokeColorCss(stroke);
     }
     if (object.type === "image") applyImageCrop(el, object, statePatch);
+    if (object.type === "media") applyMediaPlaybackState(el, statePatch.media || object.playback);
+  };
+  const applyMediaPlaybackState = (el, playback) => {
+    if (!el || !playback) return;
+    const media = el;
+    if (typeof playback.muted === "boolean") media.muted = playback.muted;
+    if (typeof playback.loop === "boolean") media.loop = playback.loop;
+    if (typeof playback.startMs === "number" && Number.isFinite(playback.startMs)) {
+      const nextTime = Math.max(0, playback.startMs / 1000);
+      if (Number.isFinite(media.duration) && Math.abs((media.currentTime || 0) - nextTime) > 0.08) {
+        try {
+          media.currentTime = Math.min(nextTime, Math.max(0, media.duration));
+        } catch {}
+      } else if (!Number.isFinite(media.duration) && Math.abs((media.currentTime || 0) - nextTime) > 0.08) {
+        try {
+          media.currentTime = nextTime;
+        } catch {}
+      }
+    }
+    if (playback.playing === true && media.paused) {
+      const promise = media.play?.();
+      if (promise && typeof promise.catch === "function") promise.catch(() => {});
+    } else if (playback.playing === false && !media.paused) {
+      media.pause?.();
+    }
   };
   const applySlideFrame = (layer, slide, timeMs) => {
     const states = computeSlideObjectStates(slide, timeMs);
@@ -1815,6 +1870,67 @@ function runtimeScript(): string {
     }
     resize();
   };
+  const mediaElementsForSegment = (slide, segment) => {
+    const objectIds = [segment?.objectId, segment?.targetId, segment?.mediaId].filter(Boolean);
+    const objects = flattenObjects(slide?.objects || []).filter((object) => object.type === "media" && (!objectIds.length || objectIds.includes(object.id)));
+    return objects
+      .map((object) => stage.querySelector('[data-object-id="' + CSS.escape(object.id) + '"]'))
+      .filter((el) => el && typeof el.currentTime === "number");
+  };
+  const pauseSegmentMedia = () => {
+    if (!state.activeMovieSegment) {
+      cancelAnimationFrame(state.segmentRaf);
+      state.segmentRaf = 0;
+      return;
+    }
+    for (const el of Array.from(stage.querySelectorAll("video,audio"))) {
+      if (typeof el.pause === "function") el.pause();
+    }
+    state.activeMovieSegment = undefined;
+    cancelAnimationFrame(state.segmentRaf);
+    state.segmentRaf = 0;
+  };
+  const playMovieSegment = (slide, segment) => {
+    pauseSegmentMedia();
+    const resolution = seekSlide(state.slideIndex, segment.startMs);
+    const media = mediaElementsForSegment(slide, segment);
+    const startSeconds = segment.startMs / 1000;
+    const endSeconds = segment.endMs / 1000;
+    state.activeMovieSegment = { ...segment, slideIndex: state.slideIndex };
+    for (const el of media) {
+      try {
+        if (Math.abs((el.currentTime || 0) - startSeconds) > 0.02) el.currentTime = startSeconds;
+        el.muted = segment.muted !== undefined ? Boolean(segment.muted) : true;
+        const playResult = typeof el.play === "function" ? el.play() : undefined;
+        if (playResult?.catch) playResult.catch(() => {});
+      } catch {}
+    }
+    const watch = () => {
+      if (!state.activeMovieSegment || state.activeMovieSegment.slideIndex !== state.slideIndex) return;
+      const active = media.find((el) => !el.paused);
+      const currentMs = active ? (active.currentTime || 0) * 1000 : state.slideTimeMs;
+      if (currentMs >= segment.endMs - 8) {
+        for (const el of media) {
+          try {
+            el.pause();
+            if (Math.abs((el.currentTime || 0) - endSeconds) > 0.02) el.currentTime = endSeconds;
+          } catch {}
+        }
+        seekSlide(state.slideIndex, segment.endMs);
+        state.activeMovieSegment = undefined;
+        state.segmentRaf = 0;
+        return;
+      }
+      state.segmentRaf = requestAnimationFrame(watch);
+    };
+    state.segmentRaf = requestAnimationFrame(watch);
+    emitRuntimeEvent("movieSegment", { resolution, segment: clone(segment) });
+    return resolution;
+  };
+  const nextMovieSegment = (slide) => {
+    const segments = normalizeMovieSegments(slide);
+    return segments.find((segment) => segment.startMs > state.slideTimeMs + 16 || (state.slideTimeMs < segment.endMs - 16 && state.slideTimeMs <= segment.startMs + 16));
+  };
   const updateControls = (resolution) => {
     if (scrub) {
       scrub.max = String(timeline.durationMs);
@@ -1866,6 +1982,8 @@ function runtimeScript(): string {
   const stepToNextTimelineEvent = () => {
     pause();
     const slide = deck.deck.slides[state.slideIndex];
+    const segment = nextMovieSegment(slide);
+    if (segment) return playMovieSegment(slide, segment);
     const nextTime = timelineEventBoundaryTimes(slide).find((time) => time > state.slideTimeMs + 16);
     if (nextTime !== undefined) {
       const resolution = seekSlide(state.slideIndex, nextTime);
@@ -1908,6 +2026,7 @@ function runtimeScript(): string {
   const pause = () => {
     state.playing = false;
     cancelAnimationFrame(state.raf);
+    pauseSegmentMedia();
     if (playButton) playButton.textContent = "Play";
   };
   const tick = () => {
@@ -1926,8 +2045,21 @@ function runtimeScript(): string {
     if (playButton) playButton.textContent = "Pause";
     tick();
   };
-  const previousSlide = () => seekSlide(Math.max(0, state.slideIndex - 1), 0);
-  const nextSlide = () => seekSlide(Math.min(timeline.slides.length - 1, state.slideIndex + 1), 0);
+  const previousSlide = () => {
+    pauseSegmentMedia();
+    return seekSlide(Math.max(0, state.slideIndex - 1), 0);
+  };
+  const nextSlide = () => {
+    pauseSegmentMedia();
+    return seekSlide(Math.min(timeline.slides.length - 1, state.slideIndex + 1), 0);
+  };
+  const nextSlideOrMovieSegment = () => {
+    pause();
+    const slide = deck.deck.slides[state.slideIndex];
+    const segment = nextMovieSegment(slide);
+    if (segment) return playMovieSegment(slide, segment);
+    return nextSlide();
+  };
   const serializeStates = (states) => Object.fromEntries(Array.from(states.entries()).map(([id, value]) => [id, JSON.parse(JSON.stringify(value || {}))]));
   const getTimelineEventDiagnostics = (slideIndex = state.slideIndex, timeMs) => {
     const index = Math.max(0, Math.min((deck.deck.slides || []).length - 1, Number(slideIndex) || 0));
@@ -2056,7 +2188,7 @@ function runtimeScript(): string {
   };
   playButton?.addEventListener("click", () => state.playing ? pause() : play());
   prevButton?.addEventListener("click", previousSlide);
-  nextButton?.addEventListener("click", nextSlide);
+  nextButton?.addEventListener("click", () => nextSlideOrMovieSegment());
   stepButton?.addEventListener("click", () => stepToNextTimelineEvent());
   scrub?.addEventListener("input", () => seekGlobal(Number(scrub.value)));
   window.addEventListener("resize", resize);

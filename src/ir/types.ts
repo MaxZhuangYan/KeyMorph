@@ -313,6 +313,7 @@ export interface MediaPlayback {
   autoplay?: boolean;
   loop?: boolean;
   muted?: boolean;
+  playing?: boolean;
   startMs?: number;
   endMs?: number;
 }

@@ -184,6 +184,7 @@ function parseSlideXml(
   const objects: IRObject[] = [];
   const shapeIdToObjectId = new Map<string, string>();
   const objectBoundsById = new Map<string, { x: number; y: number; width: number; height: number }>();
+  const mediaObjectIds = new Set<string>();
   const shapeSources = source.match(/<p:sp\b[\s\S]*?<\/p:sp>/g) ?? [];
   const rels = parseRelationships(getTextEntry(entries, relationshipsPathForPart(slidePath)) ?? "");
 
@@ -236,12 +237,54 @@ function parseSlideXml(
     const imageData = imagePath ? entries.get(imagePath) : undefined;
     const contentType = imagePath ? contentTypeFromPartPath(imagePath) : undefined;
     const dataUriValue = imageData && contentType ? `data:${contentType};base64,${Buffer.from(imageData).toString("base64")}` : undefined;
+    const mediaReference = readPictureMediaReference(pictureXml, rels, entries, slidePath);
     const bounds = readShapeBounds(pictureXml, slideSize, {
       x: 96 + (shapeSources.length + pictureIndex) * 28,
       y: 96 + (shapeSources.length + pictureIndex) * 28,
       width: 400,
       height: 240
     });
+    if (mediaReference) {
+      const mediaDataUriValue =
+        mediaReference.data && mediaReference.contentType
+          ? `data:${mediaReference.contentType};base64,${Buffer.from(mediaReference.data).toString("base64")}`
+          : undefined;
+      objects.push({
+        id,
+        type: "media",
+        mediaType: mediaReference.mediaType,
+        name: readShapeName(pictureXml) ?? "Media",
+        bounds,
+        opacity: 1,
+        source: {
+          ...(mediaDataUriValue ? { dataUri: mediaDataUriValue } : {}),
+          ...(!mediaDataUriValue ? { uri: `pptx://${mediaReference.path}` } : {}),
+          metadata: { pptxMediaPath: mediaReference.path, mimeType: mediaReference.contentType }
+        },
+        posterSource:
+          imagePath && (dataUriValue || contentType)
+            ? {
+                ...(dataUriValue ? { dataUri: dataUriValue } : { uri: `pptx://${imagePath}` }),
+                metadata: { pptxImagePath: imagePath, mimeType: contentType ?? "" }
+              }
+            : undefined,
+        playback: { autoplay: false, muted: true },
+        metadata: {
+          ...(sourceShapeId ? { pptxShapeId: sourceShapeId } : {}),
+          pptxRelationshipId: mediaReference.relationshipId,
+          pptxMediaRelationshipId: mediaReference.relationshipId,
+          pptxMediaPath: mediaReference.path,
+          ...(relId ? { pptxPosterRelationshipId: relId } : {}),
+          ...(imagePath ? { pptxPosterImagePath: imagePath } : {})
+        }
+      });
+      mediaObjectIds.add(id);
+      if (sourceShapeId) {
+        shapeIdToObjectId.set(sourceShapeId, id);
+        objectBoundsById.set(id, bounds);
+      }
+      return;
+    }
     objects.push({
       id,
       type: "image",
@@ -265,7 +308,7 @@ function parseSlideXml(
     }
   });
 
-  const timing = parseSlideTiming(source, index, slideSize, shapeIdToObjectId, objectBoundsById);
+  const timing = parseSlideTiming(source, index, slideSize, shapeIdToObjectId, objectBoundsById, mediaObjectIds);
   const maxEventEnd = timing.events.reduce((max, event) => Math.max(max, eventStartMs(event) + (event.durationMs ?? 0)), 0);
 
   return {
@@ -333,7 +376,47 @@ function contentTypeFromPartPath(partPath: string): string | undefined {
   if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
   if (extension === ".gif") return "image/gif";
   if (extension === ".webp") return "image/webp";
+  if (extension === ".mp4") return "video/mp4";
+  if (extension === ".m4v") return "video/x-m4v";
+  if (extension === ".mov") return "video/quicktime";
+  if (extension === ".webm") return "video/webm";
+  if (extension === ".mp3") return "audio/mpeg";
+  if (extension === ".m4a") return "audio/mp4";
+  if (extension === ".wav") return "audio/wav";
   return undefined;
+}
+
+function readPictureMediaReference(
+  pictureXml: string,
+  relationships: Map<string, string>,
+  entries: Map<string, Uint8Array>,
+  slidePath: string
+):
+  | {
+      relationshipId: string;
+      path: string;
+      contentType: string;
+      data?: Uint8Array;
+      mediaType: "video" | "audio";
+    }
+  | undefined {
+  const relId =
+    pictureXml.match(/<a:videoFile\b[^>]*(?:r:link|r:embed)="([^"]+)"/)?.[1] ??
+    pictureXml.match(/<a:audioFile\b[^>]*(?:r:link|r:embed)="([^"]+)"/)?.[1] ??
+    pictureXml.match(/<p14:media\b[^>]*(?:r:embed|r:link)="([^"]+)"/)?.[1];
+  if (!relId) return undefined;
+  const target = relationships.get(relId);
+  if (!target) return undefined;
+  const mediaPath = normalizePartPath(pathJoinPart(path.posix.dirname(slidePath), target));
+  const contentType = contentTypeFromPartPath(mediaPath);
+  if (!contentType || (!contentType.startsWith("video/") && !contentType.startsWith("audio/"))) return undefined;
+  return {
+    relationshipId: relId,
+    path: mediaPath,
+    contentType,
+    data: entries.get(mediaPath),
+    mediaType: contentType.startsWith("audio/") ? "audio" : "video"
+  };
 }
 
 function readShapeText(source: string): string {
@@ -478,7 +561,7 @@ interface ParsedTimingNode {
   path: string[];
 }
 
-type SupportedTimingTag = "animEffect" | "anim" | "set" | "animMotion" | "animScale" | "animRot";
+type SupportedTimingTag = "animEffect" | "anim" | "set" | "animMotion" | "animScale" | "animRot" | "cmd";
 
 interface TimingSequenceContext {
   kind: "absolute" | "withPrevious" | "afterPrevious" | "onClick";
@@ -513,7 +596,8 @@ function parseSlideTiming(
   slideIndex: number,
   slideSize: { width: number; height: number },
   shapeIdToObjectId: Map<string, string>,
-  objectBoundsById: Map<string, { x: number; y: number; width: number; height: number }> = new Map()
+  objectBoundsById: Map<string, { x: number; y: number; width: number; height: number }> = new Map(),
+  mediaObjectIds: Set<string> = new Set()
 ): TimingParseResult {
   const timingXml = extractXmlElements(source, "timing")[0];
   const result: TimingParseResult = {
@@ -538,6 +622,7 @@ function parseSlideTiming(
       slideSize,
       shapeIdToObjectId,
       objectBoundsById,
+      mediaObjectIds,
       result.unsupportedFeatures,
       result.degradedFeatures
     );
@@ -575,6 +660,7 @@ function parseSupportedTimingEvent(
   slideSize: { width: number; height: number },
   shapeIdToObjectId: Map<string, string>,
   objectBoundsById: Map<string, { x: number; y: number; width: number; height: number }>,
+  mediaObjectIds: Set<string>,
   unsupportedFeatures: UnsupportedFeature[],
   degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
@@ -593,7 +679,10 @@ function parseSupportedTimingEvent(
   if (node.tag === "animScale") {
     return parseScaleEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
   }
-  return parseRotationEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
+  if (node.tag === "animRot") {
+    return parseRotationEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
+  }
+  return parseMediaCommand(node.xml, slideIndex, eventIndex, shapeIdToObjectId, mediaObjectIds, unsupportedFeatures, degradedFeatures);
 }
 
 function applyTimingContext(event: AnimationEvent, context: TimingSequenceContext): void {
@@ -999,6 +1088,82 @@ function parseRotationEffect(
   };
 }
 
+function parseMediaCommand(
+  node: string,
+  slideIndex: number,
+  eventIndex: number,
+  shapeIdToObjectId: Map<string, string>,
+  mediaObjectIds: Set<string>,
+  unsupportedFeatures: UnsupportedFeature[],
+  degradedFeatures: DegradedFeature[]
+): AnimationEvent | undefined {
+  const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
+  const attrs = readXmlAttributes(node, "cmd");
+  const command = attrs.get("cmd") ?? "";
+  const commandType = attrs.get("type") ?? "unknown";
+  if (!targetId || !mediaObjectIds.has(targetId)) {
+    unsupportedFeatures.push({
+      code: "presentationml-cmd",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint p:cmd animation command type "${commandType}"${command ? ` (${command})` : ""} does not target an imported media object.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:cmd`,
+      fallback: "Preserve the static object and omit this media command."
+    });
+    return undefined;
+  }
+
+  const playFrom = command.match(/^playFrom\((-?\d+(?:\.\d+)?)\)$/i);
+  const timing = readTimingNodeSemantics(node, 0, slideIndex, "cmd", degradedFeatures);
+  if (playFrom) {
+    const seekMs = Math.max(0, Math.round(Number(playFrom[1]) * 1000));
+    return {
+      id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+      kind: "media",
+      label: "Media play",
+      targetId,
+      action: "play",
+      seekMs,
+      start: { type: "absolute", atMs: readTimingDelay(node) },
+      durationMs: 0,
+      fill: timing.fill,
+      metadata: { ...timing.metadata, pptxEffect: "mediaCommand", pptxCommand: command, pptxCommandType: commandType }
+    };
+  }
+
+  if (command.toLowerCase() === "togglepause") {
+    degradedFeatures.push({
+      code: "presentationml-media-toggle-pause",
+      severity: "warning",
+      area: "animation",
+      description: 'PowerPoint p:cmd "togglePause" was approximated as a deterministic media pause action.',
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:cmd`,
+      fallback: "Pause the media at this timeline point instead of toggling unknown current playback state."
+    });
+    return {
+      id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+      kind: "media",
+      label: "Media pause",
+      targetId,
+      action: "pause",
+      start: { type: "absolute", atMs: readTimingDelay(node) },
+      durationMs: 0,
+      fill: timing.fill,
+      metadata: { ...timing.metadata, pptxEffect: "mediaCommand", pptxCommand: command, pptxCommandType: commandType, pptxApproximation: "togglePause->pause" }
+    };
+  }
+
+  unsupportedFeatures.push({
+    code: "presentationml-cmd",
+    severity: "warning",
+    area: "animation",
+    description: `PowerPoint p:cmd animation command type "${commandType}"${command ? ` (${command})` : ""} is not executable in the IR timeline.`,
+    sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:cmd`,
+    fallback: "Preserve the static object and omit this media command."
+  });
+  return undefined;
+}
+
 function parseBuildListSequencing(
   timingXml: string,
   slideIndex: number,
@@ -1044,7 +1209,7 @@ function parseBuildListSequencing(
 }
 
 function extractSupportedTimingNodes(timingXml: string, ranges: XmlElementRange[]): ParsedTimingNode[] {
-  const supported = new Set<SupportedTimingTag>(["animEffect", "anim", "set", "animMotion", "animScale", "animRot"]);
+  const supported = new Set<SupportedTimingTag>(["animEffect", "anim", "set", "animMotion", "animScale", "animRot", "cmd"]);
   return ranges
     .filter((range): range is XmlElementRange & { localName: SupportedTimingTag } => supported.has(range.localName as SupportedTimingTag))
     .sort((a, b) => a.start - b.start)
@@ -1062,9 +1227,9 @@ function reportUnsupportedTimingNodes(
   slideIndex: number,
   unsupportedFeatures: UnsupportedFeature[]
 ): void {
-  const supported = new Set<SupportedTimingTag>(["animEffect", "anim", "set", "animMotion", "animScale", "animRot"]);
+  const supported = new Set<SupportedTimingTag>(["animEffect", "anim", "set", "animMotion", "animScale", "animRot", "cmd"]);
   for (const range of ranges) {
-    if (!["animClr", "cmd"].includes(range.localName)) continue;
+    if (range.localName !== "animClr") continue;
     const nodeXml = timingXml.slice(range.start, range.end);
     unsupportedFeatures.push({
       code: `presentationml-${range.localName}`,
