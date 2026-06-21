@@ -950,6 +950,75 @@ describe("Keynote bridge", () => {
     assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationUnresolvedCount, 0);
   });
 
+  test("recovers static native 2011 text drawables without build targets", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-static-text-drawable-"));
+    const keyPath = path.join(dir, "static-text-drawable.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(1200, [{ type: 2001, payload: nativeTextContentPayload("静态标题") }]),
+        iwaArchiveRecord(1100, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1200,
+              bounds: { x: 320, y: 240, width: 560, height: 110 }
+            })
+          }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const objects = deck.deck.slides[0]?.objects ?? [];
+    const nativeObject = objects.find((candidate) => candidate.metadata?.nativeExtraction === "typed-iwa-text-drawable");
+    assert.equal(nativeObject?.type, "text");
+    if (nativeObject?.type !== "text") throw new Error("Expected native text drawable.");
+    assert.equal(nativeObject.text.plainText, "静态标题");
+    assert.deepEqual(nativeObject.bounds, { x: 320, y: 240, width: 560, height: 110 });
+    assert.equal(nativeObject.metadata?.nativeTextDrawableBuildTarget, undefined);
+    assert.equal(objects.filter((object) => object.type === "text").length, 1);
+  });
+
+  test("suppresses noisy fallback text when a native text drawable contains the same copy", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-native-text-dedupe-"));
+    const keyPath = path.join(dir, "native-text-dedupe.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(1300, [{ type: 15, payload: protoString("[一个让 AI 在 虚拟社会里生活工作 并把有价值的部分 存在链上的游戏") }]),
+        iwaArchiveRecord(1200, [
+          { type: 2001, payload: nativeTextContentPayload("一个让 AI 在 虚拟社会里生活工作 并把有价值的部分 存在链上的游戏") }
+        ]),
+        iwaArchiveRecord(1100, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1200,
+              bounds: { x: 240, y: 180, width: 1100, height: 96 }
+            })
+          }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const textObjects = deck.deck.slides[0]?.objects.filter((object) => object.type === "text") ?? [];
+    assert.equal(textObjects.length, 1);
+    assert.equal(textObjects[0]?.metadata?.nativeExtraction, "typed-iwa-text-drawable");
+    assert.equal(textObjects[0]?.type, "text");
+    if (textObjects[0]?.type !== "text") throw new Error("Expected native text drawable.");
+    assert.equal(textObjects[0].text.plainText, "一个让 AI 在 虚拟社会里生活工作 并把有价值的部分 存在链上的游戏");
+  });
+
   test("applies native stylesheet font, color, and alignment to 2011 text drawables", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-text-style-"));
     const keyPath = path.join(dir, "text-style.key");

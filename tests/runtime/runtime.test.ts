@@ -74,6 +74,16 @@ describe("HTML runtime rendering", () => {
     assert.match(markup, /padding-left:1\.4em/);
   });
 
+  test("renders rich text runs in the executable runtime", () => {
+    const html = renderHtmlDocument(createRichTextDeck());
+
+    assert.match(html, /const richTextHtml =/);
+    assert.match(html, /const textRunHtml =/);
+    assert.match(html, /const textParagraphHtml =/);
+    assert.match(html, /richTextHtml\(object\)/);
+    assert.match(html, /el\.innerHTML = richTextHtml\(object, statePatch\)/);
+  });
+
   test("renders shape text with text layout class and styles", () => {
     const deck = createShapeTextDeck();
     const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);

@@ -2100,10 +2100,6 @@ function createNativeTextDrawableObjects(
   textStyleMap: NativeTextStyleMap
 ): IRObject[] {
   const targetIds = nativeBuildTargetIds(messages);
-  if (targetIds.size === 0) {
-    return [];
-  }
-
   const textByArchiveId = new Map<string, NativeIwaTextContentEvidence>();
   for (const message of messages) {
     if (message.archiveIdentifier && message.textContent) {
@@ -2116,7 +2112,7 @@ function createNativeTextDrawableObjects(
   for (const message of messages) {
     const drawable = message.textDrawable;
     const drawableId = message.archiveIdentifier;
-    if (!drawable || !drawableId || !targetIds.has(drawableId) || seenDrawableIds.has(drawableId)) {
+    if (!drawable || !drawableId || seenDrawableIds.has(drawableId)) {
       continue;
     }
     const textEntry = drawable.textArchiveIds.map((id) => textByArchiveId.get(id)).find((entry) => entry?.text);
@@ -2125,6 +2121,12 @@ function createNativeTextDrawableObjects(
     }
     const object = createNativeTextDrawableObject(slideId, message, drawable, textEntry, objects.length, sourcePath, deckSize, textStyleMap);
     if (object) {
+      if (targetIds.has(drawableId)) {
+        object.metadata = {
+          ...(object.metadata ?? {}),
+          nativeTextDrawableBuildTarget: true
+        };
+      }
       seenDrawableIds.add(drawableId);
       objects.push(object);
     }
@@ -2340,13 +2342,13 @@ function normalizeNativeTextDrawableBounds(
 }
 
 function suppressDuplicateFallbackTextObjects(textObjects: IRObject[], nativeTextObjects: IRObject[]): IRObject[] {
-  const nativeText = new Set(
+  const nativeTexts = uniqueStrings(
     nativeTextObjects
       .filter((object): object is Extract<IRObject, { type: "text" }> => object.type === "text")
       .map((object) => normalizeTextForDuplicateCheck(object.text.plainText))
       .filter((text): text is string => Boolean(text))
   );
-  if (nativeText.size === 0) {
+  if (nativeTexts.length === 0) {
     return textObjects;
   }
   return textObjects.filter((object) => {
@@ -2354,13 +2356,28 @@ function suppressDuplicateFallbackTextObjects(textObjects: IRObject[], nativeTex
       return true;
     }
     const normalized = normalizeTextForDuplicateCheck(object.text.plainText);
-    return !normalized || !nativeText.has(normalized);
+    return !normalized || !nativeTexts.some((nativeText) => normalizedTextDuplicatesNativeText(normalized, nativeText));
   });
 }
 
 function normalizeTextForDuplicateCheck(text: string | undefined): string | undefined {
-  const cleaned = text?.replace(/\s+/g, "").trim().toLowerCase();
+  const cleaned = text
+    ?.replace(/^[\s[({<「『【《]+|[\s\])}>」』】》]+$/g, "")
+    .replace(/[，,。.!！?？:：;；"'“”‘’\s]+/g, "")
+    .trim()
+    .toLowerCase();
   return cleaned || undefined;
+}
+
+function normalizedTextDuplicatesNativeText(normalizedFallbackText: string, normalizedNativeText: string): boolean {
+  if (normalizedFallbackText === normalizedNativeText) {
+    return true;
+  }
+  const shorterLength = Math.min(normalizedFallbackText.length, normalizedNativeText.length);
+  if (shorterLength < 8) {
+    return false;
+  }
+  return normalizedFallbackText.includes(normalizedNativeText) || normalizedNativeText.includes(normalizedFallbackText);
 }
 
 function createPlaceholderObject(

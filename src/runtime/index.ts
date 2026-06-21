@@ -177,7 +177,10 @@ export function renderHtmlDocument(deck: DeckIR, options: HtmlRuntimeOptions = {
     #stage { position: relative; overflow: hidden; background: #fff; box-shadow: ${exportMode ? "none" : "0 18px 55px rgba(0,0,0,.36)"}; transform-origin: top left; }
     .km-slide-layer { position: absolute; inset: 0; overflow: hidden; transform-origin: center center; }
     .km-object { position: absolute; box-sizing: border-box; overflow: hidden; transform-origin: center center; }
-    .km-text, .km-shape-text { white-space: pre-wrap; display: flex; align-items: flex-start; }
+    .km-text, .km-shape-text { white-space: pre-wrap; display: block; }
+    .km-text-paragraph { display: block; }
+    .km-text-bullet { margin-right: .35em; }
+    .km-text-run { white-space: pre-wrap; }
     .km-text-char { display: inline-block; white-space: pre; }
     .km-image, .km-media { user-select: none; -webkit-user-drag: none; }
     .km-image-content { position: absolute; display: block; max-width: none; max-height: none; user-select: none; -webkit-user-drag: none; }
@@ -730,13 +733,55 @@ function runtimeScript(): string {
     el.style.backgroundColor = "transparent";
   };
   const strokeColorCss = (stroke) => colorCss(stroke?.color) || "transparent";
-  const textOf = (object, statePatch) => statePatch?.text?.plainText || (statePatch?.text?.runs || []).map((run) => run.text).join("") || object.text?.plainText || (object.text?.runs || []).map((run) => run.text).join("") || "";
+  const textContentValue = (object, statePatch) => statePatch?.text || object.text;
+  const textOfContent = (text) => text?.plainText || (text?.runs || []).map((run) => run.text).join("") || (text?.paragraphs || []).map((paragraph) => (paragraph.runs || []).map((run) => run.text).join("")).join("\\n") || "";
+  const textOf = (object, statePatch) => textOfContent(textContentValue(object, statePatch));
   const graphemes = (text) => {
     const value = String(text || "");
     if (typeof Intl !== "undefined" && Intl.Segmenter) return Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value), (item) => item.segment);
     return Array.from(value);
   };
   const characterTextHtml = (text) => graphemes(text).map((char, index) => '<span class="km-text-char" data-char-index="' + index + '">' + esc(char) + '</span>').join("");
+  const textRunStyleCss = (style) => {
+    if (!style) return "";
+    return [
+      style.fontFamily ? "font-family:" + style.fontFamily : "",
+      style.fontSize !== undefined ? "font-size:" + Number(style.fontSize) + "px" : "",
+      style.fontWeight !== undefined ? "font-weight:" + style.fontWeight : "",
+      style.italic ? "font-style:italic" : "",
+      style.underline ? "text-decoration:underline" : "",
+      style.color !== undefined ? "color:" + (colorCss(style.color) || "#111827") : "",
+      style.lineHeight !== undefined ? "line-height:" + style.lineHeight : "",
+      style.letterSpacing !== undefined ? "letter-spacing:" + Number(style.letterSpacing) + "px" : ""
+    ].filter(Boolean).join(";");
+  };
+  const textRunHtml = (run) => {
+    const style = textRunStyleCss(run?.style);
+    return '<span class="km-text-run"' + (style ? ' style="' + esc(style) + '"' : "") + ">" + esc(run?.text || "") + "</span>";
+  };
+  const textParagraphHtml = (paragraph) => {
+    const style = [
+      paragraph?.alignment ? "text-align:" + paragraph.alignment : "",
+      paragraph?.bullet?.level !== undefined ? "padding-left:" + Math.max(0, Number(paragraph.bullet.level) || 0) * 1.4 + "em" : ""
+    ].filter(Boolean).join(";");
+    const marker = paragraph?.bullet ? '<span class="km-text-bullet">' + esc(paragraph.bullet.marker || "•") + "</span>" : "";
+    const runs = (paragraph?.runs || []).map(textRunHtml).join("");
+    return '<div class="km-text-paragraph"' + (style ? ' style="' + esc(style) + '"' : "") + ">" + marker + runs + "</div>";
+  };
+  const richTextHtml = (object, statePatch) => {
+    const text = textContentValue(object, statePatch);
+    if (!text) return "";
+    if (text.paragraphs && text.paragraphs.length > 0) return text.paragraphs.map(textParagraphHtml).join("");
+    if (text.runs && text.runs.length > 0) return text.runs.map(textRunHtml).join("");
+    return esc(text.plainText || "");
+  };
+  const textFingerprint = (object, statePatch) => {
+    try {
+      return JSON.stringify(textContentValue(object, statePatch) || {});
+    } catch {
+      return textOf(object, statePatch);
+    }
+  };
   const hasCharacterBuild = (object) => {
     for (const slide of deck.deck.slides || []) {
       for (const event of slide.timeline?.events || []) {
@@ -956,7 +1001,7 @@ function runtimeScript(): string {
   const objectHtml = (object) => {
     const className = "km-object km-" + object.type + (object.type === "shape" && object.text ? " km-shape-text" : "");
     const common = 'class="' + esc(className) + '" data-object-id="' + esc(object.id) + '" style="' + boxStyle(object) + ';';
-    if (object.type === "text") return '<div ' + common + textStyleCss(object) + '">' + (hasCharacterBuild(object) ? characterTextHtml(textOf(object)) : esc(textOf(object))) + '</div>';
+    if (object.type === "text") return '<div ' + common + textStyleCss(object) + '">' + (hasCharacterBuild(object) ? characterTextHtml(textOf(object)) : richTextHtml(object)) + '</div>';
     if (object.type === "image") return '<div ' + common + '"><img class="km-image-content" style="' + imageContentStyle(object) + '" src="' + esc(sourceUrl(object.source)) + '" alt="' + esc(object.altText || object.name || "") + '"></div>';
     if (object.type === "media") {
       const tag = object.mediaType === "audio" ? "audio" : "video";
@@ -964,7 +1009,7 @@ function runtimeScript(): string {
       return '<' + tag + ' ' + common + '" src="' + esc(sourceUrl(object.source)) + '"' + poster + ' muted playsinline></' + tag + '>';
     }
     if (object.type === "group") return '<div ' + common + 'overflow:visible">' + (object.children || []).map(objectHtml).join("") + '</div>';
-    if (object.type === "shape" && object.text) return '<div ' + common + textStyleCss(object) + '">' + (hasCharacterBuild(object) ? characterTextHtml(textOf(object)) : esc(textOf(object))) + '</div>';
+    if (object.type === "shape" && object.text) return '<div ' + common + textStyleCss(object) + '">' + (hasCharacterBuild(object) ? characterTextHtml(textOf(object)) : richTextHtml(object)) + '</div>';
     return '<div ' + common + '"></div>';
   };
   const layerHtml = (slide, layerName) => {
@@ -1534,7 +1579,11 @@ function runtimeScript(): string {
         el.style.opacity = String(object.opacity ?? 1);
         applyCharacterTextState(el, object, statePatch, slide, timeMs, starts);
       } else {
-        el.textContent = textOf(object, statePatch);
+        const fingerprint = textFingerprint(object, statePatch);
+        if (el.dataset.kmTextFingerprint !== fingerprint) {
+          el.innerHTML = richTextHtml(object, statePatch);
+          el.dataset.kmTextFingerprint = fingerprint;
+        }
       }
       applyTextStyle(el, object, statePatch);
     }
