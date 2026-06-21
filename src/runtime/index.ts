@@ -172,9 +172,10 @@ export function renderHtmlDocument(deck: DeckIR, options: HtmlRuntimeOptions = {
   <title>${escapeHtml(deck.metadata?.title ?? deck.deck.title ?? "KeyMorph Runtime")}</title>
   <style>
     :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; min-height: 100vh; background: ${exportMode ? "transparent" : "#202124"}; color: #f8fafc; display: grid; grid-template-rows: 1fr auto; }
-    #viewport { min-height: 0; display: grid; place-items: ${exportMode ? "start" : "center"}; padding: ${exportMode ? "0" : "24px"}; overflow: hidden; }
-    #stage { position: relative; overflow: hidden; background: #fff; box-shadow: ${exportMode ? "none" : "0 18px 55px rgba(0,0,0,.36)"}; transform-origin: top left; }
+    body { margin: 0; height: 100vh; overflow: hidden; background: ${exportMode ? "transparent" : "#202124"}; color: #f8fafc; display: grid; grid-template-rows: minmax(0, 1fr) auto; }
+    #viewport { min-height: 0; box-sizing: border-box; display: grid; place-items: ${exportMode ? "start" : "center"}; padding: ${exportMode ? "0" : "24px"}; overflow: hidden; }
+    #stage-shell { position: relative; flex: none; }
+    #stage { position: absolute; left: 0; top: 0; overflow: hidden; background: #fff; box-shadow: ${exportMode ? "none" : "0 18px 55px rgba(0,0,0,.36)"}; transform-origin: top left; }
     .km-slide-layer { position: absolute; inset: 0; overflow: hidden; transform-origin: center center; }
     .km-object { position: absolute; box-sizing: border-box; overflow: hidden; transform-origin: center center; }
     .km-text, .km-shape-text { white-space: pre-wrap; display: block; }
@@ -192,7 +193,7 @@ export function renderHtmlDocument(deck: DeckIR, options: HtmlRuntimeOptions = {
   </style>
 </head>
 <body>
-  <main id="viewport"><div id="stage" aria-label="KeyMorph slide stage"></div></main>
+  <main id="viewport"><div id="stage-shell"><div id="stage" aria-label="KeyMorph slide stage"></div></div></main>
   <div class="km-controls">
     <button id="prev" type="button">Prev</button>
     <button id="play" type="button">Play</button>
@@ -535,6 +536,7 @@ function runtimeScript(): string {
   const deck = window.__KEYMORPH_DECK__;
   const runtimeOptions = window.__KEYMORPH_RUNTIME_OPTIONS__ || {};
   const stage = document.getElementById("stage");
+  const stageShell = document.getElementById("stage-shell");
   const viewport = document.getElementById("viewport");
   const playButton = document.getElementById("play");
   const prevButton = document.getElementById("prev");
@@ -1849,12 +1851,26 @@ function runtimeScript(): string {
     const scaleOption = Number(runtimeOptions.stageScale);
     if (Number.isFinite(scaleOption) && scaleOption > 0) {
       stage.style.transform = "scale(" + scaleOption + ")";
+      if (stageShell) {
+        stageShell.style.width = Math.round(deck.deck.size.width * scaleOption) + "px";
+        stageShell.style.height = Math.round(deck.deck.size.height * scaleOption) + "px";
+      }
       viewport.style.width = Math.round(deck.deck.size.width * scaleOption) + "px";
       viewport.style.height = Math.round(deck.deck.size.height * scaleOption) + "px";
       return;
     }
-    const scale = Math.min((viewport.clientWidth - 8) / deck.deck.size.width, (viewport.clientHeight - 8) / deck.deck.size.height, 1);
-    stage.style.transform = "scale(" + Math.max(0.1, scale) + ")";
+    const viewportStyle = getComputedStyle(viewport);
+    const horizontalPadding = parseFloat(viewportStyle.paddingLeft || "0") + parseFloat(viewportStyle.paddingRight || "0");
+    const verticalPadding = parseFloat(viewportStyle.paddingTop || "0") + parseFloat(viewportStyle.paddingBottom || "0");
+    const availableWidth = Math.max(1, viewport.clientWidth - horizontalPadding - 8);
+    const availableHeight = Math.max(1, viewport.clientHeight - verticalPadding - 8);
+    const scale = Math.min(availableWidth / deck.deck.size.width, availableHeight / deck.deck.size.height, 1);
+    const appliedScale = Math.max(0.1, scale);
+    stage.style.transform = "scale(" + appliedScale + ")";
+    if (stageShell) {
+      stageShell.style.width = Math.round(deck.deck.size.width * appliedScale) + "px";
+      stageShell.style.height = Math.round(deck.deck.size.height * appliedScale) + "px";
+    }
   };
   const pause = () => {
     state.playing = false;

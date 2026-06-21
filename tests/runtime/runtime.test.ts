@@ -34,6 +34,10 @@ describe("HTML runtime rendering", () => {
     assert.match(html, /seekFrame/);
     assert.match(html, /createTimingPlan/);
     assert.match(html, /setPlaybackRate/);
+    assert.match(html, /id="stage-shell"/);
+    assert.match(html, /stageShell\.style\.width/);
+    assert.match(html, /body \{ margin: 0; height: 100vh; overflow: hidden/);
+    assert.match(html, /availableHeight = Math\.max\(1, viewport\.clientHeight - verticalPadding - 8\)/);
   });
 
   test("renders slide objects as positioned markup", () => {
