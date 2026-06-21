@@ -12,6 +12,7 @@ import {
   exportIrToKeynote,
   exportKeynoteToHtml,
   exportKeynoteToMovie,
+  materializeNativeKeynoteAssetFiles,
   parseKeynoteHtmlExportToIr,
   parseKeynoteToIr,
   type KeynoteAutomationOptions
@@ -66,6 +67,7 @@ export interface ProductBundlePaths {
   keynoteHtmlDir: string;
   keynoteHtmlIndex: string;
   keynoteMovie: string;
+  nativeAssetsDir: string;
   rebuiltPptx: string;
   lossReport: string;
   manifest: string;
@@ -98,6 +100,7 @@ export interface ProductBundleManifest {
     irRuntimeHtml: string | null;
     keynoteHtml: string | null;
     keynoteMovie: string | null;
+    nativeAssets: string | null;
     rebuiltPptx: string;
     lossReport: string;
     videoPlan: string;
@@ -249,6 +252,7 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
     throw new Error(`Converted IR is invalid: ${validation.errors.map((error) => `${error.path} ${error.message}`).join("; ")}`);
   }
 
+  const materializedNativeAssetCount = sourceKind === "keynote" ? await materializeBundleNativeAssets(paths.source, deck, paths) : 0;
   const lossReport = createLossReport(deck.conversion ?? { status: "success", messages: [] });
   const videoPlan = createVideoExportPlan(deck, options.video);
   const videoDependencies = await describeVideoDependencies(options.video?.ffmpegPath);
@@ -263,6 +267,15 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
     videoDependencies,
     paths
   });
+  manifest.artifacts.nativeAssets = materializedNativeAssetCount > 0 ? "assets/native" : null;
+  if (materializedNativeAssetCount > 0) {
+    manifest.report.recommendedFixes = Array.from(
+      new Set([
+        ...manifest.report.recommendedFixes,
+        "Use materialized native Keynote image assets for HTML preview instead of low-resolution text fallback."
+      ])
+    );
+  }
 
   await writeJson(paths.deckIr, deck);
   await writeFile(paths.irRuntimeHtml, renderHtmlDocument(deck), "utf8");
@@ -891,6 +904,69 @@ async function prepareBundleRuntime(input: {
   };
 }
 
+async function materializeBundleNativeAssets(sourcePath: string, deck: DeckIR, paths: ProductBundlePaths): Promise<number> {
+  const requests = (deck.deck.assets ?? [])
+    .map((asset) => {
+      const sourcePath = typeof asset.metadata?.nativeSourcePath === "string" ? asset.metadata.nativeSourcePath : undefined;
+      if (!sourcePath || asset.uri || asset.dataUri) {
+        return undefined;
+      }
+      if (!nativeAssetIsUsedBySlide(deck, asset.id)) {
+        return undefined;
+      }
+      return { assetId: asset.id, sourcePath };
+    })
+    .filter((request): request is { assetId: string; sourcePath: string } => Boolean(request));
+
+  const materialized = await materializeNativeKeynoteAssetFiles(sourcePath, requests, paths.nativeAssetsDir, "assets/native");
+  if (materialized.length === 0) {
+    return 0;
+  }
+
+  const byAssetId = new Map(materialized.map((asset) => [asset.assetId, asset]));
+  for (const asset of deck.deck.assets ?? []) {
+    const match = byAssetId.get(asset.id);
+    if (!match) {
+      continue;
+    }
+    asset.uri = match.uri;
+    asset.metadata = {
+      ...(asset.metadata ?? {}),
+      nativeMaterializedAsset: true,
+      nativeMaterializedUri: match.uri,
+      nativeMaterializedPath: path.relative(paths.jobDir, match.outputPath).split(path.sep).join(path.posix.sep),
+      nativeMaterializedByteLength: match.byteLength
+    };
+  }
+
+  deck.conversion ??= { status: "partial", messages: [] };
+  deck.conversion.status = deck.conversion.status === "success" ? "partial" : deck.conversion.status;
+  deck.conversion.messages.push({
+    severity: "info",
+    code: "keynote-native-assets-materialized",
+    message: `Materialized ${materialized.length} native Keynote package asset(s) into bundle-local files for HTML runtime fidelity.`
+  });
+  deck.conversion.metadata = {
+    ...(deck.conversion.metadata ?? {}),
+    materializedNativeAssetCount: materialized.length
+  };
+  return materialized.length;
+}
+
+function nativeAssetIsUsedBySlide(deck: DeckIR, assetId: string): boolean {
+  return deck.deck.slides.some((slide) => slide.objects.some((object) => objectUsesAsset(object, assetId)));
+}
+
+function objectUsesAsset(object: DeckIR["deck"]["slides"][number]["objects"][number], assetId: string): boolean {
+  if ((object.type === "image" || object.type === "media") && object.source.assetId === assetId) {
+    return true;
+  }
+  if (object.type === "group") {
+    return object.children.some((child) => objectUsesAsset(child, assetId));
+  }
+  return false;
+}
+
 async function writeMovieRuntime(paths: ProductBundlePaths): Promise<ProductRuntimeSummary> {
   await writeFile(paths.runtimeHtml, renderMovieRuntimeHtml("keynote-movie.m4v"), "utf8");
   return {
@@ -973,6 +1049,7 @@ function createBundlePaths(jobDir: string, sourceName: string): ProductBundlePat
     keynoteHtmlDir: path.join(jobDir, "keynote-html"),
     keynoteHtmlIndex: path.join(jobDir, "keynote-html", "index.html"),
     keynoteMovie: path.join(jobDir, "keynote-movie.m4v"),
+    nativeAssetsDir: path.join(jobDir, "assets", "native"),
     rebuiltPptx: path.join(jobDir, "rebuilt.pptx"),
     lossReport: path.join(jobDir, "loss-report.json"),
     manifest: path.join(jobDir, "manifest.json"),
@@ -1021,6 +1098,7 @@ function createBundleManifest(input: {
       irRuntimeHtml: null,
       keynoteHtml: null,
       keynoteMovie: null,
+      nativeAssets: null,
       rebuiltPptx: "rebuilt.pptx",
       lossReport: "loss-report.json",
       videoPlan: "video-plan.json",

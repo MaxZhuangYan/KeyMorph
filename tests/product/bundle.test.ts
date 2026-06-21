@@ -148,6 +148,31 @@ describe("product bundle workflow", () => {
     assert.match(await readFile(path.join(bundleDir, "keynote-movie.m4v"), "utf8"), /stub movie/);
   });
 
+  test("materializes used native Keynote package images into bundle-local runtime assets", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-native-assets-"));
+    const keyPath = path.join(dir, "native.key");
+    const bundleDir = path.join(dir, "bundle");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    const largeImage = concat([pngBytes(1300, 1300), new Uint8Array(2 * 1024 * 1024 + 1)]);
+    await writeFile(path.join(keyPath, "Data", "hero large.png"), largeImage);
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), concat([protoString("Data/hero large.png")]));
+
+    await createProductBundle(keyPath, bundleDir, { jobId: "native-assets-job" });
+
+    const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
+    const deck = JSON.parse(await readFile(path.join(bundleDir, "deck.ir.json"), "utf8"));
+    const runtimeHtml = await readFile(path.join(bundleDir, "runtime.html"), "utf8");
+    const materializedAsset = deck.deck.assets.find((asset) => asset.name === "hero large.png");
+
+    assert.equal(manifest.artifacts.nativeAssets, "assets/native");
+    assert.match(materializedAsset.uri, /^assets\/native\/hero-large-[a-f0-9]{12}\.png$/);
+    assert.equal(materializedAsset.metadata.nativeMaterializedAsset, true);
+    assert.match(runtimeHtml, /assets\/native\/hero-large-[a-f0-9]{12}\.png/);
+    assert.equal((await stat(path.join(bundleDir, materializedAsset.uri))).size, largeImage.byteLength);
+    assert.equal(deck.conversion.messages.some((message) => message.code === "keynote-native-assets-materialized"), true);
+  });
+
   test("falls back to Keynote HTML runtime when movie export is unavailable", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-keynote-html-"));
     const inputPath = path.join(dir, "source.key");
@@ -307,4 +332,44 @@ describe("product bundle workflow", () => {
 
 function image(width: number, height: number, data: number[]): RgbaImage {
   return { width, height, data: new Uint8Array(data) };
+}
+
+function protoString(value: string, fieldNumber = 1): Uint8Array {
+  const encoded = new TextEncoder().encode(value);
+  return concat([varint((fieldNumber << 3) | 2), varint(encoded.length), encoded]);
+}
+
+function varint(value: number): Uint8Array {
+  const bytes: number[] = [];
+  let remaining = value;
+  while (remaining > 0x7f) {
+    bytes.push((remaining & 0x7f) | 0x80);
+    remaining = Math.floor(remaining / 128);
+  }
+  bytes.push(remaining);
+  return new Uint8Array(bytes);
+}
+
+function concat(chunks: Uint8Array[]): Uint8Array {
+  const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function pngBytes(width = 1, height = 1): Uint8Array {
+  const bytes = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82
+  ]);
+  new DataView(bytes.buffer).setUint32(16, width, false);
+  new DataView(bytes.buffer).setUint32(20, height, false);
+  return bytes;
 }

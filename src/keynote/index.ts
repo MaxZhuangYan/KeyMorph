@@ -9,8 +9,10 @@ import { parseNativeKeynoteToIr } from "./native.ts";
 
 export { isKeynoteHtmlExportDir, parseKeynoteHtmlExportToIr, parseKeynoteHtmlToIr } from "./html.ts";
 export type { KeynoteHtmlImportOptions, KeynoteHtmlParseOptions } from "./html.ts";
-export { detectNativeKeynotePackage, parseNativeKeynoteToIr } from "./native.ts";
+export { detectNativeKeynotePackage, materializeNativeKeynoteAssetFiles, parseNativeKeynoteToIr } from "./native.ts";
 export type {
+  NativeKeynoteAssetMaterializationRequest,
+  NativeKeynoteAssetMaterializationResult,
   NativeIwaCompression,
   NativeIwaFieldSummary,
   NativeIwaStreamMetadata,

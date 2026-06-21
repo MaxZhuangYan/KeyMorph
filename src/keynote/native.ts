@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { inflateRawSync } from "node:zlib";
@@ -54,6 +54,19 @@ export interface NativeKeynoteDetection {
   quickLookPaths: string[];
   quickLookPreviews: NativeQuickLookPreviewMetadata[];
   iwaStreams?: NativeIwaStreamMetadata[];
+}
+
+export interface NativeKeynoteAssetMaterializationRequest {
+  assetId: string;
+  sourcePath: string;
+}
+
+export interface NativeKeynoteAssetMaterializationResult {
+  assetId: string;
+  sourcePath: string;
+  outputPath: string;
+  uri: string;
+  byteLength: number;
 }
 
 export type NativeKeynotePackageFormat =
@@ -476,6 +489,43 @@ export async function detectNativeKeynotePackage(keynotePath: string): Promise<N
     quickLookPreviews: parts.quickLookPreviews,
     iwaStreams: classifyIwaStreams(parts.iwaEntries, assets)
   };
+}
+
+export async function materializeNativeKeynoteAssetFiles(
+  keynotePath: string,
+  requests: NativeKeynoteAssetMaterializationRequest[],
+  outputDir: string,
+  uriBase = "assets/native"
+): Promise<NativeKeynoteAssetMaterializationResult[]> {
+  if (requests.length === 0) {
+    return [];
+  }
+
+  const keynotePackage = await readKeynotePackage(keynotePath);
+  const parts = readNativeKeynoteParts(keynotePackage.entries);
+  const uniqueRequests = uniqueNativeAssetMaterializationRequests(requests);
+  const results: NativeKeynoteAssetMaterializationResult[] = [];
+
+  await mkdir(outputDir, { recursive: true });
+  for (const request of uniqueRequests) {
+    const sourcePath = normalizePartPath(request.sourcePath);
+    const data = parts.entries.get(sourcePath);
+    if (!data) {
+      continue;
+    }
+    const outputName = nativeMaterializedAssetFileName(sourcePath);
+    const outputPath = path.join(outputDir, outputName);
+    await writeFile(outputPath, data);
+    results.push({
+      assetId: request.assetId,
+      sourcePath,
+      outputPath,
+      uri: `${stripTrailingSlash(uriBase)}/${encodeURIComponent(outputName)}`,
+      byteLength: data.byteLength
+    });
+  }
+
+  return results;
 }
 
 export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckIR> {
@@ -1340,6 +1390,35 @@ function convertNativeImageToPng(assetPath: string, data: Uint8Array): Uint8Arra
 
 function dataUri(mimeType: string | undefined, data: Uint8Array): string {
   return `data:${mimeType ?? "application/octet-stream"};base64,${Buffer.from(data).toString("base64")}`;
+}
+
+function uniqueNativeAssetMaterializationRequests(
+  requests: NativeKeynoteAssetMaterializationRequest[]
+): NativeKeynoteAssetMaterializationRequest[] {
+  const seen = new Set<string>();
+  const unique: NativeKeynoteAssetMaterializationRequest[] = [];
+  for (const request of requests) {
+    const sourcePath = normalizePartPath(request.sourcePath);
+    const key = `${request.assetId}:${sourcePath}`;
+    if (!request.assetId || !sourcePath || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push({ assetId: request.assetId, sourcePath });
+  }
+  return unique;
+}
+
+function nativeMaterializedAssetFileName(sourcePath: string): string {
+  const normalized = normalizePartPath(sourcePath);
+  const extension = path.posix.extname(normalized);
+  const base = path.posix.basename(normalized, extension).replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-|-$/g, "") || "asset";
+  const hash = sha256Hex(new TextEncoder().encode(normalized)).slice(0, 12);
+  return `${base}-${hash}${extension || ".bin"}`;
+}
+
+function stripTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
 }
 
 function isSnapshotAssetPath(assetPath: string): boolean {
