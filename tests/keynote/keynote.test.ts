@@ -7,6 +7,7 @@ import { deflateRawSync } from "node:zlib";
 
 import { detectNativeKeynotePackage, exportKeynoteToPptx, parseKeynoteToIr, parseNativeKeynoteToIr } from "../../src/keynote/index.ts";
 import { validateIR } from "../../src/ir/index.ts";
+import { createSlideTimingPlan } from "../../src/runtime/index.ts";
 
 describe("Keynote bridge", () => {
   test("fails with a clear local automation error for missing input or unavailable Keynote", async () => {
@@ -796,6 +797,24 @@ describe("Keynote bridge", () => {
       ]
     );
     assert.equal(events[1]?.metadata?.nativeBuildStartsWithPrevious, true);
+    const edges = deck.deck.slides[0]?.timeline?.dependencyGraph?.edges ?? [];
+    assert.deepEqual(
+      edges.map((edge) => ({ from: edge.from, to: edge.to, relation: edge.relation, offsetMs: edge.offsetMs })),
+      [
+        {
+          from: events[0]!.id,
+          to: events[1]!.id,
+          relation: "with",
+          offsetMs: undefined
+        }
+      ]
+    );
+    assert.deepEqual(createSlideTimingPlan(deck.deck.slides[0]).starts, {
+      [events[0]!.id]: 0,
+      [events[1]!.id]: 0
+    });
+    assert.equal(deck.deck.slides[0]?.timeline?.metadata?.nativeBuildTimingDependencyCount, 1);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildTimingDependencyCount, 1);
     assert.equal(deck.deck.slides[0]?.timeline?.durationMs, 2500);
   });
 
@@ -834,6 +853,7 @@ describe("Keynote bridge", () => {
     assert.deepEqual(events[0]?.start, { type: "absolute", atMs: 1000 });
     assert.equal(events[0]?.metadata?.nativeBuildStartRelation, "afterPrevious");
     assert.equal(events[0]?.metadata?.nativeBuildTimingRawField6, 1);
+    assert.deepEqual(deck.deck.slides[0]?.timeline?.dependencyGraph?.edges ?? [], []);
     assert.equal(deck.deck.slides[0]?.metadata?.nativeBuildAnimationUnresolvedCount, 1);
   });
 
@@ -897,6 +917,86 @@ describe("Keynote bridge", () => {
     assert.equal(events[1]?.metadata?.nativeBuildAfterPrevious, false);
     assert.equal(events[1]?.metadata?.nativeBuildTimingRawField5, 1);
     assert.equal(events[1]?.metadata?.nativeBuildTimingRawField6, 1);
+    const edges = deck.deck.slides[0]?.timeline?.dependencyGraph?.edges ?? [];
+    assert.deepEqual(
+      edges.map((edge) => ({ from: edge.from, to: edge.to, relation: edge.relation, offsetMs: edge.offsetMs })),
+      [
+        { from: events[0]!.id, to: events[1]!.id, relation: "with", offsetMs: undefined },
+        { from: events[0]!.id, to: events[2]!.id, relation: "with", offsetMs: undefined },
+        { from: events[0]!.id, to: events[3]!.id, relation: "after", offsetMs: undefined }
+      ]
+    );
+    assert.deepEqual(createSlideTimingPlan(deck.deck.slides[0]).starts, {
+      [events[0]!.id]: 0,
+      [events[1]!.id]: 0,
+      [events[2]!.id]: 0,
+      [events[3]!.id]: 1000
+    });
+    assert.equal(deck.deck.slides[0]?.timeline?.metadata?.nativeBuildTimingDependencyCount, 3);
+  });
+
+  test("links multi-target native builds as same-time timing dependencies", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-multi-target-timing-"));
+    const keyPath = path.join(dir, "timing.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(111, [
+          {
+            type: 3005,
+            payload: nativeImagePlacementPayload(42, { x: 10, y: 20, width: 100, height: 80 }),
+            dataReferences: [42],
+            objectReferences: [777]
+          }
+        ]),
+        iwaArchiveRecord(222, [
+          {
+            type: 3005,
+            payload: nativeImagePlacementPayload(42, { x: 140, y: 20, width: 100, height: 80 }),
+            dataReferences: [42],
+            objectReferences: [777]
+          }
+        ]),
+        iwaArchiveRecord(9001, [
+          {
+            type: 8,
+            payload: nativeBuildPayload({ targetId: 777, direction: "In", effect: "apple:bc-appear", durationSeconds: 1 })
+          }
+        ]),
+        iwaArchiveRecord(9002, [
+          { type: 153, payload: nativeBuildTimingPayload({ buildId: 9001, durationSeconds: 1, startsWithPrevious: false }) }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const slide = deck.deck.slides[0];
+    const events = slide?.timeline?.events ?? [];
+    assert.equal(events.length, 2);
+    assert.deepEqual(
+      events.map((event) => event.start),
+      [
+        { type: "absolute", atMs: 0 },
+        { type: "absolute", atMs: 0 }
+      ]
+    );
+    assert.deepEqual(slide?.timeline?.dependencyGraph?.edges, [
+      {
+        id: `native-timing-${events[0]!.id}-${events[1]!.id}-with`,
+        from: events[0]!.id,
+        to: events[1]!.id,
+        relation: "with"
+      }
+    ]);
+    assert.deepEqual(createSlideTimingPlan(slide).starts, {
+      [events[0]!.id]: 0,
+      [events[1]!.id]: 0
+    });
   });
 
   test("approximates native Keynote wipe as a bounds reveal", async () => {

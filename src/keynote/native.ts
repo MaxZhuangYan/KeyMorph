@@ -6,7 +6,17 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { inflateRawSync } from "node:zlib";
 
-import { IR_VERSION, type AnimationEvent, type Asset, type DeckIR, type IRObject, type JSONRecord, type KeyframeTrack, type Slide } from "../ir/index.ts";
+import {
+  IR_VERSION,
+  type AnimationEvent,
+  type Asset,
+  type DeckIR,
+  type IRObject,
+  type JSONRecord,
+  type KeyframeTrack,
+  type Slide,
+  type TimingDependencyEdge
+} from "../ir/index.ts";
 
 const DEFAULT_DECK_SIZE = { width: 1280, height: 720 };
 const MAX_TEXT_CANDIDATES_PER_STREAM = 80;
@@ -1488,14 +1498,15 @@ function buildNativeSlides(
       timeline: {
         durationMs: buildAnimationRecovery.durationMs,
         events: buildAnimationRecovery.events,
-        dependencyGraph: { edges: [] },
+        dependencyGraph: { edges: buildAnimationRecovery.dependencyEdges },
         ...(buildAnimationRecovery.buildRecords.length > 0 || buildAnimationRecovery.timingRecords.length > 0
           ? {
               metadata: {
                 nativeBuildRecordCount: buildAnimationRecovery.buildRecords.length,
                 nativeBuildTimingRecordCount: buildAnimationRecovery.timingRecords.length,
                 nativeBuildAnimationRecoveredCount: buildAnimationRecovery.events.length,
-                nativeBuildAnimationUnresolvedCount: buildAnimationRecovery.unresolvedBuildCount
+                nativeBuildAnimationUnresolvedCount: buildAnimationRecovery.unresolvedBuildCount,
+                nativeBuildTimingDependencyCount: buildAnimationRecovery.dependencyEdges.length
               }
             }
           : {})
@@ -1522,6 +1533,7 @@ function buildNativeSlides(
         nativeBuildTimingRecordCount: buildAnimationRecovery.timingRecords.length,
         nativeBuildAnimationRecoveredCount: buildAnimationRecovery.events.length,
         nativeBuildAnimationUnresolvedCount: buildAnimationRecovery.unresolvedBuildCount,
+        nativeBuildTimingDependencyCount: buildAnimationRecovery.dependencyEdges.length,
         ...(buildAnimationRecovery.buildRecords.length > 0
           ? { nativeBuildRecords: buildAnimationRecovery.buildRecords.slice(0, 24) }
           : {}),
@@ -2246,10 +2258,18 @@ function nativePlacementGroupKey(object: IRObject): string | undefined {
 
 interface NativeBuildAnimationRecovery {
   events: AnimationEvent[];
+  dependencyEdges: TimingDependencyEdge[];
   durationMs: number;
   buildRecords: NativeIwaBuildEvidence[];
   timingRecords: NativeIwaBuildTimingEvidence[];
   unresolvedBuildCount: number;
+}
+
+interface NativeBuildTimingAnchor {
+  primaryEventId: string;
+  eventIds: string[];
+  startMs: number;
+  durationMs: number;
 }
 
 function recoverNativeBuildAnimations(
@@ -2262,7 +2282,7 @@ function recoverNativeBuildAnimations(
     .map((message) => message.buildTiming)
     .filter((timing): timing is NativeIwaBuildTimingEvidence => Boolean(timing));
   if (buildRecords.length === 0) {
-    return { events: [], durationMs: 2500, buildRecords, timingRecords, unresolvedBuildCount: 0 };
+    return { events: [], dependencyEdges: [], durationMs: 2500, buildRecords, timingRecords, unresolvedBuildCount: 0 };
   }
 
   const objectLookup = createNativeBuildObjectLookup(objects);
@@ -2281,8 +2301,11 @@ function recoverNativeBuildAnimations(
   const sequencedBuilds = sequenceNativeBuildRecords(buildRecords, timingRecords, buildById);
 
   const events: AnimationEvent[] = [];
+  const dependencyEdges: TimingDependencyEdge[] = [];
   let cursorMs = 0;
+  let cursorAnchor: NativeBuildTimingAnchor | undefined;
   let groupStartMs = 0;
+  let groupAnchor: NativeBuildTimingAnchor | undefined;
   let unresolvedBuildCount = 0;
   for (const [index, build] of sequencedBuilds.entries()) {
     const timing = build.buildId ? timingByBuildId.get(build.buildId) : undefined;
@@ -2292,19 +2315,50 @@ function recoverNativeBuildAnimations(
     const startsWithPrevious = isNativeTimingWithPrevious(timing);
     const baseStartMs = startsWithPrevious ? groupStartMs : cursorMs;
     const startMs = baseStartMs + delayMs;
-    let generatedEventCount = 0;
+    const sequenceReference = cursorAnchor;
+    const groupReference = groupAnchor ?? cursorAnchor;
+    const generatedEvents: AnimationEvent[] = [];
     for (const [targetIndex, resolution] of resolutions.entries()) {
       const event = nativeBuildEventFromEvidence(slideId, index, targetIndex, build, timing, resolution, startMs, durationMs);
       if (event) {
         events.push(event);
-        generatedEventCount += 1;
+        generatedEvents.push(event);
       }
     }
+
+    const generatedAnchor = createNativeBuildTimingAnchor(generatedEvents, startMs, durationMs);
+    if (generatedAnchor) {
+      addNativeBuildSiblingTimingEdges(dependencyEdges, generatedAnchor);
+      if (startsWithPrevious) {
+        addNativeBuildTimingDependencyEdge(
+          dependencyEdges,
+          groupReference?.primaryEventId,
+          generatedAnchor.primaryEventId,
+          "with",
+          startMs - (groupReference?.startMs ?? startMs)
+        );
+      } else if (sequenceReference) {
+        addNativeBuildTimingDependencyEdge(
+          dependencyEdges,
+          sequenceReference.primaryEventId,
+          generatedAnchor.primaryEventId,
+          "after",
+          startMs - (sequenceReference.startMs + sequenceReference.durationMs)
+        );
+      }
+    }
+
+    const generatedEventCount = generatedEvents.length;
     if (generatedEventCount > 0 || timing || build.durationMs !== undefined) {
       if (!startsWithPrevious) {
         groupStartMs = startMs;
+        groupAnchor = generatedAnchor;
       }
-      cursorMs = Math.max(cursorMs, startMs + durationMs);
+      const endMs = startMs + durationMs;
+      if (!cursorAnchor || endMs > cursorMs) {
+        cursorMs = endMs;
+        cursorAnchor = generatedAnchor;
+      }
     }
     if (generatedEventCount === 0) {
       unresolvedBuildCount += 1;
@@ -2313,6 +2367,7 @@ function recoverNativeBuildAnimations(
 
   return {
     events,
+    dependencyEdges,
     durationMs: Math.max(2500, events.reduce((max, event) => Math.max(max, eventEndMs(event)), 0) + 500),
     buildRecords,
     timingRecords,
@@ -2322,6 +2377,48 @@ function recoverNativeBuildAnimations(
 
 function isNativeTimingWithPrevious(timing: NativeIwaBuildTimingEvidence | undefined): boolean {
   return timing?.startRelation === "withPrevious" || timing?.startsWithPrevious === true;
+}
+
+function createNativeBuildTimingAnchor(events: AnimationEvent[], startMs: number, durationMs: number): NativeBuildTimingAnchor | undefined {
+  if (events.length === 0) {
+    return undefined;
+  }
+  return {
+    primaryEventId: events[0]!.id,
+    eventIds: events.map((event) => event.id),
+    startMs,
+    durationMs
+  };
+}
+
+function addNativeBuildSiblingTimingEdges(edges: TimingDependencyEdge[], anchor: NativeBuildTimingAnchor): void {
+  for (const eventId of anchor.eventIds.slice(1)) {
+    addNativeBuildTimingDependencyEdge(edges, anchor.primaryEventId, eventId, "with", 0);
+  }
+}
+
+function addNativeBuildTimingDependencyEdge(
+  edges: TimingDependencyEdge[],
+  from: string | undefined,
+  to: string | undefined,
+  relation: TimingDependencyEdge["relation"],
+  offsetMs: number
+): void {
+  if (!from || !to || from === to) {
+    return;
+  }
+  const roundedOffsetMs = Number.isFinite(offsetMs) ? Math.round(offsetMs) : 0;
+  const key = `${from}|${to}|${relation}|${roundedOffsetMs}`;
+  if (edges.some((edge) => `${edge.from}|${edge.to}|${edge.relation}|${Math.round(Number(edge.offsetMs ?? 0))}` === key)) {
+    return;
+  }
+  edges.push({
+    id: `native-timing-${nativeBuildSlug(from)}-${nativeBuildSlug(to)}-${relation}`,
+    from,
+    to,
+    relation,
+    ...(roundedOffsetMs !== 0 ? { offsetMs: roundedOffsetMs } : {})
+  });
 }
 
 function createNativeBuildObjectLookup(objects: IRObject[]): Map<string, Array<{ object: IRObject; method: string }>> {
