@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
-import type { DeckIR } from "../ir/index.ts";
+import type { DeckIR, IRObject } from "../ir/index.ts";
 import { parsePptxToIr, exportIrToPptx } from "../pptx/index.ts";
 import { parseNativeKeynoteToIr } from "./native.ts";
 
@@ -22,6 +22,11 @@ export type {
 } from "./native.ts";
 
 const execFileAsync = promisify(execFile);
+const INTERNAL_KEYNOTE_EXPORT_CHECK_MARKERS = [
+  "KeyMorph Export Check",
+  "Native Size AppleScript verification",
+  "AppleScript verification"
+];
 
 export interface KeynoteImportOptions {
   exportedPptxPath?: string;
@@ -37,6 +42,7 @@ export interface KeynoteExportOptions {
   intermediatePptxPath?: string;
   automationTimeoutMs?: number;
   allowAutomation?: boolean;
+  keynoteImport?: (pptxPath: string, keynotePath: string, options: KeynoteAutomationOptions) => Promise<void>;
 }
 
 export interface KeynoteHtmlExportOptions {
@@ -128,10 +134,17 @@ export async function exportIrToKeynote(deck: DeckIR, keynotePath: string, optio
     path.join(path.dirname(keynotePath), `${path.basename(keynotePath, path.extname(keynotePath))}.pptx`);
   await mkdir(path.dirname(pptxPath), { recursive: true });
   await exportIrToPptx(deck, pptxPath);
-  await importPptxAndSaveKeynote(pptxPath, keynotePath, {
-    automationTimeoutMs: options.automationTimeoutMs,
-    allowAutomation: options.allowAutomation
-  });
+  await rm(keynotePath, { recursive: true, force: true });
+  try {
+    await (options.keynoteImport ?? importPptxAndSaveKeynote)(pptxPath, keynotePath, {
+      automationTimeoutMs: options.automationTimeoutMs,
+      allowAutomation: options.allowAutomation
+    });
+    await assertKeynoteExportLooksUsable(keynotePath);
+  } catch (error) {
+    await rm(keynotePath, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export interface KeynoteExportResult {
@@ -223,6 +236,7 @@ export async function importPptxAndSaveKeynote(pptxPath: string, keynotePath: st
   await assertReadableFile(pptxPath, "Input PPTX file");
   assertAutomationAllowed(options);
   await mkdir(path.dirname(keynotePath), { recursive: true });
+  await rm(keynotePath, { recursive: true, force: true });
   await runAppleScript(`
 set inputFile to POSIX file "${escapeAppleScriptString(path.resolve(pptxPath))}"
 set outputFile to POSIX file "${escapeAppleScriptString(path.resolve(keynotePath))}"
@@ -233,6 +247,54 @@ tell application "Keynote"
   close theDocument saving no
 end tell
 `, options);
+}
+
+async function assertKeynoteExportLooksUsable(keynotePath: string): Promise<void> {
+  if (!(await fileExistsWithContent(keynotePath))) {
+    throw new Error(`Keynote export did not create an output file: ${keynotePath}`);
+  }
+
+  let exportedDeck: DeckIR;
+  try {
+    exportedDeck = await parseNativeKeynoteToIr(keynotePath);
+  } catch {
+    return;
+  }
+
+  const recoveredText = collectDeckText(exportedDeck).join("\n");
+  const marker = INTERNAL_KEYNOTE_EXPORT_CHECK_MARKERS.find((candidate) => recoveredText.includes(candidate));
+  if (!marker) {
+    return;
+  }
+
+  throw new Error(
+    `Keynote export produced KeyMorph's internal verification deck (${marker}) instead of the converted presentation. The invalid output was removed; restart Keynote and retry the export.`
+  );
+}
+
+function collectDeckText(deck: DeckIR): string[] {
+  const text: string[] = [];
+  if (deck.deck.title) text.push(deck.deck.title);
+  if (deck.metadata?.title) text.push(deck.metadata.title);
+  for (const slide of deck.deck.slides) {
+    if (slide.name) text.push(slide.name);
+    for (const object of slide.objects) {
+      collectObjectText(object, text);
+    }
+  }
+  return text;
+}
+
+function collectObjectText(object: IRObject, text: string[]): void {
+  if (object.name) text.push(object.name);
+  if ((object.type === "text" || object.type === "shape") && object.text?.plainText) {
+    text.push(object.text.plainText);
+  }
+  if (object.type === "group") {
+    for (const child of object.children) {
+      collectObjectText(child, text);
+    }
+  }
 }
 
 function assertAutomationAllowed(options: KeynoteAutomationOptions = {}): void {

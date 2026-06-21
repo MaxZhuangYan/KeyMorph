@@ -360,7 +360,7 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
   manifest.runtime = runtime;
   manifest.artifacts.runtimeHtml = "runtime.html";
   manifest.artifacts.irRuntimeHtml = runtime.irHtmlPath ? "runtime-ir.html" : null;
-  manifest.artifacts.keynoteHtml = runtime.mode === "keynote-html" ? "keynote-html/index.html" : null;
+  manifest.artifacts.keynoteHtml = runtime.keynoteHtmlPath;
   manifest.artifacts.keynoteMovie = runtime.moviePath;
   manifest.artifacts.renderVideo = runtime.mode === "keynote-movie" ? runtime.moviePath : manifest.artifacts.renderVideo;
   await exportIrToPptx(deck, paths.rebuiltPptx);
@@ -1081,7 +1081,7 @@ async function fallbackKeynoteBridgeIr(sourcePath: string, validation: ReturnTyp
     severity: "warning",
     code: "keynote-bridge-ir-validation-fallback",
     message:
-      "Keynote PPTX bridge produced unsupported timing dependency semantics, so native IR probing was used for analysis while Keynote HTML remains the preferred runtime."
+      "Keynote PPTX bridge produced unsupported timing dependency semantics, so native IR probing was used for analysis while the KeyMorph IR runtime remains the default preview."
   });
   deck.conversion.degradedFeatures ??= [];
   deck.conversion.degradedFeatures.push({
@@ -1089,7 +1089,7 @@ async function fallbackKeynoteBridgeIr(sourcePath: string, validation: ReturnTyp
     severity: "warning",
     area: "animation",
     description: `Keynote-exported PPTX timing graph did not validate: ${validation.errors.map((error) => error.message).join(" ")}`,
-    fallback: "Use Keynote native HTML export for animated playback and keep native IR probing for analysis artifacts."
+    fallback: "Use KeyMorph IR runtime for preview and keep native IR probing for analysis artifacts."
   });
   return deck;
 }
@@ -1127,13 +1127,14 @@ async function prepareBundleRuntime(input: {
         allowAutomation: input.allowKeynoteAutomation,
         automationTimeoutMs: input.keynoteAutomationTimeoutMs
       });
-      await writeFile(input.paths.runtimeHtml, renderKeynoteHtmlRuntimeWrapper("keynote-html/index.html"), "utf8");
+      await copyFile(input.paths.irRuntimeHtml, input.paths.runtimeHtml);
       return {
-        mode: "keynote-html",
-        fidelity: "keynote-native",
-        message: "Runtime preview uses Keynote's native HTML export for high-resolution animated playback.",
+        mode: "keymorph-ir",
+        fidelity: "ir-reconstructed",
+        message:
+          "Runtime preview uses the KeyMorph IR. Keynote's native HTML export was preserved separately for comparison because it can expose Keynote template/check pages.",
         htmlPath: "runtime.html",
-        irHtmlPath: "runtime-ir.html",
+        irHtmlPath: null,
         moviePath: null,
         keynoteHtmlPath: "keynote-html/index.html"
       };
@@ -1254,35 +1255,8 @@ function renderMovieRuntimeHtml(moviePath: string): string {
 `;
 }
 
-function renderKeynoteHtmlRuntimeWrapper(entryPath: string): string {
-  const escapedPath = escapeHtmlAttr(entryPath);
-  const escapedScriptPath = escapeJsString(entryPath);
-  return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta http-equiv="refresh" content="0; url=${escapedPath}">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>KeyMorph Keynote Runtime</title>
-  <style>
-    html, body { width: 100%; height: 100%; margin: 0; background: #000; color: #fff; font-family: system-ui, sans-serif; }
-    a { color: #fff; }
-  </style>
-  <script>location.replace("${escapedScriptPath}");</script>
-</head>
-<body>
-  <a href="${escapedPath}">Open Keynote runtime</a>
-</body>
-</html>
-`;
-}
-
 function escapeHtmlAttr(value: string): string {
   return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char);
-}
-
-function escapeJsString(value: string): string {
-  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/</g, "\\x3c");
 }
 
 function detectInputKind(fileName: string): ProductInputKind {

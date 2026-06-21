@@ -181,7 +181,7 @@ describe("product bundle workflow", () => {
     assert.equal(deck.conversion.messages.some((message) => message.code === "keynote-native-assets-materialized"), true);
   });
 
-  test("falls back to Keynote HTML runtime when movie export is unavailable", async () => {
+  test("preserves Keynote HTML separately without replacing the default IR runtime", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-keynote-html-"));
     const inputPath = path.join(dir, "source.key");
     const bundleDir = path.join(dir, "bundle");
@@ -198,17 +198,23 @@ describe("product bundle workflow", () => {
       },
       keynoteHtmlExport: async (_keynotePath, outputDir) => {
         await mkdir(outputDir, { recursive: true });
-        await writeFile(path.join(outputDir, "index.html"), "<!doctype html><title>Keynote Native Runtime</title>", "utf8");
+        await writeFile(
+          path.join(outputDir, "index.html"),
+          "<!doctype html><title>Keynote Native Runtime</title><h1>KeyMorph Export Check</h1><p>Native Size AppleScript verification</p><p>作者和日期</p>",
+          "utf8"
+        );
       }
     });
 
     const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
     const runtimeHtml = await readFile(path.join(bundleDir, "runtime.html"), "utf8");
 
-    assert.equal(manifest.runtime.mode, "keynote-html");
+    assert.equal(manifest.runtime.mode, "keymorph-ir");
     assert.equal(manifest.artifacts.keynoteMovie, null);
     assert.equal(manifest.artifacts.keynoteHtml, "keynote-html/index.html");
-    assert.match(runtimeHtml, /location\.replace\("keynote-html\/index\.html"\)/);
+    assert.match(runtimeHtml, /window\.__KEYMORPH_DECK__/);
+    assert.doesNotMatch(runtimeHtml, /location\.replace\("keynote-html\/index\.html"\)/);
+    assert.doesNotMatch(runtimeHtml, /KeyMorph Export Check/);
     assert.match(await readFile(path.join(bundleDir, "keynote-html", "index.html"), "utf8"), /Keynote Native Runtime/);
   });
 

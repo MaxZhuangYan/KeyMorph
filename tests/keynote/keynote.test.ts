@@ -1,11 +1,12 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { deflateRawSync } from "node:zlib";
 
-import { detectNativeKeynotePackage, exportKeynoteToPptx, parseKeynoteToIr, parseNativeKeynoteToIr } from "../../src/keynote/index.ts";
+import { detectNativeKeynotePackage, exportIrToKeynote, exportKeynoteToPptx, parseKeynoteToIr, parseNativeKeynoteToIr } from "../../src/keynote/index.ts";
+import { createDemoDeck } from "../../src/demo/createDemoDeck.ts";
 import { validateIR } from "../../src/ir/index.ts";
 import { createSlideTimingPlan } from "../../src/runtime/index.ts";
 
@@ -26,6 +27,31 @@ describe("Keynote bridge", () => {
         /Keynote GUI automation is disabled by default/
       );
     });
+  });
+
+  test("rejects internal verification decks produced by the Keynote export bridge", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-export-check-"));
+    const keyPath = path.join(dir, "rebuilt.key");
+
+    await assert.rejects(
+      () =>
+        exportIrToKeynote(createDemoDeck(), keyPath, {
+          allowAutomation: true,
+          keynoteImport: async (_pptxPath, outputKeyPath) => {
+            await mkdir(path.join(outputKeyPath, "Index"), { recursive: true });
+            await writeFile(
+              path.join(outputKeyPath, "Index", "Slide-1.iwa"),
+              concat([
+                protoString("KeyMorph Export Check"),
+                protoString("Native Size AppleScript verification"),
+                protoString("作者和日期")
+              ])
+            );
+          }
+        }),
+      /internal verification deck/
+    );
+    await assert.rejects(() => stat(keyPath), /ENOENT/);
   });
 
   test("detects and parses a native directory-style .key package", async () => {
