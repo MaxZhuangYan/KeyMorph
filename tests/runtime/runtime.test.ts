@@ -102,6 +102,40 @@ describe("HTML runtime rendering", () => {
     assert.match(html, /km-image-content/);
   });
 
+  test("renders image fill backgrounds with explicit fit CSS", () => {
+    const deck = createShapeImageFillDeck("cover");
+    const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);
+
+    assert.match(markup, /background-image:url\("data:image\/jpeg;base64,AA=="\)/);
+    assert.match(markup, /background-size:cover/);
+    assert.match(markup, /background-repeat:no-repeat/);
+    assert.match(markup, /background-position:center center/);
+  });
+
+  test("converts image fill keyframes to explicit background fit CSS", () => {
+    const frames = keyframeEventToCssFrames({
+      id: "fill",
+      kind: "keyframes",
+      targetId: "box",
+      durationMs: 1000,
+      tracks: [
+        {
+          property: "style.fill",
+          keyframes: [
+            { offset: 0, value: { type: "solid", color: "#ffffff" } },
+            { offset: 1, value: { type: "image", source: { uri: "asset.jpg" }, fit: "contain" } }
+          ]
+        }
+      ]
+    });
+
+    assert.equal(frames[0]?.background, "#ffffff");
+    assert.equal(frames[1]?.["background-image"], 'url("asset.jpg")');
+    assert.equal(frames[1]?.["background-size"], "contain");
+    assert.equal(frames[1]?.["background-repeat"], "no-repeat");
+    assert.equal(frames[1]?.["background-position"], "center center");
+  });
+
   test("converts keyframe event tracks to CSS frames", () => {
     const event = createDemoDeck().deck.slides[0].timeline?.events[0];
 
@@ -853,6 +887,37 @@ function createStaticCropDeck(): DeckIR {
               bounds: { x: 10, y: 20, width: 200, height: 100 },
               source: { assetId: "asset" },
               crop: { x: 0.25, y: 0.25, width: 0.5, height: 0.5, unit: "ratio" }
+            }
+          ],
+          timeline: { durationMs: 1000, events: [] }
+        }
+      ]
+    }
+  };
+}
+
+function createShapeImageFillDeck(fit: "cover" | "contain" | "stretch" | "tile"): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "image-background",
+      size: { width: 400, height: 200, unit: "px" },
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "shape",
+              type: "shape",
+              shape: "rect",
+              bounds: { x: 0, y: 0, width: 400, height: 200 },
+              style: {
+                fill: {
+                  type: "image",
+                  fit,
+                  source: { dataUri: "data:image/jpeg;base64,AA==" }
+                }
+              }
             }
           ],
           timeline: { durationMs: 1000, events: [] }

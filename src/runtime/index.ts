@@ -677,6 +677,13 @@ function runtimeScript(): string {
     if (color && typeof color === "object" && "value" in color) return String(color.value);
     return undefined;
   };
+  const imageFillCssParts = (input) => {
+    const fit = input?.fit || "stretch";
+    if (fit === "cover") return { size: "cover", repeat: "no-repeat", position: "center center" };
+    if (fit === "contain") return { size: "contain", repeat: "no-repeat", position: "center center" };
+    if (fit === "tile") return { size: "auto", repeat: "repeat", position: "left top" };
+    return { size: "100% 100%", repeat: "no-repeat", position: "center center" };
+  };
   const fillCss = (input) => {
     if (!input) return undefined;
     if (input.type === "solid") return colorCss(input.color);
@@ -692,6 +699,35 @@ function runtimeScript(): string {
     }
     if (typeof input === "string") return input;
     return undefined;
+  };
+  const backgroundStyleCss = (input, fallback) => {
+    const background = fillCss(input) || fallback;
+    if (input?.type !== "image") return "background:" + background;
+    const parts = imageFillCssParts(input);
+    return [
+      "background-image:" + background,
+      "background-size:" + parts.size,
+      "background-repeat:" + parts.repeat,
+      "background-position:" + parts.position,
+      "background-color:transparent"
+    ].join(";");
+  };
+  const applyBackgroundStyle = (el, input, fallback) => {
+    if (!el) return;
+    const background = fillCss(input) || fallback;
+    if (input?.type !== "image") {
+      el.style.background = background;
+      el.style.backgroundSize = "";
+      el.style.backgroundRepeat = "";
+      el.style.backgroundPosition = "";
+      return;
+    }
+    const parts = imageFillCssParts(input);
+    el.style.backgroundImage = background;
+    el.style.backgroundSize = parts.size;
+    el.style.backgroundRepeat = parts.repeat;
+    el.style.backgroundPosition = parts.position;
+    el.style.backgroundColor = "transparent";
   };
   const strokeColorCss = (stroke) => colorCss(stroke?.color) || "transparent";
   const textOf = (object, statePatch) => statePatch?.text?.plainText || (statePatch?.text?.runs || []).map((run) => run.text).join("") || object.text?.plainText || (object.text?.runs || []).map((run) => run.text).join("") || "";
@@ -910,7 +946,7 @@ function runtimeScript(): string {
       "filter:" + filterCss(current.filter)
     ];
     if (object.type === "shape" || object.type === "placeholder") {
-      parts.push("background:" + (fillCss(style.fill) || "#e2e8f0"));
+      parts.push(backgroundStyleCss(style.fill, "#e2e8f0"));
       parts.push("border:" + Number(stroke.width || 0) + "px solid " + strokeColorCss(stroke));
       if (object.shape === "ellipse") parts.push("border-radius:999px");
       if (object.shape === "roundRect") parts.push("border-radius:8px");
@@ -932,8 +968,7 @@ function runtimeScript(): string {
     return '<div ' + common + '"></div>';
   };
   const layerHtml = (slide, layerName) => {
-    const background = fillCss(slide.background) || "#fff";
-    return '<div class="km-slide-layer" data-layer="' + layerName + '" style="background:' + background + '">' + (slide.objects || []).map(objectHtml).join("") + '</div>';
+    return '<div class="km-slide-layer" data-layer="' + layerName + '" style="' + backgroundStyleCss(slide.background, "#fff") + '">' + (slide.objects || []).map(objectHtml).join("") + '</div>';
   };
   const flattenObjects = (objects, out = []) => {
     for (const object of objects || []) {
@@ -1506,7 +1541,7 @@ function runtimeScript(): string {
     if (object.type === "shape" || object.type === "placeholder") {
       const style = statePatch.style || {};
       const stroke = style.stroke || {};
-      el.style.background = fillCss(style.fill) || "#e2e8f0";
+      applyBackgroundStyle(el, style.fill, "#e2e8f0");
       el.style.border = Number(stroke.width || 0) + "px solid " + strokeColorCss(stroke);
     }
     if (object.type === "image") applyImageCrop(el, object, statePatch);
@@ -1688,7 +1723,7 @@ function runtimeScript(): string {
     if (!slide) return;
     stage.style.width = deck.deck.size.width + "px";
     stage.style.height = deck.deck.size.height + "px";
-    stage.style.background = fillCss(slide.background) || "#fff";
+    applyBackgroundStyle(stage, slide.background, "#fff");
     const key = resolution.inTransition ? "transition:" + resolution.previousSlideIndex + ":" + resolution.slideIndex : "slide:" + resolution.slideIndex;
     if (state.renderedKey !== key) {
       if (resolution.inTransition) {
@@ -1891,6 +1926,10 @@ function runtimeScript(): string {
     },
     layers: Array.from(stage.querySelectorAll(".km-slide-layer")).map((layer) => ({
       layer: layer.getAttribute("data-layer") || "",
+      backgroundImage: layer.style.backgroundImage,
+      backgroundSize: layer.style.backgroundSize,
+      backgroundRepeat: layer.style.backgroundRepeat,
+      backgroundPosition: layer.style.backgroundPosition,
       opacity: layer.style.opacity,
       transform: layer.style.transform,
       clipPath: layer.style.clipPath,
@@ -2113,7 +2152,7 @@ function objectStyle(object: IRObject): string {
   }
 
   if (object.type === "shape" || object.type === "placeholder") {
-    style.push(`background:${fillToCss(state.style?.fill) ?? "#e2e8f0"}`);
+    style.push(...backgroundStyleEntries(state.style?.fill, "#e2e8f0"));
     const stroke = state.style?.stroke;
     if (stroke) {
       style.push(`border:${stroke.width ?? 1}px solid ${colorToCss(stroke.color) ?? "transparent"}`);
@@ -3068,6 +3107,43 @@ function fillToCss(fill: Fill | undefined): string | undefined {
   return undefined;
 }
 
+function backgroundStyleEntries(fill: Fill | undefined, fallback: string): string[] {
+  const background = fillToCss(fill) ?? fallback;
+  if (fill?.type !== "image") return [`background:${background}`];
+  const parts = imageFillCssParts(fill);
+  return [
+    `background-image:${background}`,
+    `background-size:${parts.size}`,
+    `background-repeat:${parts.repeat}`,
+    `background-position:${parts.position}`,
+    "background-color:transparent"
+  ];
+}
+
+function backgroundStyleRecord(fill: Fill | undefined, fallback: string): Record<string, string> {
+  const record: Record<string, string> = {};
+  for (const entry of backgroundStyleEntries(fill, fallback)) {
+    const separatorIndex = entry.indexOf(":");
+    if (separatorIndex <= 0) continue;
+    record[entry.slice(0, separatorIndex)] = entry.slice(separatorIndex + 1);
+  }
+  return record;
+}
+
+function imageFillCssParts(fill: Extract<Fill, { type: "image" }>): { size: string; repeat: string; position: string } {
+  switch (fill.fit ?? "stretch") {
+    case "cover":
+      return { size: "cover", repeat: "no-repeat", position: "center center" };
+    case "contain":
+      return { size: "contain", repeat: "no-repeat", position: "center center" };
+    case "tile":
+      return { size: "auto", repeat: "repeat", position: "left top" };
+    case "stretch":
+    default:
+      return { size: "100% 100%", repeat: "no-repeat", position: "center center" };
+  }
+}
+
 function colorToCss(color: unknown): string | undefined {
   if (typeof color === "string") return color;
   if (color && typeof color === "object" && "value" in color) return String(color.value);
@@ -3152,7 +3228,7 @@ function propertyValueToCss(property: string, value: unknown): Record<string, st
   if (normalized === "bounds.width") return { width: `${value}px` };
   if (normalized === "bounds.height") return { height: `${value}px` };
   if (normalized === "filter.blurPx") return { filter: filterToCss({ blurPx: finiteNumber(value) ?? 0 }) };
-  if (normalized === "style.fill") return { background: fillToCss(value as Fill) ?? String(value) };
+  if (normalized === "style.fill") return backgroundStyleRecord(value as Fill, String(value));
   return {};
 }
 
