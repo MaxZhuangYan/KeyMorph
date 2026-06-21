@@ -2259,12 +2259,13 @@ function createNativeStyledTextRuns(
     if (!runText) {
       continue;
     }
+    const style = nativeTextStyleAtOffset(start, textEntry, textStyleMap, fallbackStyle);
     runs.push({
       text: runText,
-      style: nativeTextStyleAtOffset(start, textEntry, textStyleMap, fallbackStyle)
+      style: sanitizeNativeTextRunStyle(runText, style, fallbackStyle)
     });
   }
-  return runs.length > 0 ? runs : [{ text, style: fallbackStyle }];
+  return runs.length > 0 ? runs : [{ text, style: sanitizeNativeTextRunStyle(text, fallbackStyle, fallbackStyle) }];
 }
 
 function nativeTextStyleAtOffset(
@@ -2287,6 +2288,27 @@ function nativeTextStyleAtOffset(
 function withoutFallbackColor(style: TextStyle): TextStyle {
   const { color: _color, ...rest } = style;
   return rest;
+}
+
+function sanitizeNativeTextRunStyle(runText: string, style: TextStyle, fallbackStyle: TextStyle): TextStyle {
+  if (!hasCjkText(runText) || !isLatinSerifFallbackFont(style.fontFamily)) {
+    return compactTextStyle(style);
+  }
+  return compactTextStyle({
+    ...style,
+    fontFamily: fallbackStyle.fontFamily ?? "Helvetica Neue"
+  });
+}
+
+function hasCjkText(text: string): boolean {
+  return /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text);
+}
+
+function isLatinSerifFallbackFont(fontFamily: string | undefined): boolean {
+  if (!fontFamily) {
+    return false;
+  }
+  return /^(?:times(?:-roman| new roman)?|serif)$/i.test(fontFamily.trim().replace(/^["']|["']$/g, ""));
 }
 
 function resolveNativeStyleForOffset(
@@ -3009,6 +3031,7 @@ function recoverNativeBuildAnimations(
       unresolvedBuildCount += 1;
     }
   }
+  applyNativeBuildInitialStates(objects, events);
 
   return {
     events,
@@ -3019,6 +3042,59 @@ function recoverNativeBuildAnimations(
     timingRecords,
     unresolvedBuildCount
   };
+}
+
+function applyNativeBuildInitialStates(objects: IRObject[], events: AnimationEvent[]): void {
+  const objectById = new Map(flattenIRObjects(objects).map((object) => [object.id, object]));
+  const earliestByTarget = new Map<string, AnimationEvent>();
+  for (const event of events) {
+    if (!event.targetId || nativeBuildOpacityStartValue(event) === undefined) {
+      continue;
+    }
+    const previous = earliestByTarget.get(event.targetId);
+    if (!previous || animationEventStartMs(event) < animationEventStartMs(previous)) {
+      earliestByTarget.set(event.targetId, event);
+    }
+  }
+  for (const [targetId, event] of earliestByTarget) {
+    const object = objectById.get(targetId);
+    if (!object || object.opacity === 0 || nativeBuildOpacityStartValue(event) !== 0) {
+      continue;
+    }
+    object.initialState = {
+      ...(object.initialState ?? {}),
+      opacity: 0
+    };
+    object.metadata = {
+      ...(object.metadata ?? {}),
+      nativeInitialOpacityFromBuild: event.id
+    };
+  }
+}
+
+function nativeBuildOpacityStartValue(event: AnimationEvent): number | undefined {
+  if (event.kind !== "keyframes") {
+    return undefined;
+  }
+  const opacityTrack = event.tracks.find((track) => track.property === "opacity");
+  const first = opacityTrack?.keyframes
+    .slice()
+    .sort((left, right) => left.offset - right.offset)[0]?.value;
+  return typeof first === "number" ? first : undefined;
+}
+
+function animationEventStartMs(event: AnimationEvent): number {
+  return event.start?.type === "absolute" ? Math.max(0, event.start.atMs) : Math.max(0, event.delayMs ?? 0);
+}
+
+function flattenIRObjects(objects: IRObject[], out: IRObject[] = []): IRObject[] {
+  for (const object of objects) {
+    out.push(object);
+    if (object.type === "group") {
+      flattenIRObjects(object.children, out);
+    }
+  }
+  return out;
 }
 
 function isNativeTimingWithPrevious(timing: NativeIwaBuildTimingEvidence | undefined): boolean {

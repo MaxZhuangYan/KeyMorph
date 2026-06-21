@@ -689,8 +689,12 @@ describe("Keynote bridge", () => {
     const event = deck.deck.slides[0]?.timeline?.events[0];
     assert.equal(event?.kind, "keyframes");
     assert.equal(event?.targetId, imageObjects.find((object) => object.metadata?.nativeArchiveIdentifier === "222")?.id);
+    const buildTarget = imageObjects.find((object) => object.metadata?.nativeArchiveIdentifier === "222");
+    assert.equal(buildTarget?.initialState?.opacity, 0);
+    assert.equal(buildTarget?.metadata?.nativeInitialOpacityFromBuild, event?.id);
     assert.equal(event?.metadata?.nativeBuildTargetId, "222");
     assert.equal(event?.metadata?.nativeBuildFallback, "blur-in");
+    assert.equal(event?.fill, "both");
     assert.equal(typeof event?.metadata?.nativeBuildDegradation, "string");
     assert.deepEqual(event?.kind === "keyframes" ? event.tracks.find((track) => track.property === "filter.blurPx")?.keyframes : undefined, [
       { offset: 0, value: 18 },
@@ -915,6 +919,9 @@ describe("Keynote bridge", () => {
     const appear = events.find((event) => event.metadata?.nativeBuildId === "1300");
     assert.equal(appear?.kind, "keyframes");
     assert.equal(appear?.targetId, object.id);
+    assert.equal(appear?.fill, "both");
+    assert.equal(object.initialState?.opacity, 0);
+    assert.equal(object.metadata?.nativeInitialOpacityFromBuild, appear?.id);
     const motion = events.find((event) => event.metadata?.nativeBuildId === "1400");
     assert.equal(motion?.kind, "keyframes");
     assert.equal(motion?.targetId, object.id);
@@ -1106,6 +1113,65 @@ describe("Keynote bridge", () => {
     assert.deepEqual(object.metadata?.nativeTextStyleIds, ["9100", "9200"]);
     assert.equal(object.metadata?.nativeParagraphStyleRunCount, 1);
     assert.equal(object.metadata?.nativeCharacterStyleRunCount, 1);
+  });
+
+  test("uses a CJK-safe fallback when native styles expose Times-Roman for Chinese text", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-cjk-font-fallback-"));
+    const keyPath = path.join(dir, "cjk-font-fallback.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    const stylesheetRecords = concat([
+      iwaArchiveRecord(9250, [
+        {
+          type: 2022,
+          payload: nativeParagraphStylePayload({
+            fontFamily: "AvenirNext-Regular",
+            fontSize: 38
+          }),
+          objectReferences: [9250]
+        }
+      ]),
+      iwaArchiveRecord(9251, [
+        {
+          type: 2021,
+          payload: nativeCharacterStylePayload({
+            fontFamily: "Times-Roman",
+            color: { red: 0.1, green: 0.2, blue: 0.3, alpha: 1 }
+          }),
+          objectReferences: [9251]
+        }
+      ])
+    ]);
+    await writeFile(path.join(keyPath, "Index", "DocumentStylesheet.iwa"), iwaSnappyChunks(splitBytes(stylesheetRecords, [17, 91])));
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      concat([
+        iwaArchiveRecord(1200, [{ type: 2001, payload: nativeStyledTextContentPayload("声望记录", { paragraphStyleId: 9250, characterStyleId: 9251 }) }]),
+        iwaArchiveRecord(1100, [
+          {
+            type: 2011,
+            payload: nativeTextDrawablePayload({
+              slideId: 900,
+              textId: 1200,
+              bounds: { x: 100, y: 120, width: 300, height: 80 }
+            })
+          }
+        ])
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.metadata?.nativeExtraction === "typed-iwa-text-drawable");
+    assert.equal(object?.type, "text");
+    if (object?.type !== "text") throw new Error("Expected native text drawable.");
+    assert.equal(object.text.plainText, "声望记录");
+    assert.deepEqual(object.text.runs?.[0]?.style, {
+      fontFamily: "Helvetica Neue",
+      fontSize: 34,
+      color: "#1a334d"
+    });
+    assert.deepEqual(object.metadata?.nativeTextStyleIds, ["9250", "9251"]);
   });
 
   test("applies native stylesheet to fallback protobuf text candidates", async () => {
