@@ -20,13 +20,26 @@ import {
 const EMU_PER_INCH = 914400;
 const WIDE_LAYOUT = { width: 13.333333, height: 7.5 };
 const OPENXML_ANGLE_UNITS_PER_DEGREE = 60000;
+const DEFAULT_SLIDE_SIZE: PptxSlideSize = {
+  width: 1280,
+  height: 720,
+  emuWidth: inchesToEmu(WIDE_LAYOUT.width),
+  emuHeight: inchesToEmu(WIDE_LAYOUT.height)
+};
+
+interface PptxSlideSize {
+  width: number;
+  height: number;
+  emuWidth: number;
+  emuHeight: number;
+}
 
 export async function parsePptxToIr(filePath: string): Promise<DeckIR> {
   const data = await readFile(filePath);
   const entries = readZipEntries(data);
   const presentationXml = getTextEntry(entries, "ppt/presentation.xml");
   const slidePaths = presentationXml ? readSlidePaths(entries, presentationXml) : [];
-  const size = presentationXml ? readSlideSize(presentationXml) : { width: 1280, height: 720 };
+  const size = presentationXml ? readSlideSize(presentationXml) : DEFAULT_SLIDE_SIZE;
   const slideResults = slidePaths.map((slidePath, index) => parseSlideXml(getTextEntry(entries, slidePath) ?? "", index, size, entries, slidePath));
   const slides = slideResults.map((result) => result.slide);
   const parsedSlides = slides.length
@@ -177,7 +190,7 @@ function parseSlideXml(
     const id = `slide-${index + 1}-object-${objectIndex + 1}`;
     const sourceShapeId = readShapeSourceId(shapeXml);
     const text = readShapeText(shapeXml);
-    const bounds = readShapeBounds(shapeXml, { x: 96 + objectIndex * 28, y: 96 + objectIndex * 28, width: 400, height: 100 });
+    const bounds = readShapeBounds(shapeXml, slideSize, { x: 96 + objectIndex * 28, y: 96 + objectIndex * 28, width: 400, height: 100 });
     if (text) {
       objects.push({
         id,
@@ -224,7 +237,12 @@ function parseSlideXml(
       id,
       type: "image",
       name: readShapeName(pictureXml) ?? "Picture",
-      bounds: readShapeBounds(pictureXml, { x: 96 + (shapeSources.length + pictureIndex) * 28, y: 96 + (shapeSources.length + pictureIndex) * 28, width: 400, height: 240 }),
+      bounds: readShapeBounds(pictureXml, slideSize, {
+        x: 96 + (shapeSources.length + pictureIndex) * 28,
+        y: 96 + (shapeSources.length + pictureIndex) * 28,
+        width: 400,
+        height: 240
+      }),
       opacity: 1,
       source: {
         ...(dataUriValue ? { dataUri: dataUriValue } : {}),
@@ -266,12 +284,16 @@ function readSlidePaths(entries: Map<string, Uint8Array>, presentationXml: strin
     .map((target) => normalizePartPath(`ppt/${target}`));
 }
 
-function readSlideSize(presentationXml: string): { width: number; height: number } {
+function readSlideSize(presentationXml: string): PptxSlideSize {
   const match = presentationXml.match(/<p:sldSz\b[^>]*cx="(\d+)"[^>]*cy="(\d+)"/);
-  if (!match) return { width: 1280, height: 720 };
+  if (!match) return DEFAULT_SLIDE_SIZE;
+  const emuWidth = Number(match[1]);
+  const emuHeight = Number(match[2]);
   return {
-    width: Math.round((Number(match[1]) / EMU_PER_INCH) * 96),
-    height: Math.round((Number(match[2]) / EMU_PER_INCH) * 96)
+    width: Math.round((emuWidth / EMU_PER_INCH) * 96),
+    height: Math.round((emuHeight / EMU_PER_INCH) * 96),
+    emuWidth,
+    emuHeight
   };
 }
 
@@ -318,15 +340,19 @@ function readShapeSourceId(source: string): string | undefined {
   return match ? unescapeXml(match[1]) : undefined;
 }
 
-function readShapeBounds(source: string, fallback: { x: number; y: number; width: number; height: number }) {
+function readShapeBounds(
+  source: string,
+  slideSize: PptxSlideSize,
+  fallback: { x: number; y: number; width: number; height: number }
+) {
   const offset = source.match(/<a:off\b[^>]*x="(-?\d+)"[^>]*y="(-?\d+)"/);
   const extent = source.match(/<a:ext\b[^>]*cx="(\d+)"[^>]*cy="(\d+)"/);
   if (!offset || !extent) return fallback;
   return {
-    x: emuToWidePx(Number(offset[1]), WIDE_LAYOUT.width),
-    y: emuToWidePx(Number(offset[2]), WIDE_LAYOUT.height),
-    width: emuToWidePx(Number(extent[1]), WIDE_LAYOUT.width),
-    height: emuToWidePx(Number(extent[2]), WIDE_LAYOUT.height)
+    x: emuToPx(Number(offset[1]), slideSize.emuWidth, slideSize.width),
+    y: emuToPx(Number(offset[2]), slideSize.emuHeight, slideSize.height),
+    width: emuToPx(Number(extent[1]), slideSize.emuWidth, slideSize.width),
+    height: emuToPx(Number(extent[2]), slideSize.emuHeight, slideSize.height)
   };
 }
 
@@ -1755,11 +1781,12 @@ function presentationXml(deck: DeckIR): string {
   const ids = deck.deck.slides
     .map((_, index) => `<p:sldId id="${256 + index}" r:id="rId${index + 2}"/>`)
     .join("");
+  const slideSize = deckToPptxSlideSize(deck);
   return xml(`\
 <p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
   <p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>
   <p:sldIdLst>${ids}</p:sldIdLst>
-  <p:sldSz cx="${inchesToEmu(WIDE_LAYOUT.width)}" cy="${inchesToEmu(WIDE_LAYOUT.height)}" type="wide"/>
+  <p:sldSz cx="${slideSize.emuWidth}" cy="${slideSize.emuHeight}" type="${slideSize.type}"/>
   <p:notesSz cx="${inchesToEmu(10)}" cy="${inchesToEmu(7.5)}"/>
 </p:presentation>`);
 }
@@ -2160,10 +2187,11 @@ function objectToShape(deck: DeckIR, object: IRObject, shapeIds: Map<string, str
 
   const id = Number(shapeIds.get(object.id) ?? 2);
   const bounds = object.bounds ?? { x: 0, y: 0, width: 100, height: 100 };
-  const x = pxToEmu(bounds.x, deck.deck.size.width, WIDE_LAYOUT.width);
-  const y = pxToEmu(bounds.y, deck.deck.size.height, WIDE_LAYOUT.height);
-  const cx = pxToEmu(bounds.width, deck.deck.size.width, WIDE_LAYOUT.width);
-  const cy = pxToEmu(bounds.height, deck.deck.size.height, WIDE_LAYOUT.height);
+  const slideSize = deckToPptxSlideSize(deck);
+  const x = pxToEmu(bounds.x, deck.deck.size.width, slideSize.emuWidth);
+  const y = pxToEmu(bounds.y, deck.deck.size.height, slideSize.emuHeight);
+  const cx = pxToEmu(bounds.width, deck.deck.size.width, slideSize.emuWidth);
+  const cy = pxToEmu(bounds.height, deck.deck.size.height, slideSize.emuHeight);
   const name = escapeXml(object.name ?? object.id);
 
   if (object.type === "image") {
@@ -2407,13 +2435,33 @@ function inchesToEmu(inches: number): number {
   return Math.round(inches * EMU_PER_INCH);
 }
 
-function pxToEmu(px: number, deckPixels: number, inches: number): number {
-  return Math.round((px / deckPixels) * inches * EMU_PER_INCH);
+function deckToPptxSlideSize(deck: DeckIR): PptxSlideSize & { type: "wide" | "screen4x3" | "custom" } {
+  const width = Number.isFinite(deck.deck.size.width) && deck.deck.size.width > 0 ? deck.deck.size.width : DEFAULT_SLIDE_SIZE.width;
+  const height = Number.isFinite(deck.deck.size.height) && deck.deck.size.height > 0 ? deck.deck.size.height : DEFAULT_SLIDE_SIZE.height;
+  const emuWidth = Math.round((width / 96) * EMU_PER_INCH);
+  const emuHeight = Math.round((height / 96) * EMU_PER_INCH);
+  return {
+    width,
+    height,
+    emuWidth,
+    emuHeight,
+    type: pptxSlideSizeType(width, height)
+  };
 }
 
-function emuToWidePx(emu: number, inches: number): number {
-  const pixels = inches === WIDE_LAYOUT.width ? 1280 : 720;
-  return Math.round((emu / (inches * EMU_PER_INCH)) * pixels);
+function pptxSlideSizeType(width: number, height: number): "wide" | "screen4x3" | "custom" {
+  const ratio = width / Math.max(1, height);
+  if (Math.abs(ratio - 16 / 9) < 0.01) return "wide";
+  if (Math.abs(ratio - 4 / 3) < 0.01) return "screen4x3";
+  return "custom";
+}
+
+function pxToEmu(px: number, deckPixels: number, slideEmu: number): number {
+  return Math.round((px / Math.max(1, deckPixels)) * slideEmu);
+}
+
+function emuToPx(emu: number, slideEmu: number, slidePixels: number): number {
+  return Math.round((emu / Math.max(1, slideEmu)) * slidePixels);
 }
 
 function fontSizeToOpenXml(px: number): number {

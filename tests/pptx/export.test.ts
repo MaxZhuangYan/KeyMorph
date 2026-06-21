@@ -52,6 +52,24 @@ describe("PPTX export", () => {
     assert.equal(parsed.deck.slides[0].objects.some((object) => object.type === "image"), true);
   });
 
+  test("preserves custom slide size and bounds instead of forcing wide layout", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-custom-size-"));
+    const out = path.join(dir, "custom-size.pptx");
+    const deck = createImageDeck();
+    deck.deck.size = { width: 1024, height: 768, unit: "px" };
+    const image = deck.deck.slides[0].objects[0];
+    image.bounds = { x: 128, y: 96, width: 512, height: 384 };
+
+    await exportIrToPptx(deck, out);
+    const presentationXml = await readPptxXml(out, "ppt/presentation.xml");
+    const parsed = await parsePptxToIr(out);
+    const parsedImage = parsed.deck.slides[0].objects.find((object) => object.type === "image");
+
+    assert.match(presentationXml, /<p:sldSz cx="9753600" cy="7315200" type="screen4x3"\/>/);
+    assert.deepEqual(parsed.deck.size, { width: 1024, height: 768, unit: "px" });
+    assert.deepEqual(parsedImage?.bounds, { x: 128, y: 96, width: 512, height: 384 });
+  });
+
   test("strips XML-invalid control characters from exported text", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-xml-safety-"));
     const out = path.join(dir, "safe-text.pptx");
