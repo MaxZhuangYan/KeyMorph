@@ -1209,7 +1209,14 @@ async function materializeBundleNativeAssets(sourcePath: string, deck: DeckIR, p
 }
 
 function nativeAssetIsUsedBySlide(deck: DeckIR, assetId: string): boolean {
-  return deck.deck.slides.some((slide) => slide.objects.some((object) => objectUsesAsset(object, assetId)));
+  return deck.deck.slides.some((slide) => slideUsesAsset(slide, assetId));
+}
+
+function slideUsesAsset(slide: DeckIR["deck"]["slides"][number], assetId: string): boolean {
+  if (slide.background?.type === "image" && slide.background.source.assetId === assetId) {
+    return true;
+  }
+  return slide.objects.some((object) => objectUsesAsset(object, assetId));
 }
 
 function objectUsesAsset(object: DeckIR["deck"]["slides"][number]["objects"][number], assetId: string): boolean {

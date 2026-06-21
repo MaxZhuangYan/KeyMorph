@@ -181,6 +181,31 @@ describe("product bundle workflow", () => {
     assert.equal(deck.conversion.messages.some((message) => message.code === "keynote-native-assets-materialized"), true);
   });
 
+  test("materializes native Keynote background images into bundle-local runtime assets", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-native-background-"));
+    const keyPath = path.join(dir, "native-background.key");
+    const bundleDir = path.join(dir, "bundle");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    const backgroundBytes = concat([jpegBytes(1920, 1080), new Uint8Array(2 * 1024 * 1024 + 1)]);
+    await writeFile(path.join(keyPath, "Data", "motionBackground-9012.jpeg"), backgroundBytes);
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("Background title"));
+
+    await createProductBundle(keyPath, bundleDir, { jobId: "native-background-job" });
+
+    const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
+    const deck = JSON.parse(await readFile(path.join(bundleDir, "deck.ir.json"), "utf8"));
+    const runtimeHtml = await readFile(path.join(bundleDir, "runtime.html"), "utf8");
+    const backgroundAsset = deck.deck.assets.find((asset) => asset.name === "motionBackground-9012.jpeg");
+
+    assert.equal(manifest.artifacts.nativeAssets, "assets/native");
+    assert.equal(deck.deck.slides[0].background.type, "image");
+    assert.match(backgroundAsset.uri, /^assets\/native\/motionBackground-9012-[a-f0-9]{12}\.jpeg$/);
+    assert.equal(backgroundAsset.metadata.nativeMaterializedAsset, true);
+    assert.match(runtimeHtml, /assets\/native\/motionBackground-9012-[a-f0-9]{12}\.jpeg/);
+    assert.equal((await stat(path.join(bundleDir, backgroundAsset.uri))).size, backgroundBytes.byteLength);
+  });
+
   test("preserves Keynote HTML separately without replacing the default IR runtime", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-keynote-html-"));
     const inputPath = path.join(dir, "source.key");
@@ -528,4 +553,32 @@ function pngBytes(width = 1, height = 1): Uint8Array {
   new DataView(bytes.buffer).setUint32(16, width, false);
   new DataView(bytes.buffer).setUint32(20, height, false);
   return bytes;
+}
+
+function jpegBytes(width: number, height: number): Uint8Array {
+  return new Uint8Array([
+    0xff,
+    0xd8,
+    0xff,
+    0xc0,
+    0x00,
+    0x11,
+    0x08,
+    (height >> 8) & 0xff,
+    height & 0xff,
+    (width >> 8) & 0xff,
+    width & 0xff,
+    0x03,
+    0x01,
+    0x11,
+    0x00,
+    0x02,
+    0x11,
+    0x00,
+    0x03,
+    0x11,
+    0x00,
+    0xff,
+    0xd9
+  ]);
 }

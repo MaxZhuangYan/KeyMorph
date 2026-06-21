@@ -276,6 +276,27 @@ describe("Keynote bridge", () => {
     assert.equal(deck.conversion?.metadata?.previewFallbackObjectCount, 1);
   });
 
+  test("maps native motion background package assets to slide backgrounds", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-motion-background-"));
+    const keyPath = path.join(dir, "motion-background.key");
+    await mkdir(path.join(keyPath, "Data"), { recursive: true });
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+    await writeFile(path.join(keyPath, "Data", "motionBackground-9012.jpeg"), jpegBytes(1920, 1080));
+    await writeFile(path.join(keyPath, "Data", "motionBackground-9013.jpeg"), jpegBytes(1920, 1080));
+    await writeFile(path.join(keyPath, "Index", "Slide-1.iwa"), protoString("Title"));
+    await writeFile(path.join(keyPath, "Index", "Slide-2.iwa"), protoString("Next"));
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.slides[0]?.background?.type, "image");
+    assert.equal(deck.deck.slides[1]?.background?.type, "image");
+    assert.equal(deck.deck.slides[0]?.background?.type === "image" ? deck.deck.slides[0].background.fit : undefined, "cover");
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeBackgroundAssetPath, "Data/motionBackground-9012.jpeg");
+    assert.equal(deck.deck.slides[1]?.metadata?.nativeBackgroundAssetPath, "Data/motionBackground-9013.jpeg");
+    assert.equal(deck.deck.assets?.find((asset) => asset.name === "motionBackground-9012.jpeg")?.metadata?.nativeBackgroundAsset, true);
+    assert.equal(deck.conversion?.metadata?.unrecoveredAssetCount, 0);
+  });
+
   test("extracts numeric geometry, grouping, image dimensions, QuickLook metadata, and animation uncertainty", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-geometry-"));
     const keyPath = path.join(dir, "geometry.key");

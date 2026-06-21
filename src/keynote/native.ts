@@ -373,6 +373,7 @@ interface NativeAssetCatalog {
   byStem: Map<string, NativeAssetReference[]>;
   byDataId: Map<string, NativeAssetReference[]>;
   previewReferences: NativePreviewAssetReference[];
+  backgroundReferences: NativeAssetReference[];
 }
 
 interface NativeAssetMatch {
@@ -1189,6 +1190,7 @@ function createNativeAssetCatalog(
   const byStem = new Map<string, NativeAssetReference[]>();
   const byDataId = new Map<string, NativeAssetReference[]>();
   const previewReferences: NativePreviewAssetReference[] = [];
+  const backgroundReferences: NativeAssetReference[] = [];
 
   for (const assetPath of assetPaths) {
     const data = entries.get(assetPath);
@@ -1283,6 +1285,14 @@ function createNativeAssetCatalog(
         previewRole: "snapshot"
       });
     }
+    if (isNativeBackgroundAssetPath(assetPath) && asset.kind === "image") {
+      backgroundReferences.push(reference);
+      asset.metadata = {
+        ...(asset.metadata ?? {}),
+        nativeBackgroundAsset: true,
+        nativeBackgroundSource: "package-asset"
+      };
+    }
   }
 
   for (const preview of quickLookPreviews) {
@@ -1338,7 +1348,22 @@ function createNativeAssetCatalog(
   assets.sort((left, right) => comparePartPaths(String(left.metadata?.nativeSourcePath ?? left.name ?? left.id), String(right.metadata?.nativeSourcePath ?? right.name ?? right.id)));
   previewAssets.sort((left, right) => comparePartPaths(String(left.metadata?.nativeSourcePath ?? left.name ?? left.id), String(right.metadata?.nativeSourcePath ?? right.name ?? right.id)));
   previewReferences.sort(comparePreviewAssetReferences);
-  return { assets, previewAssets, allAssets: [...assets, ...previewAssets], byPath, byName, byStem, byDataId, previewReferences };
+  backgroundReferences.sort(compareNativeBackgroundReferences);
+  return { assets, previewAssets, allAssets: [...assets, ...previewAssets], byPath, byName, byStem, byDataId, previewReferences, backgroundReferences };
+}
+
+function isNativeBackgroundAssetPath(assetPath: string): boolean {
+  const name = path.posix.basename(assetPath).toLowerCase();
+  return /(?:^|[-_])motionbackground[-_0-9a-f]*\.(?:jpe?g|png|webp)$/i.test(name);
+}
+
+function compareNativeBackgroundReferences(left: NativeAssetReference, right: NativeAssetReference): number {
+  const leftDataId = left.dataId ? Number(left.dataId) : Number.POSITIVE_INFINITY;
+  const rightDataId = right.dataId ? Number(right.dataId) : Number.POSITIVE_INFINITY;
+  if (Number.isFinite(leftDataId) && Number.isFinite(rightDataId) && leftDataId !== rightDataId) {
+    return leftDataId - rightDataId;
+  }
+  return comparePartPaths(left.path, right.path);
 }
 
 function shouldEmbedNativeAsset(data: Uint8Array, mimeType: string | undefined): boolean {
@@ -1572,6 +1597,7 @@ function buildNativeSlides(
     const assetMatches = findIwaAssetMatchesFromScan(scan, assets);
     const typedVisualRecords = createNativeTypedVisualRecords(scan.archiveMessages);
     const previewFallback = selectPreviewFallbackAsset(assets.previewReferences, index, entries.length);
+    const backgroundAsset = selectNativeBackgroundAsset(assets.backgroundReferences, scan, index);
     const usePreviewFallback = previewFallback
       ? shouldUsePreviewFallback(textCandidates, assetMatches, previewFallback)
       : false;
@@ -1606,7 +1632,25 @@ function buildNativeSlides(
       id: slideId,
       index,
       name: readSlideName(entry.path, index),
-      background: { type: "solid" as const, color: "#ffffff" },
+      background: backgroundAsset
+        ? {
+            type: "image" as const,
+            fit: "cover" as const,
+            source: {
+              assetId: backgroundAsset.assetId,
+              metadata: {
+                nativeAssetPath: backgroundAsset.path,
+                mimeType: backgroundAsset.mimeType,
+                ...(backgroundAsset.width !== undefined && backgroundAsset.height !== undefined
+                  ? {
+                      width: backgroundAsset.width,
+                      height: backgroundAsset.height
+                    }
+                  : {})
+              }
+            }
+          }
+        : { type: "solid" as const, color: "#ffffff" },
       ...(nativeTransition ? { transition: nativeTransition } : {}),
       objects,
       timeline: {
@@ -1666,6 +1710,14 @@ function buildNativeSlides(
               nativePreviewFallbackAvailable: true,
               nativePreviewFallbackPath: previewFallback.path,
               nativePreviewFallbackUsed: usePreviewFallback
+            }
+          : {}),
+        ...(backgroundAsset
+          ? {
+              nativeBackgroundAssetPath: backgroundAsset.path,
+              nativeBackgroundAssetId: backgroundAsset.assetId,
+              nativeBackgroundAssetConfidence: nativeBackgroundAssetConfidence(backgroundAsset, scan),
+              nativeBackgroundAssetSource: "package-motion-background"
             }
           : {}),
         nativeProtobufFieldCount: scan.protobufFieldCount,
@@ -2260,6 +2312,55 @@ function pathLooksLikeSlidePreview(entryPath: string, slideNumber: number): bool
   const baseName = path.posix.basename(entryPath, path.posix.extname(entryPath)).toLowerCase();
   const escaped = String(slideNumber).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?:^|[-_\\s])(?:slide|page|preview|snapshot|st)?[-_\\s]*0*${escaped}(?:$|[-_\\s])`, "i").test(baseName);
+}
+
+function selectNativeBackgroundAsset(
+  backgrounds: NativeAssetReference[],
+  scan: IwaScanResult,
+  slideIndex: number
+): NativeAssetReference | undefined {
+  if (backgrounds.length === 0) {
+    return undefined;
+  }
+
+  const evidenceText = [
+    ...scan.referenceCandidates.map((candidate) => candidate.value),
+    ...scan.textCandidates.map((candidate) => candidate.text),
+    ...scan.fieldSummaries.map((summary) => summary.sampleText ?? "")
+  ]
+    .join("\n")
+    .toLowerCase();
+  for (const background of backgrounds) {
+    const candidates = [
+      background.path,
+      background.name,
+      path.posix.basename(background.name, path.posix.extname(background.name)),
+      background.dataId ? `-${background.dataId}` : ""
+    ]
+      .map((value) => value.toLowerCase())
+      .filter(Boolean);
+    if (candidates.some((candidate) => evidenceText.includes(candidate))) {
+      return background;
+    }
+  }
+
+  return backgrounds[slideIndex % backgrounds.length];
+}
+
+function nativeBackgroundAssetConfidence(background: NativeAssetReference, scan: IwaScanResult): number {
+  const evidenceText = [
+    ...scan.referenceCandidates.map((candidate) => candidate.value),
+    ...scan.textCandidates.map((candidate) => candidate.text),
+    ...scan.fieldSummaries.map((summary) => summary.sampleText ?? "")
+  ]
+    .join("\n")
+    .toLowerCase();
+  const name = background.name.toLowerCase();
+  const stem = path.posix.basename(name, path.posix.extname(name));
+  if (evidenceText.includes(background.path.toLowerCase()) || evidenceText.includes(name) || evidenceText.includes(stem)) {
+    return 0.84;
+  }
+  return 0.46;
 }
 
 function createAssetObject(
@@ -5620,6 +5721,9 @@ function uniqueStrings(values: string[]): string[] {
 function countUniqueReferencedAssets(slides: Slide[]): number {
   const assetIds = new Set<string>();
   for (const slide of slides) {
+    if (slide.background?.type === "image" && slide.background.source.assetId) {
+      assetIds.add(slide.background.source.assetId);
+    }
     for (const object of slide.objects) {
       if ((object.type === "image" || object.type === "media") && object.source.assetId) {
         assetIds.add(object.source.assetId);
