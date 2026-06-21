@@ -1375,6 +1375,16 @@ function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmen
           }
         ]
       },
+      transition: {
+        type: "cut",
+        trigger: index === commands.length - 1 ? "click" : "auto",
+        durationMs: 0,
+        metadata: {
+          keymorphSegmentedMovie: true,
+          disableClickAdvanceUntilMs: command.segment.durationMs,
+          autoAdvanceAfterMs: command.segment.durationMs
+        }
+      },
       metadata: {
         sourceSlideId: sourceSlide?.id ?? null,
         sourceSlideIndex: command.segment.slideIndex,

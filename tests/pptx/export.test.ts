@@ -75,6 +75,31 @@ describe("PPTX export", () => {
     assert.match(relsXml, /Id="rId4"[^>]+office\/2007\/relationships\/media"[^>]+Target="\.\.\/media\/media1\.mp4"/);
   });
 
+  test("exports segmented movie slides with timed auto-advance and click advance disabled", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-segment-advance-"));
+    const videoPath = path.join(dir, "segment.mp4");
+    const out = path.join(dir, "segment-advance.pptx");
+    const deck = createMediaDeck(videoPath);
+    const slide = deck.deck.slides[0];
+    slide.transition = {
+      type: "cut",
+      trigger: "auto",
+      durationMs: 0,
+      metadata: {
+        keymorphSegmentedMovie: true,
+        autoAdvanceAfterMs: 1234,
+        disableClickAdvanceUntilMs: 1234
+      }
+    };
+    await writeFile(videoPath, mp4Bytes());
+
+    await exportIrToPptx(deck, out);
+
+    const slideXml = await readPptxXml(out, "ppt/slides/slide1.xml");
+    assert.match(slideXml, /<p:transition advClick="0" advTm="1234"\/>/);
+    assert.ok(slideXml.indexOf("<p:transition") < slideXml.indexOf("<p:timing>"));
+  });
+
   test("preserves custom slide size and bounds instead of forcing wide layout", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-custom-size-"));
     const out = path.join(dir, "custom-size.pptx");

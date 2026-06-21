@@ -2305,6 +2305,7 @@ function slideXml(deck: DeckIR, slide: Slide, media: PptxMediaPart[] = []): stri
   const mediaByObjectId = new Map(media.map((part) => [part.objectId, part]));
   const shapes = slide.objects.map((object) => objectToShape(deck, object, shapeIds, mediaByObjectId)).join("");
   const timing = timingXml(deck, slide);
+  const transition = slideTransitionXml(slide);
   return xml(`\
 <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
   <p:cSld>
@@ -2325,8 +2326,31 @@ function slideXml(deck: DeckIR, slide: Slide, media: PptxMediaPart[] = []): stri
     </p:spTree>
   </p:cSld>
   <p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr>
+  ${transition}
   ${timing}
 </p:sld>`);
+}
+
+function slideTransitionXml(slide: Slide): string {
+  if (!slide.transition) return "";
+  const autoAdvanceMs = numericMetadata(slide.transition.metadata, "autoAdvanceAfterMs");
+  const disableClickMs = numericMetadata(slide.transition.metadata, "disableClickAdvanceUntilMs");
+  const isSegmentedMovie = slide.transition.metadata?.keymorphSegmentedMovie === true;
+  if (isSegmentedMovie && slide.transition.trigger === "auto" && autoAdvanceMs && autoAdvanceMs > 0) {
+    return `<p:transition advClick="0" advTm="${Math.max(1, Math.round(autoAdvanceMs))}"/>`;
+  }
+  if (isSegmentedMovie && disableClickMs && disableClickMs > 0) {
+    return `<p:transition advClick="0" advTm="${Math.max(1, Math.round(disableClickMs))}"/>`;
+  }
+  if (slide.transition.trigger === "auto" && slide.transition.durationMs && slide.transition.durationMs > 0) {
+    return `<p:transition advClick="0" advTm="${Math.max(1, Math.round(slide.transition.durationMs))}"/>`;
+  }
+  return "";
+}
+
+function numericMetadata(metadata: Record<string, unknown> | undefined, key: string): number | undefined {
+  const value = metadata?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function timingXml(deck: DeckIR, slide: Slide): string {
