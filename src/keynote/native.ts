@@ -141,6 +141,20 @@ export interface NativeIwaArchiveMessageEvidence {
   textDrawable?: NativeIwaTextDrawableEvidence;
 }
 
+export interface NativeTypedVisualRecordEvidence {
+  archiveIdentifier?: string;
+  messageIndex: number;
+  type: number;
+  payloadOffset: number;
+  payloadLength: number;
+  objectReferences: string[];
+  dataReferences: string[];
+  geometryCandidates: NativeIwaGeometryCandidate[];
+  fieldSummaries: NativeIwaFieldSummary[];
+  numericCandidates: NativeIwaNumericCandidate[];
+  confidence: number;
+}
+
 export interface NativeIwaBuildEvidence {
   kind: "build";
   buildId?: string;
@@ -491,6 +505,10 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
     (total, slide) => total + (slide.timeline?.events ?? []).filter((event) => event.metadata?.nativeBuildGranularity === "character").length,
     0
   );
+  const totalNativeTypedVisualRecordCount = slides.reduce(
+    (total, slide) => total + Number(slide.metadata?.nativeTypedVisualRecordCount ?? 0),
+    0
+  );
   const unresolvedNativeBuildRecordCount = slides.reduce(
     (total, slide) => total + Number(slide.metadata?.nativeBuildAnimationUnresolvedCount ?? 0),
     0
@@ -521,6 +539,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
       typedArchiveMessageCount: totalTypedArchiveMessageCount,
       buildRecordCount: totalNativeBuildRecordCount,
       buildTimingRecordCount: totalNativeBuildTimingRecordCount,
+      typedVisualRecordCount: totalNativeTypedVisualRecordCount,
       recoveredBuildRecordCount: recoveredNativeBuildRecordCount,
       recoveredBuildAnimationCount: recoveredNativeBuildAnimationCount,
       recoveredCharacterBuildAnimationCount,
@@ -901,6 +920,7 @@ export async function parseNativeKeynoteToIr(keynotePath: string): Promise<DeckI
         totalTypedArchiveMessageCount,
         totalNativeBuildRecordCount,
         totalNativeBuildTimingRecordCount,
+        totalNativeTypedVisualRecordCount,
         recoveredNativeBuildRecordCount,
         recoveredNativeBuildAnimationCount,
         recoveredCharacterBuildAnimationCount,
@@ -1430,6 +1450,7 @@ function buildNativeSlides(
     const scan = scanIwaEntry(entry.data);
     const textCandidates = scan.textCandidates.slice(0, MAX_TEXT_OBJECTS_PER_SLIDE);
     const assetMatches = findIwaAssetMatchesFromScan(scan, assets);
+    const typedVisualRecords = createNativeTypedVisualRecords(scan.archiveMessages);
     const previewFallback = selectPreviewFallbackAsset(assets.previewReferences, index, entries.length);
     const usePreviewFallback = previewFallback
       ? shouldUsePreviewFallback(textCandidates, assetMatches, previewFallback)
@@ -1494,6 +1515,8 @@ function buildNativeSlides(
         ...(scan.archiveRecords.length > 0 ? { nativeArchiveRecords: scan.archiveRecords.slice(0, 12) } : {}),
         nativeTypedArchiveMessageCount: scan.typedArchiveMessageCount,
         ...(scan.archiveMessages.length > 0 ? { nativeTypedArchiveMessages: scan.archiveMessages.slice(0, 24) } : {}),
+        nativeTypedVisualRecordCount: typedVisualRecords.length,
+        ...(typedVisualRecords.length > 0 ? { nativeTypedVisualRecords: typedVisualRecords.slice(0, 24) } : {}),
         nativeBuildRecordCount: buildAnimationRecovery.buildRecords.length,
         nativeBuildTimingRecordCount: buildAnimationRecovery.timingRecords.length,
         nativeBuildAnimationRecoveredCount: buildAnimationRecovery.events.length,
@@ -2259,6 +2282,47 @@ function createNativeBuildObjectLookup(objects: IRObject[]): Map<string, Array<{
     addNativeBuildObjectLookupValues(lookup, object.metadata?.nativeArchiveObjectReferences, object, "archive-object-reference");
   }
   return lookup;
+}
+
+function createNativeTypedVisualRecords(messages: NativeIwaArchiveMessageEvidence[]): NativeTypedVisualRecordEvidence[] {
+  return messages
+    .filter((message) => isTypedVisualGeometryMessage(message.type))
+    .map((message) => {
+      const numericCandidates = message.fieldSummaries
+        .filter((summary) => summary.sampleNumericValue !== undefined)
+        .map((summary) => ({
+          fieldPath: summary.fieldPath,
+          fieldNumber: summary.fieldNumber,
+          wireType: summary.wireType,
+          value: roundGeometryNumber(summary.sampleNumericValue!),
+          encoding: summary.sampleNumericEncoding ?? "varint",
+          confidence: 0.58
+        }));
+      const confidence =
+        0.42 +
+        (message.archiveIdentifier ? 0.08 : 0) +
+        (message.geometryCandidates.length > 0 ? 0.26 : 0) +
+        (message.dataReferences.length > 0 ? 0.12 : 0) +
+        (message.type === 3006 ? 0.04 : 0);
+      return {
+        ...(message.archiveIdentifier ? { archiveIdentifier: message.archiveIdentifier } : {}),
+        messageIndex: message.messageIndex,
+        type: message.type!,
+        payloadOffset: message.payloadOffset,
+        payloadLength: message.payloadLength,
+        objectReferences: message.objectReferences,
+        dataReferences: message.dataReferences,
+        geometryCandidates: message.geometryCandidates.slice(0, 4),
+        fieldSummaries: message.fieldSummaries.slice(0, 16),
+        numericCandidates: numericCandidates.slice(0, 16),
+        confidence: Math.min(0.92, confidence)
+      };
+    })
+    .sort((left, right) => {
+      const type = left.type - right.type;
+      if (type !== 0) return type;
+      return Number(left.archiveIdentifier ?? 0) - Number(right.archiveIdentifier ?? 0) || left.payloadOffset - right.payloadOffset;
+    });
 }
 
 function sequenceNativeBuildRecords(

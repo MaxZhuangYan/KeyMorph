@@ -684,6 +684,41 @@ describe("Keynote bridge", () => {
     assert.equal(deck.conversion?.metadata?.recoveredCharacterBuildAnimationCount, 1);
   });
 
+  test("preserves native 3006 typed visual auxiliary records without applying crop", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-typed-visual-3006-"));
+    const keyPath = path.join(dir, "typed-visual.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      iwaArchiveRecord(4040267, [
+        {
+          type: 3006,
+          payload: concat([
+            nativeImagePlacementPayload(0, { x: 217.714, y: 63.516, width: 378.466, height: 439.634 }),
+            protoFixed32(5, 0.5),
+            protoVarint(3, 3),
+            protoVarint(4, 0),
+            protoVarint(12, 0),
+            protoVarint(13, 0)
+          ]),
+          objectReferences: [4040267]
+        }
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedVisualRecordCount, 1);
+    const record = deck.deck.slides[0]?.metadata?.nativeTypedVisualRecords?.[0];
+    assert.equal(record?.type, 3006);
+    assert.equal(record?.archiveIdentifier, "4040267");
+    assert.deepEqual(record?.geometryCandidates?.[0]?.bounds, { x: 217.714, y: 63.516, width: 378.466, height: 439.634 });
+    assert.equal(record?.numericCandidates?.some((candidate) => candidate.fieldNumber === 5 && candidate.value === 0.5), true);
+    assert.equal(deck.deck.slides[0]?.objects.some((object) => object.metadata?.nativeArchiveIdentifier === "4040267"), false);
+    assert.equal(deck.conversion?.metadata?.totalNativeTypedVisualRecordCount, 1);
+  });
+
   test("starts native Keynote builds together when timing startsWithPrevious is set", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-timing-groups-"));
     const keyPath = path.join(dir, "timing.key");
