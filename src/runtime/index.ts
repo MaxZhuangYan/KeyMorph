@@ -178,7 +178,8 @@ export function renderHtmlDocument(deck: DeckIR, options: HtmlRuntimeOptions = {
     .km-object { position: absolute; box-sizing: border-box; overflow: hidden; transform-origin: center center; }
     .km-text, .km-shape-text { white-space: pre-wrap; display: flex; align-items: flex-start; }
     .km-text-char { display: inline-block; white-space: pre; }
-    .km-image, .km-media { object-fit: contain; user-select: none; -webkit-user-drag: none; }
+    .km-image, .km-media { user-select: none; -webkit-user-drag: none; }
+    .km-image-content { position: absolute; display: block; max-width: none; max-height: none; user-select: none; -webkit-user-drag: none; }
     .km-controls { display: ${controls ? "grid" : "none"}; grid-template-columns: auto auto auto 1fr auto auto; gap: 10px; align-items: center; padding: 12px 16px; background: #111827; border-top: 1px solid rgba(255,255,255,.12); }
     button { border: 1px solid rgba(255,255,255,.18); color: #f8fafc; background: #1f2937; border-radius: 6px; padding: 8px 11px; font: inherit; cursor: pointer; }
     button:hover { background: #374151; }
@@ -857,6 +858,41 @@ function runtimeScript(): string {
     const blur = Number(filter?.blurPx || 0);
     return Number.isFinite(blur) && blur > 0 ? "blur(" + blur + "px)" : "none";
   };
+  const cropValues = (crop, object, statePatch) => {
+    if (!crop) return undefined;
+    const b = statePatch?.bounds || object.bounds || { width: 100, height: 100 };
+    const scaleX = crop.unit === "px" ? 1 / Math.max(1, Number(b.width || 1)) : 1;
+    const scaleY = crop.unit === "px" ? 1 / Math.max(1, Number(b.height || 1)) : 1;
+    const x = Number(crop.x || 0) * scaleX;
+    const y = Number(crop.y || 0) * scaleY;
+    const width = Number(crop.width ?? 1) * scaleX;
+    const height = Number(crop.height ?? 1) * scaleY;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return undefined;
+    return { x: clamp(x, 0, 1), y: clamp(y, 0, 1), width: clamp(width, 0.001, 1), height: clamp(height, 0.001, 1) };
+  };
+  const imageContentStyle = (object, statePatch) => {
+    const crop = cropValues(statePatch?.crop ?? object.crop, object, statePatch);
+    if (!crop || (crop.x === 0 && crop.y === 0 && crop.width === 1 && crop.height === 1)) {
+      return "left:0%;top:0%;width:100%;height:100%;object-fit:contain";
+    }
+    return [
+      "left:" + (-(crop.x / crop.width) * 100) + "%",
+      "top:" + (-(crop.y / crop.height) * 100) + "%",
+      "width:" + (100 / crop.width) + "%",
+      "height:" + (100 / crop.height) + "%",
+      "object-fit:fill"
+    ].join(";");
+  };
+  const applyImageCrop = (el, object, statePatch) => {
+    const image = el.querySelector(".km-image-content");
+    if (!image) return;
+    const style = imageContentStyle(object, statePatch).split(";");
+    for (const declaration of style) {
+      const separator = declaration.indexOf(":");
+      if (separator === -1) continue;
+      image.style.setProperty(declaration.slice(0, separator), declaration.slice(separator + 1));
+    }
+  };
   const boxStyle = (object, statePatch) => {
     const current = merge(baseState(object), statePatch);
     const b = current.bounds || { x: 0, y: 0, width: 100, height: 100 };
@@ -884,7 +920,7 @@ function runtimeScript(): string {
     const className = "km-object km-" + object.type + (object.type === "shape" && object.text ? " km-shape-text" : "");
     const common = 'class="' + esc(className) + '" data-object-id="' + esc(object.id) + '" style="' + boxStyle(object) + ';';
     if (object.type === "text") return '<div ' + common + textStyleCss(object) + '">' + (hasCharacterBuild(object) ? characterTextHtml(textOf(object)) : esc(textOf(object))) + '</div>';
-    if (object.type === "image") return '<img ' + common + '" src="' + esc(sourceUrl(object.source)) + '" alt="' + esc(object.altText || object.name || "") + '">';
+    if (object.type === "image") return '<div ' + common + '"><img class="km-image-content" style="' + imageContentStyle(object) + '" src="' + esc(sourceUrl(object.source)) + '" alt="' + esc(object.altText || object.name || "") + '"></div>';
     if (object.type === "media") {
       const tag = object.mediaType === "audio" ? "audio" : "video";
       const poster = tag === "video" && object.posterSource ? ' poster="' + esc(sourceUrl(object.posterSource)) + '"' : "";
@@ -1472,6 +1508,7 @@ function runtimeScript(): string {
       el.style.background = fillCss(style.fill) || "#e2e8f0";
       el.style.border = Number(stroke.width || 0) + "px solid " + strokeColorCss(stroke);
     }
+    if (object.type === "image") applyImageCrop(el, object, statePatch);
   };
   const applySlideFrame = (layer, slide, timeMs) => {
     const states = computeSlideObjectStates(slide, timeMs);
@@ -1937,7 +1974,7 @@ function renderObjectMarkup(object: IRObject, deck?: DeckIR): string {
     return `<div ${common}>${renderTextObjectContent(object, deck)}</div>`;
   }
   if (object.type === "image") {
-    return `<img ${common} src="${escapeHtml(resolveObjectSourceUrl(object.source, deck))}" alt="${escapeHtml(object.altText ?? object.name ?? "")}">`;
+    return `<div ${common}><img class="km-image-content" style="${imageContentStyle(object)}" src="${escapeHtml(resolveObjectSourceUrl(object.source, deck))}" alt="${escapeHtml(object.altText ?? object.name ?? "")}"></div>`;
   }
   if (object.type === "media") {
     const tag = object.mediaType === "audio" ? "audio" : "video";
@@ -2036,6 +2073,45 @@ function objectStyle(object: IRObject): string {
   }
 
   return style.join(";");
+}
+
+function imageContentStyle(object: Extract<IRObject, { type: "image" }>, state?: ObjectStateProperties): string {
+  const crop = normalizedCrop(state?.crop ?? object.crop, object, state);
+  if (!crop || (crop.x === 0 && crop.y === 0 && crop.width === 1 && crop.height === 1)) {
+    return "left:0%;top:0%;width:100%;height:100%;object-fit:contain";
+  }
+  return [
+    `left:${roundCssNumber(-(crop.x / crop.width) * 100)}%`,
+    `top:${roundCssNumber(-(crop.y / crop.height) * 100)}%`,
+    `width:${roundCssNumber(100 / crop.width)}%`,
+    `height:${roundCssNumber(100 / crop.height)}%`,
+    "object-fit:fill"
+  ].join(";");
+}
+
+function normalizedCrop(crop: ObjectStateProperties["crop"], object: IRObject, state?: ObjectStateProperties):
+  | { x: number; y: number; width: number; height: number }
+  | undefined {
+  if (!crop) return undefined;
+  const bounds = state?.bounds ?? object.bounds ?? { x: 0, y: 0, width: 100, height: 100 };
+  const scaleX = crop.unit === "px" ? 1 / Math.max(1, Number(bounds.width || 1)) : 1;
+  const scaleY = crop.unit === "px" ? 1 / Math.max(1, Number(bounds.height || 1)) : 1;
+  const x = Number(crop.x || 0) * scaleX;
+  const y = Number(crop.y || 0) * scaleY;
+  const width = Number(crop.width ?? 1) * scaleX;
+  const height = Number(crop.height ?? 1) * scaleY;
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return undefined;
+  }
+  return { x: clampNumber(x, 0, 1), y: clampNumber(y, 0, 1), width: clampNumber(width, 0.001, 1), height: clampNumber(height, 0.001, 1) };
+}
+
+function roundCssNumber(value: number): number {
+  return Number(value.toFixed(4));
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function initialObjectState(object: IRObject): ObjectStateProperties {

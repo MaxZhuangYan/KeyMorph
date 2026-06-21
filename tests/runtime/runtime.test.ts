@@ -73,6 +73,22 @@ describe("HTML runtime rendering", () => {
     assert.match(markup, /First\nSecond/);
   });
 
+  test("renders image crop as inner image content geometry", () => {
+    const deck = createStaticCropDeck();
+    const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);
+    const html = renderHtmlDocument(deck);
+
+    assert.match(markup, /class="km-object km-image"/);
+    assert.match(markup, /class="km-image-content"/);
+    assert.match(markup, /left:-50%/);
+    assert.match(markup, /top:-50%/);
+    assert.match(markup, /width:200%/);
+    assert.match(markup, /height:200%/);
+    assert.match(markup, /object-fit:fill/);
+    assert.match(html, /applyImageCrop/);
+    assert.match(html, /km-image-content/);
+  });
+
   test("converts keyframe event tracks to CSS frames", () => {
     const event = createDemoDeck().deck.slides[0].timeline?.events[0];
 
@@ -753,6 +769,32 @@ function createShapeTextDeck(): DeckIR {
                   }
                 ]
               }
+            }
+          ],
+          timeline: { durationMs: 1000, events: [] }
+        }
+      ]
+    }
+  };
+}
+
+function createStaticCropDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "static-crop",
+      size: { width: 400, height: 200, unit: "px" },
+      assets: [{ id: "asset", name: "crop.png", mimeType: "image/png", dataUri: "data:image/png;base64,AA==" }],
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "cropped",
+              type: "image",
+              bounds: { x: 10, y: 20, width: 200, height: 100 },
+              source: { assetId: "asset" },
+              crop: { x: 0.25, y: 0.25, width: 0.5, height: 0.5, unit: "ratio" }
             }
           ],
           timeline: { durationMs: 1000, events: [] }
