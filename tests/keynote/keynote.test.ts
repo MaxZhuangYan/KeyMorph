@@ -453,6 +453,14 @@ describe("Keynote bridge", () => {
     assert.equal(object?.metadata?.nativeExtraction, "asset-archive-info-data-reference");
     assert.equal(object?.metadata?.nativeArchiveMessageType, 3005);
     assert.equal(object?.metadata?.nativeAssetDataId, "42");
+    assert.deepEqual(object?.metadata?.nativeTypedVisualLayout, {
+      kind: "image",
+      frame: { x: 100, y: 120, width: 320, height: 180 },
+      frameFieldPaths: ["1.1.1.1", "1.1.1.2", "1.1.2.1", "1.1.2.2"],
+      schema: "typed-visual-frame-1.1",
+      confidence: 0.97
+    });
+    assert.equal(object?.metadata?.nativeTypedVisualSchema, "typed-visual-frame-1.1");
     assert.deepEqual(object?.metadata?.nativeArchiveObjectReferences, ["777"]);
     assert.equal(deck.deck.slides[0]?.metadata?.nativeTypedArchiveMessageCount, 4);
     assert.equal(
@@ -876,6 +884,13 @@ describe("Keynote bridge", () => {
     const record = deck.deck.slides[0]?.metadata?.nativeTypedVisualRecords?.[0];
     assert.equal(record?.type, 3006);
     assert.equal(record?.archiveIdentifier, "4040267");
+    assert.deepEqual(record?.layout, {
+      kind: "image",
+      frame: { x: 217.714, y: 63.516, width: 378.466, height: 439.634 },
+      frameFieldPaths: ["1.1.1.1", "1.1.1.2", "1.1.2.1", "1.1.2.2"],
+      schema: "typed-visual-frame-1.1",
+      confidence: 0.97
+    });
     assert.deepEqual(record?.geometryCandidates?.[0]?.bounds, { x: 217.714, y: 63.516, width: 378.466, height: 439.634 });
     assert.equal(record?.numericCandidates?.some((candidate) => candidate.fieldNumber === 5 && candidate.value === 0.5), true);
     assert.equal(deck.deck.slides[0]?.objects.some((object) => object.metadata?.nativeArchiveIdentifier === "4040267"), false);

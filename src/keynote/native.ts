@@ -159,9 +159,18 @@ export interface NativeTypedVisualRecordEvidence {
   payloadLength: number;
   objectReferences: string[];
   dataReferences: string[];
+  layout?: NativeTypedVisualLayoutEvidence;
   geometryCandidates: NativeIwaGeometryCandidate[];
   fieldSummaries: NativeIwaFieldSummary[];
   numericCandidates: NativeIwaNumericCandidate[];
+  confidence: number;
+}
+
+export interface NativeTypedVisualLayoutEvidence {
+  kind: "image" | "media";
+  frame: { x: number; y: number; width: number; height: number };
+  frameFieldPaths: string[];
+  schema: "typed-visual-frame-1.1";
   confidence: number;
 }
 
@@ -2177,6 +2186,9 @@ function createAssetObject(
     nativeAssetEvidence: match.evidence,
     nativeAssetMatchConfidence: match.confidence,
     nativeAssetFieldPath: match.fieldPath,
+    ...(match.archiveMessage
+      ? nativeTypedVisualLayoutMetadata(nativeTypedVisualLayoutEvidence(match.archiveMessage))
+      : {}),
     ...(match.suppressedAssets && match.suppressedAssets.length > 0
       ? {
           nativeSuppressedAssetVariantCount: match.suppressedAssets.length,
@@ -2279,6 +2291,19 @@ function createAssetObject(
       ...metadata,
       reason: `Native package asset kind "${asset.kind}" cannot be represented as a direct IR image/media object.`
     }
+  };
+}
+
+function nativeTypedVisualLayoutMetadata(layout: NativeTypedVisualLayoutEvidence | undefined): JSONRecord {
+  if (!layout) {
+    return {};
+  }
+  return {
+    nativeTypedVisualLayout: layout,
+    nativeTypedVisualKind: layout.kind,
+    nativeTypedVisualSchema: layout.schema,
+    nativeTypedVisualFrameFieldPaths: layout.frameFieldPaths,
+    nativeTypedVisualFrameConfidence: layout.confidence
   };
 }
 
@@ -2618,6 +2643,7 @@ function createNativeTypedVisualRecords(messages: NativeIwaArchiveMessageEvidenc
         (message.geometryCandidates.length > 0 ? 0.26 : 0) +
         (message.dataReferences.length > 0 ? 0.12 : 0) +
         (message.type === 3006 ? 0.04 : 0);
+      const layout = nativeTypedVisualLayoutEvidence(message);
       return {
         ...(message.archiveIdentifier ? { archiveIdentifier: message.archiveIdentifier } : {}),
         messageIndex: message.messageIndex,
@@ -2626,6 +2652,7 @@ function createNativeTypedVisualRecords(messages: NativeIwaArchiveMessageEvidenc
         payloadLength: message.payloadLength,
         objectReferences: message.objectReferences,
         dataReferences: message.dataReferences,
+        ...(layout ? { layout } : {}),
         geometryCandidates: message.geometryCandidates.slice(0, 4),
         fieldSummaries: message.fieldSummaries.slice(0, 16),
         numericCandidates: numericCandidates.slice(0, 16),
@@ -2637,6 +2664,34 @@ function createNativeTypedVisualRecords(messages: NativeIwaArchiveMessageEvidenc
       if (type !== 0) return type;
       return Number(left.archiveIdentifier ?? 0) - Number(right.archiveIdentifier ?? 0) || left.payloadOffset - right.payloadOffset;
     });
+}
+
+function nativeTypedVisualLayoutEvidence(message: NativeIwaArchiveMessageEvidence): NativeTypedVisualLayoutEvidence | undefined {
+  if (!isTypedVisualGeometryMessage(message.type)) {
+    return undefined;
+  }
+  const frame = message.geometryCandidates.find((candidate) => isNativeTypedVisualFrameGeometry(candidate));
+  if (!frame) {
+    return undefined;
+  }
+  return {
+    kind: message.type === 3007 ? "media" : "image",
+    frame: frame.bounds,
+    frameFieldPaths: frame.fieldPaths,
+    schema: "typed-visual-frame-1.1",
+    confidence: Math.min(0.98, frame.confidence)
+  };
+}
+
+function isNativeTypedVisualFrameGeometry(candidate: NativeIwaGeometryCandidate): boolean {
+  return (
+    candidate.groupPath === "1.1" &&
+    candidate.fieldPaths.length === 4 &&
+    candidate.fieldPaths[0] === "1.1.1.1" &&
+    candidate.fieldPaths[1] === "1.1.1.2" &&
+    candidate.fieldPaths[2] === "1.1.2.1" &&
+    candidate.fieldPaths[3] === "1.1.2.2"
+  );
 }
 
 function sequenceNativeBuildRecords(
