@@ -3,7 +3,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createDemoDeck } from "./demo/createDemoDeck.ts";
-import { validateIR, type DeckIR } from "./ir/index.ts";
+import { IR_VERSION, validateIR, type DeckIR, type Slide } from "./ir/index.ts";
 import { renderHtmlDocument } from "./runtime/index.ts";
 import { createLossReport, scoreConversion, type ConversionLossReport } from "./report/index.ts";
 import { comparePngFiles } from "./report/fidelity.ts";
@@ -20,14 +20,19 @@ import {
 import {
   captureVideoFrames,
   createVideoExportPlan,
+  createSegmentPlan,
   createVideoFrameFidelityReport,
   describeVideoDependencies,
   exportIrToVideo,
   extractVideoFramesFromVideo,
+  splitVideoIntoSegments,
   type VideoDependencyStatus,
   type VideoExportOptions,
   type VideoFrameFidelityReport,
   type VideoExportPlan,
+  type SplitVideoSegmentsOptions,
+  type SplitVideoSegmentsResult,
+  type VideoSegmentPlanEntry,
   VideoExportDependencyError
 } from "./video/index.ts";
 
@@ -41,6 +46,12 @@ export interface ProductBundleOptions {
   keynoteBridgeExport?: (keynotePath: string, pptxPath: string, options: KeynoteAutomationOptions) => Promise<void>;
   keynoteHtmlExport?: (keynotePath: string, outputDir: string, options: KeynoteAutomationOptions) => Promise<void>;
   keynoteMovieExport?: (keynotePath: string, moviePath: string, options: KeynoteAutomationOptions) => Promise<void>;
+  segmentVideoSplit?: (
+    inputMoviePath: string,
+    segments: VideoSegmentPlanEntry[],
+    outputDir: string,
+    options: SplitVideoSegmentsOptions
+  ) => Promise<SplitVideoSegmentsResult>;
   video?: Pick<VideoExportOptions, "fps" | "scale" | "ffmpegPath">;
 }
 
@@ -135,8 +146,11 @@ export interface ProductBundlePaths {
   keynoteHtmlDir: string;
   keynoteHtmlIndex: string;
   keynoteMovie: string;
+  segmentsDir: string;
+  segmentPlan: string;
   nativeAssetsDir: string;
   rebuiltPptx: string;
+  segmentedPptx: string;
   lossReport: string;
   manifest: string;
   videoPlan: string;
@@ -168,6 +182,8 @@ export interface ProductBundleManifest {
     irRuntimeHtml: string | null;
     keynoteHtml: string | null;
     keynoteMovie: string | null;
+    segmentPlan: string | null;
+    segmentedPptx: string | null;
     nativeAssets: string | null;
     rebuiltPptx: string;
     lossReport: string;
@@ -364,6 +380,31 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
   manifest.artifacts.keynoteMovie = runtime.moviePath;
   manifest.artifacts.renderVideo = runtime.mode === "keynote-movie" ? runtime.moviePath : manifest.artifacts.renderVideo;
   await exportIrToPptx(deck, paths.rebuiltPptx);
+  const segmented = await createSegmentedMoviePptx({
+    deck,
+    paths,
+    createdAt,
+    runtime,
+    splitVideo: options.segmentVideoSplit,
+    splitOptions: { ffmpegPath: options.video?.ffmpegPath }
+  });
+  manifest.artifacts.segmentPlan = segmented.segmentPlanPath;
+  manifest.artifacts.segmentedPptx = segmented.pptxPath;
+  if (segmented.pptxPath) {
+    manifest.report.recommendedFixes = Array.from(
+      new Set([
+        ...manifest.report.recommendedFixes,
+        "Use segmented.pptx for highest-fidelity step-by-step playback when editability is not required."
+      ])
+    );
+  } else if (segmented.message) {
+    deck.conversion?.messages.push({
+      severity: "warning",
+      code: "segmented-pptx-unavailable",
+      message: segmented.message
+    });
+    await writeJson(paths.deckIr, deck);
+  }
   await writeJson(paths.lossReport, lossReport);
   await writeJson(paths.videoPlan, {
     generatedAt: createdAt,
@@ -753,6 +794,7 @@ export function createProductApiResponse(bundle: ProductBundleResult, basePath: 
       html: `${base}/runtime.html`,
       ir: `${base}/deck.ir.json`,
       pptx: `${base}/rebuilt.pptx`,
+      segmentedPptx: bundle.manifest.artifacts.segmentedPptx ? `${base}/${bundle.manifest.artifacts.segmentedPptx}` : null,
       key: null,
       report: `${base}/loss-report.json`,
       manifest: `${base}/manifest.json`,
@@ -1229,6 +1271,140 @@ function objectUsesAsset(object: DeckIR["deck"]["slides"][number]["objects"][num
   return false;
 }
 
+async function createSegmentedMoviePptx(input: {
+  deck: DeckIR;
+  paths: ProductBundlePaths;
+  createdAt: string;
+  runtime: ProductRuntimeSummary;
+  splitVideo?: ProductBundleOptions["segmentVideoSplit"];
+  splitOptions: SplitVideoSegmentsOptions;
+}): Promise<{ segmentPlanPath: string | null; pptxPath: string | null; message?: string }> {
+  if (input.runtime.mode !== "keynote-movie" || !input.runtime.moviePath) {
+    return { segmentPlanPath: null, pptxPath: null };
+  }
+
+  const segments = createSegmentPlan(input.deck);
+  await writeJson(input.paths.segmentPlan, {
+    generatedAt: input.createdAt,
+    sourceMovie: input.runtime.moviePath,
+    mode: "movie-segment-pptx",
+    message: "Each entry maps one Keynote-rendered movie interval to one PPTX slide with an embedded full-slide video.",
+    segments
+  });
+
+  if (segments.length === 0) {
+    return { segmentPlanPath: "segment-plan.json", pptxPath: null, message: "No playable timeline segments were found for segmented PPTX export." };
+  }
+
+  try {
+    const split = await (input.splitVideo ?? splitVideoIntoSegments)(
+      input.paths.keynoteMovie,
+      segments,
+      input.paths.segmentsDir,
+      input.splitOptions
+    );
+    const segmentedDeck = createSegmentedMovieDeck(input.deck, split.commands);
+    await exportIrToPptx(segmentedDeck, input.paths.segmentedPptx);
+    return { segmentPlanPath: "segment-plan.json", pptxPath: "segmented.pptx" };
+  } catch (error) {
+    return {
+      segmentPlanPath: "segment-plan.json",
+      pptxPath: null,
+      message: `Segmented high-fidelity PPTX export failed. Install ffmpeg or use macOS avconvert, then rerun conversion. ${errorMessage(error)}`
+    };
+  }
+}
+
+function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmentsResult["commands"]): DeckIR {
+  const slides: Slide[] = commands.map((command, index) => {
+    const sourceSlide = sourceDeck.deck.slides[command.segment.slideIndex];
+    const objectId = `segment-video-${index + 1}`;
+    return {
+      id: `segment-slide-${index + 1}`,
+      index,
+      name: `${sourceSlide?.name ?? `Slide ${command.segment.slideIndex + 1}`} · segment ${command.segment.clickIndex + 1}`,
+      background: { type: "solid", color: "#000000" },
+      objects: [
+        {
+          id: objectId,
+          type: "media",
+          mediaType: "video",
+          name: command.segment.outputName,
+          bounds: { x: 0, y: 0, width: sourceDeck.deck.size.width, height: sourceDeck.deck.size.height },
+          opacity: 1,
+          source: { uri: command.outputPath },
+          playback: { autoplay: true, startMs: 0, endMs: command.segment.durationMs },
+          metadata: {
+            sourceSlideId: sourceSlide?.id ?? null,
+            sourceSlideIndex: command.segment.slideIndex,
+            sourceClickIndex: command.segment.clickIndex,
+            sourceMovieStartMs: command.segment.startMs,
+            sourceMovieEndMs: command.segment.endMs,
+            sourceMovieDurationMs: command.segment.durationMs,
+            keymorphSegmentedMovie: true
+          }
+        }
+      ],
+      timeline: {
+        durationMs: command.segment.durationMs,
+        events: [
+          {
+            id: `segment-play-${index + 1}`,
+            kind: "media",
+            targetId: objectId,
+            action: "play",
+            seekMs: 0,
+            start: { type: "absolute", atMs: 0 },
+            durationMs: 1,
+            fill: "forwards"
+          }
+        ]
+      },
+      metadata: {
+        sourceSlideId: sourceSlide?.id ?? null,
+        sourceSlideIndex: command.segment.slideIndex,
+        sourceClickIndex: command.segment.clickIndex,
+        keymorphSegmentedMovie: true
+      }
+    };
+  });
+
+  return {
+    irVersion: IR_VERSION,
+    metadata: {
+      ...(sourceDeck.metadata ?? {}),
+      title: `${sourceDeck.metadata?.title ?? sourceDeck.deck.title ?? "Keynote"} segmented playback`,
+      sourceApplication: "KeyMorph segmented movie PPTX"
+    },
+    deck: {
+      id: `${sourceDeck.deck.id}-segmented-movie`,
+      title: `${sourceDeck.deck.title ?? "Keynote"} segmented playback`,
+      size: sourceDeck.deck.size,
+      slides
+    },
+    conversion: {
+      status: "partial",
+      messages: [
+        {
+          severity: "info",
+          code: "segmented-movie-pptx",
+          message:
+            "Generated from Keynote's rendered movie, split at KeyMorph timeline boundaries, and embedded as one full-slide video per PPTX slide."
+        }
+      ],
+      degradedFeatures: [
+        {
+          code: "segmented-movie-pptx-not-editable",
+          severity: "info",
+          area: "media",
+          description: "Segmented PPTX preserves visual animation playback but replaces editable slide objects with full-slide videos.",
+          fallback: "Edit the source Keynote deck and rerun conversion to refresh the segmented playback draft."
+        }
+      ]
+    }
+  };
+}
+
 async function writeMovieRuntime(paths: ProductBundlePaths): Promise<ProductRuntimeSummary> {
   await writeFile(paths.runtimeHtml, renderMovieRuntimeHtml("keynote-movie.m4v"), "utf8");
   return {
@@ -1284,8 +1460,11 @@ function createBundlePaths(jobDir: string, sourceName: string): ProductBundlePat
     keynoteHtmlDir: path.join(jobDir, "keynote-html"),
     keynoteHtmlIndex: path.join(jobDir, "keynote-html", "index.html"),
     keynoteMovie: path.join(jobDir, "keynote-movie.m4v"),
+    segmentsDir: path.join(jobDir, "segments"),
+    segmentPlan: path.join(jobDir, "segment-plan.json"),
     nativeAssetsDir: path.join(jobDir, "assets", "native"),
     rebuiltPptx: path.join(jobDir, "rebuilt.pptx"),
+    segmentedPptx: path.join(jobDir, "segmented.pptx"),
     lossReport: path.join(jobDir, "loss-report.json"),
     manifest: path.join(jobDir, "manifest.json"),
     videoPlan: path.join(jobDir, "video-plan.json"),
@@ -1333,6 +1512,8 @@ function createBundleManifest(input: {
       irRuntimeHtml: null,
       keynoteHtml: null,
       keynoteMovie: null,
+      segmentPlan: null,
+      segmentedPptx: null,
       nativeAssets: null,
       rebuiltPptx: "rebuilt.pptx",
       lossReport: "loss-report.json",
@@ -1541,6 +1722,12 @@ function printBundleSummary(bundle: ProductBundleResult): void {
   console.log(`  IR: ${bundle.paths.deckIr}`);
   console.log(`  HTML runtime: ${pathToFileURL(bundle.paths.runtimeHtml).toString()}`);
   console.log(`  rebuilt PPTX: ${bundle.paths.rebuiltPptx}`);
+  if (bundle.manifest.artifacts.segmentedPptx) {
+    console.log(`  segmented PPTX: ${bundle.paths.segmentedPptx}`);
+  }
+  if (bundle.manifest.artifacts.segmentPlan) {
+    console.log(`  segment plan: ${bundle.paths.segmentPlan}`);
+  }
   console.log(`  loss report: ${bundle.paths.lossReport}`);
   console.log(`  manifest: ${bundle.paths.manifest}`);
   console.log(`  video plan: ${bundle.paths.videoPlan}`);

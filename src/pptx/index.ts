@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 
 import {
@@ -118,14 +119,14 @@ export async function parsePptxToIr(filePath: string): Promise<DeckIR> {
 }
 
 export async function exportIrToPptx(deck: DeckIR, outputPath: string): Promise<void> {
-  const files = createPptxFiles(deck);
+  const files = await createPptxFiles(deck);
   await writeFile(outputPath, createZip(files));
 }
 
-function createPptxFiles(deck: DeckIR): Map<string, string | Uint8Array> {
+async function createPptxFiles(deck: DeckIR): Promise<Map<string, string | Uint8Array>> {
   const files = new Map<string, string | Uint8Array>();
   const slideCount = deck.deck.slides.length;
-  const slideMedia = collectPptxMedia(deck);
+  const slideMedia = await collectPptxMedia(deck);
 
   files.set("[Content_Types].xml", contentTypes(slideCount, slideMedia.contentTypes));
   files.set("_rels/.rels", rootRels());
@@ -147,6 +148,9 @@ function createPptxFiles(deck: DeckIR): Map<string, string | Uint8Array> {
   });
   for (const part of slideMedia.parts) {
     files.set(part.partPath, part.data);
+    if (part.posterPartPath && part.posterData) {
+      files.set(part.posterPartPath, part.posterData);
+    }
   }
 
   return files;
@@ -161,11 +165,17 @@ interface ParsedSlide {
 interface PptxMediaPart {
   objectId: string;
   relId: string;
+  mediaRelId?: string;
+  videoRelId?: string;
   partPath: string;
   target: string;
   data: Uint8Array;
   extension: string;
   contentType: string;
+  kind: "image" | "video" | "audio";
+  posterPartPath?: string;
+  posterTarget?: string;
+  posterData?: Uint8Array;
 }
 
 interface PptxMediaCollection {
@@ -469,36 +479,54 @@ function readSlideBackground(source: string): string | undefined {
   return match ? `#${match[1]}` : undefined;
 }
 
-function collectPptxMedia(deck: DeckIR): PptxMediaCollection {
+async function collectPptxMedia(deck: DeckIR): Promise<PptxMediaCollection> {
   const bySlide = new Map<string, PptxMediaPart[]>();
   const parts: PptxMediaPart[] = [];
   const contentTypes = new Map<string, string>();
+  let nextImageIndex = 1;
   let nextMediaIndex = 1;
+  let nextPosterIndex = 1;
 
   for (const slide of deck.deck.slides) {
     const media: PptxMediaPart[] = [];
+    let nextRelIndex = 2;
     const objects = flattenObjects(slide.objects);
     for (const object of objects) {
-      if (object.type !== "image") continue;
-      const source = resolveObjectSource(object.source, deck);
-      const decoded = decodeDataUri(source);
-      if (!decoded) continue;
-      const extension = imageExtensionForContentType(decoded.contentType);
+      if (object.type !== "image" && object.type !== "media") continue;
+      const resolved = await resolveObjectSourceBytes(object.source, deck);
+      if (!resolved) continue;
+      const extension = object.type === "image" ? imageExtensionForContentType(resolved.contentType) : mediaExtensionForContentType(resolved.contentType);
       if (!extension) continue;
-      const relId = `rId${media.length + 2}`;
-      const partPath = `ppt/media/image${nextMediaIndex}.${extension}`;
+      const kind = object.type === "image" ? "image" : object.mediaType;
+      const relId = `rId${nextRelIndex++}`;
+      const videoRelId = kind === "image" ? undefined : `rId${nextRelIndex++}`;
+      const mediaRelId = kind === "image" ? undefined : `rId${nextRelIndex++}`;
+      const partName = kind === "image" ? `image${nextImageIndex}.${extension}` : `media${nextMediaIndex}.${extension}`;
+      const posterPartName = kind === "image" ? undefined : `poster${nextPosterIndex}.png`;
+      const partPath = `ppt/media/${partName}`;
       media.push({
         objectId: object.id,
         relId,
+        mediaRelId,
+        videoRelId,
         partPath,
-        target: `../media/image${nextMediaIndex}.${extension}`,
-        data: decoded.data,
+        target: `../media/${partName}`,
+        data: resolved.data,
         extension,
-        contentType: decoded.contentType
+        contentType: resolved.contentType,
+        kind,
+        posterPartPath: posterPartName ? `ppt/media/${posterPartName}` : undefined,
+        posterTarget: posterPartName ? `../media/${posterPartName}` : undefined,
+        posterData: posterPartName ? defaultVideoPosterPng() : undefined
       });
-      contentTypes.set(extension, decoded.contentType);
+      contentTypes.set(extension, resolved.contentType);
+      if (posterPartName) contentTypes.set("png", "image/png");
       parts.push(media[media.length - 1]!);
-      nextMediaIndex += 1;
+      if (kind === "image") nextImageIndex += 1;
+      else {
+        nextMediaIndex += 1;
+        nextPosterIndex += 1;
+      }
     }
     if (media.length > 0) bySlide.set(slide.id, media);
   }
@@ -526,6 +554,28 @@ function resolveObjectSource(source: { assetId?: string; uri?: string; dataUri?:
   return asset?.uri ?? asset?.dataUri;
 }
 
+async function resolveObjectSourceBytes(source: { assetId?: string; uri?: string; dataUri?: string } | undefined, deck: DeckIR): Promise<{ contentType: string; data: Uint8Array } | undefined> {
+  const value = resolveObjectSource(source, deck);
+  const decoded = decodeDataUri(value);
+  if (decoded) return decoded;
+  const filePath = filePathFromObjectSource(value);
+  if (!filePath) return undefined;
+  const contentType = contentTypeFromPartPath(filePath);
+  if (!contentType) return undefined;
+  try {
+    return { contentType, data: await readFile(filePath) };
+  } catch {
+    return undefined;
+  }
+}
+
+function filePathFromObjectSource(source: string | undefined): string | undefined {
+  if (!source) return undefined;
+  if (source.startsWith("file://")) return fileURLToPath(source);
+  if (path.isAbsolute(source)) return source;
+  return undefined;
+}
+
 function decodeDataUri(source: string | undefined): { contentType: string; data: Uint8Array } | undefined {
   if (!source?.startsWith("data:")) return undefined;
   const match = /^data:([^;,]+)(?:;charset=[^;,]+)?;base64,(.*)$/is.exec(source);
@@ -543,6 +593,27 @@ function imageExtensionForContentType(contentType: string): string | undefined {
   if (contentType === "image/gif") return "gif";
   if (contentType === "image/webp") return "webp";
   return undefined;
+}
+
+function mediaExtensionForContentType(contentType: string): string | undefined {
+  if (contentType === "video/mp4") return "mp4";
+  if (contentType === "video/x-m4v") return "m4v";
+  if (contentType === "video/quicktime") return "mov";
+  if (contentType === "video/webm") return "webm";
+  if (contentType === "audio/mpeg") return "mp3";
+  if (contentType === "audio/mp4") return "m4a";
+  if (contentType === "audio/wav") return "wav";
+  return undefined;
+}
+
+function defaultVideoPosterPng(): Uint8Array {
+  return new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82
+  ]);
 }
 
 interface TimingParseResult {
@@ -2305,6 +2376,14 @@ function eventToTimingNodes(
     return [timingWrapper(slide, event, startIndex, visibilitySetXml(startIndex, shapeId, event.visible, 0), shapeIds)];
   }
 
+  if (event.kind === "media") {
+    const shapeId = shapeIds.get(event.targetId);
+    if (!shapeId) return [];
+    if (event.action !== "play" && event.action !== "pause" && event.action !== "stop") return [];
+    const command = event.action === "play" ? `playFrom(${formatSeconds((event.seekMs ?? 0) / 1000)})` : "togglePause";
+    return [timingWrapper(slide, event, startIndex, mediaCommandXml(startIndex, shapeId, command, event.durationMs ?? 1), shapeIds)];
+  }
+
   if (event.kind !== "keyframes") return [];
   const shapeId = shapeIds.get(event.targetId);
   if (!shapeId) return [];
@@ -2467,6 +2546,18 @@ function visibilitySetXml(index: number, shapeId: string, visible: boolean, dela
 </p:set>`;
 }
 
+function mediaCommandXml(index: number, shapeId: string, command: string, durationMs: number): string {
+  return `\
+<p:cmd type="call" cmd="${escapeXml(command)}">
+  <p:cBhvr>
+    <p:cTn id="${4 + index * 3}" dur="${Math.max(1, Math.round(durationMs))}" fill="hold">
+      <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="${shapeId}"/></p:tgtEl>
+  </p:cBhvr>
+</p:cmd>`;
+}
+
 function motionPathXml(
   deck: DeckIR,
   index: number,
@@ -2589,6 +2680,12 @@ function formatMotionCoordinate(value: number): string {
   return Object.is(rounded, -0) ? "0" : String(rounded);
 }
 
+function formatSeconds(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  const rounded = Math.round(Math.max(0, value) * 1000) / 1000;
+  return Object.is(rounded, -0) ? "0" : String(rounded);
+}
+
 function assignShapeIds(objects: IRObject[]): Map<string, string> {
   const ids = new Map<string, string>();
   let nextId = 2;
@@ -2624,6 +2721,31 @@ function objectToShape(deck: DeckIR, object: IRObject, shapeIds: Map<string, str
       return `\
 <p:pic>
   <p:nvPicPr><p:cNvPr id="${id}" name="${name}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr>
+  <p:blipFill>
+    <a:blip r:embed="${media.relId}"/>
+    <a:stretch><a:fillRect/></a:stretch>
+  </p:blipFill>
+  <p:spPr>
+    <a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>
+    <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+  </p:spPr>
+</p:pic>`;
+    }
+  }
+
+  if (object.type === "media") {
+    const media = mediaByObjectId.get(object.id);
+    if (media) {
+      return `\
+<p:pic>
+  <p:nvPicPr>
+    <p:cNvPr id="${id}" name="${name}"/>
+    <p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr>
+    <p:nvPr>
+      ${object.mediaType === "video" ? `<a:videoFile r:link="${media.videoRelId ?? media.relId}"/>` : `<a:audioFile r:link="${media.videoRelId ?? media.relId}"/>`}
+      <p:extLst><p:ext uri="{DAA4B4D4-6D71-4841-9C94-3DE7FCFBF4A5}"><p14:media xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main" r:embed="${media.mediaRelId ?? media.relId}"/></p:ext></p:extLst>
+    </p:nvPr>
+  </p:nvPicPr>
   <p:blipFill>
     <a:blip r:embed="${media.relId}"/>
     <a:stretch><a:fillRect/></a:stretch>
@@ -2702,10 +2824,22 @@ function rootRels(): string {
 
 function slideRels(media: PptxMediaPart[] = []): string {
   const mediaRels = media
-    .map(
-      (part) =>
-        `<Relationship Id="${part.relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${escapeXml(part.target)}"/>`
-    )
+    .flatMap((part) => {
+      if (part.kind === "image") {
+        return [
+          `<Relationship Id="${part.relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${escapeXml(part.target)}"/>`
+        ];
+      }
+      const type =
+        part.kind === "audio"
+          ? "http://schemas.openxmlformats.org/officeDocument/2006/relationships/audio"
+          : "http://schemas.openxmlformats.org/officeDocument/2006/relationships/video";
+      return [
+        `<Relationship Id="${part.relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${escapeXml(part.posterTarget ?? part.target)}"/>`,
+        `<Relationship Id="${part.videoRelId ?? `${part.relId}Video`}" Type="${type}" Target="${escapeXml(part.target)}"/>`,
+        `<Relationship Id="${part.mediaRelId ?? `${part.relId}Media`}" Type="http://schemas.microsoft.com/office/2007/relationships/media" Target="${escapeXml(part.target)}"/>`
+      ];
+    })
     .join("");
   return xml(`\
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">

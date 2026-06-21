@@ -134,6 +134,23 @@ describe("product bundle workflow", () => {
       keynoteMovieExport: async (_keynotePath, moviePath) => {
         await writeFile(moviePath, "stub movie", "utf8");
       },
+      segmentVideoSplit: async (inputMoviePath, segments, outputDir) => {
+        await mkdir(outputDir, { recursive: true });
+        const commands = [];
+        for (const segment of segments.slice(0, 2)) {
+          const outputPath = path.join(outputDir, segment.outputName);
+          await writeFile(outputPath, mp4Bytes());
+          commands.push({
+            tool: "ffmpeg" as const,
+            command: "ffmpeg",
+            args: [],
+            inputPath: inputMoviePath,
+            outputPath,
+            segment
+          });
+        }
+        return { commands };
+      },
       keynoteHtmlExport: async (_keynotePath, outputDir) => {
         await mkdir(outputDir, { recursive: true });
         await writeFile(path.join(outputDir, "index.html"), "<!doctype html><title>Keynote Native Runtime</title>", "utf8");
@@ -150,10 +167,57 @@ describe("product bundle workflow", () => {
     assert.equal(manifest.artifacts.keynoteHtml, null);
     assert.equal(manifest.artifacts.keynoteMovie, "keynote-movie.m4v");
     assert.equal(manifest.artifacts.renderVideo, "keynote-movie.m4v");
+    assert.equal(manifest.artifacts.segmentPlan, "segment-plan.json");
+    assert.equal(manifest.artifacts.segmentedPptx, "segmented.pptx");
     const runtimeHtml = await readFile(path.join(bundleDir, "runtime.html"), "utf8");
     assert.match(runtimeHtml, /<video src="keynote-movie\.m4v"/);
     assert.match(await readFile(path.join(bundleDir, "runtime-ir.html"), "utf8"), /window\.__KEYMORPH_DECK__/);
     assert.match(await readFile(path.join(bundleDir, "keynote-movie.m4v"), "utf8"), /stub movie/);
+    assert.ok((await stat(path.join(bundleDir, "segment-plan.json"))).size > 0);
+    assert.ok((await stat(path.join(bundleDir, "segmented.pptx"))).size > 0);
+  });
+
+  test("exposes segmented high-fidelity PPTX downloads for Keynote movie bundles", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-segmented-pptx-"));
+    const inputPath = path.join(dir, "source.key");
+    const bundleDir = path.join(dir, "bundle");
+    await writeFile(inputPath, "stub keynote package", "utf8");
+
+    const bundle = await createProductBundle(inputPath, bundleDir, {
+      jobId: "segmented-job",
+      allowKeynoteAutomation: true,
+      keynoteBridgeExport: async (_keynotePath, pptxPath) => {
+        await exportIrToPptx(createDemoDeck(), pptxPath);
+      },
+      keynoteMovieExport: async (_keynotePath, moviePath) => {
+        await writeFile(moviePath, "stub movie", "utf8");
+      },
+      segmentVideoSplit: async (inputMoviePath, segments, outputDir) => {
+        await mkdir(outputDir, { recursive: true });
+        const commands = [];
+        for (const segment of segments.slice(0, 2)) {
+          const outputPath = path.join(outputDir, segment.outputName);
+          await writeFile(outputPath, mp4Bytes());
+          commands.push({
+            tool: "ffmpeg" as const,
+            command: "ffmpeg",
+            args: [],
+            inputPath: inputMoviePath,
+            outputPath,
+            segment
+          });
+        }
+        return { commands };
+      }
+    });
+
+    const response = createProductApiResponse(bundle, "/demo/out/jobs/segmented-job") as { downloads: Record<string, string | null> };
+    const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
+
+    assert.equal(manifest.artifacts.segmentPlan, "segment-plan.json");
+    assert.equal(manifest.artifacts.segmentedPptx, "segmented.pptx");
+    assert.equal(response.downloads.segmentedPptx, "/demo/out/jobs/segmented-job/segmented.pptx");
+    assert.ok((await stat(path.join(bundleDir, "segmented.pptx"))).size > 0);
   });
 
   test("materializes used native Keynote package images into bundle-local runtime assets", async () => {
@@ -500,6 +564,10 @@ describe("product bundle workflow", () => {
     assert.match(source, /轉換保真度/);
     assert.match(source, /Keynote 基准对比需要原始 \.key 源文件/);
     assert.match(source, /Keynote 基準對比需要原始 \.key 來源檔/);
+    assert.match(source, /下载高保真分段 PPTX/);
+    assert.match(source, /下載高保真分段 PPTX/);
+    assert.match(source, /downloadLink\(result\.downloads\.segmentedPptx, t\('downloadSegmentedPptx'\)\)/);
+    assert.match(source, /pruneOldJobs\(jobId, 2\)/);
     assert.match(source, /baselineCanRun/);
     assert.match(source, /renderBaseline" type="button"' \+ \(baselineCanRun \? '' : ' disabled'\)/);
     assert.match(source, /keynoteEndpoint \+ '\?allowKeynote=1'/);
@@ -553,6 +621,10 @@ function pngBytes(width = 1, height = 1): Uint8Array {
   new DataView(bytes.buffer).setUint32(16, width, false);
   new DataView(bytes.buffer).setUint32(20, height, false);
   return bytes;
+}
+
+function mp4Bytes(): Uint8Array {
+  return new Uint8Array([0, 0, 0, 24, 102, 116, 121, 112, 109, 112, 52, 50, 0, 0, 0, 0, 109, 112, 52, 50]);
 }
 
 function jpegBytes(width: number, height: number): Uint8Array {

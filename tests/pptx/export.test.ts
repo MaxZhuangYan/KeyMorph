@@ -52,6 +52,29 @@ describe("PPTX export", () => {
     assert.equal(parsed.deck.slides[0].objects.some((object) => object.type === "image"), true);
   });
 
+  test("exports media objects as embedded PPTX videos with playback commands", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-video-export-"));
+    const videoPath = path.join(dir, "segment.mp4");
+    const out = path.join(dir, "video.pptx");
+    await writeFile(videoPath, mp4Bytes());
+
+    await exportIrToPptx(createMediaDeck(videoPath), out);
+
+    const entries = readZipEntries(await readFile(out));
+    const slideXml = new TextDecoder().decode(entries.get("ppt/slides/slide1.xml"));
+    const relsXml = new TextDecoder().decode(entries.get("ppt/slides/_rels/slide1.xml.rels"));
+
+    assert.ok(entries.has("ppt/media/media1.mp4"));
+    assert.ok(entries.has("ppt/media/poster1.png"));
+    assert.match(slideXml, /<a:videoFile r:link="rId3"\/>/);
+    assert.match(slideXml, /<p14:media[^>]+r:embed="rId4"/);
+    assert.match(slideXml, /<a:blip r:embed="rId2"\/>/);
+    assert.match(slideXml, /<p:cmd type="call" cmd="playFrom\(0\)">/);
+    assert.match(relsXml, /Id="rId2"[^>]+relationships\/image"[^>]+Target="\.\.\/media\/poster1\.png"/);
+    assert.match(relsXml, /Id="rId3"[^>]+relationships\/video"[^>]+Target="\.\.\/media\/media1\.mp4"/);
+    assert.match(relsXml, /Id="rId4"[^>]+office\/2007\/relationships\/media"[^>]+Target="\.\.\/media\/media1\.mp4"/);
+  });
+
   test("preserves custom slide size and bounds instead of forcing wide layout", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-custom-size-"));
     const out = path.join(dir, "custom-size.pptx");
@@ -761,6 +784,55 @@ function createImageDeck(): DeckIR {
   };
 }
 
+function createMediaDeck(videoPath: string): DeckIR {
+  return {
+    irVersion: IR_VERSION,
+    metadata: { title: "Video PPTX fixture", sourceApplication: "KeyMorph tests" },
+    deck: {
+      id: "video-fixture",
+      title: "Video PPTX fixture",
+      size: { width: 1280, height: 720, unit: "px" },
+      slides: [
+        {
+          id: "slide-1",
+          index: 0,
+          name: "Video",
+          background: { type: "solid", color: "#000000" },
+          objects: [
+            {
+              id: "segment-video",
+              type: "media",
+              mediaType: "video",
+              name: "Segment video",
+              bounds: { x: 0, y: 0, width: 1280, height: 720 },
+              opacity: 1,
+              source: { uri: videoPath },
+              playback: { autoplay: true }
+            }
+          ],
+          timeline: {
+            durationMs: 1000,
+            events: [
+              {
+                id: "play-video",
+                kind: "media",
+                targetId: "segment-video",
+                action: "play",
+                seekMs: 0,
+                start: { type: "absolute", atMs: 0 },
+                durationMs: 1,
+                fill: "forwards"
+              }
+            ],
+            dependencyGraph: { edges: [] }
+          }
+        }
+      ]
+    },
+    conversion: { status: "success", messages: [] }
+  };
+}
+
 function createSequencedDeck(): DeckIR {
   const deck = createAnimatedDeck();
   const slide = deck.deck.slides[0];
@@ -959,6 +1031,10 @@ function pngBytes(width = 1, height = 1): Uint8Array {
   new DataView(bytes.buffer).setUint32(16, width, false);
   new DataView(bytes.buffer).setUint32(20, height, false);
   return bytes;
+}
+
+function mp4Bytes(): Uint8Array {
+  return new Uint8Array([0, 0, 0, 24, 102, 116, 121, 112, 109, 112, 52, 50, 0, 0, 0, 0, 109, 112, 52, 50]);
 }
 
 function readZipEntries(data: Uint8Array): Map<string, Uint8Array> {

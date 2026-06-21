@@ -1,5 +1,5 @@
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -91,6 +91,7 @@ async function handleConvert(request, response) {
   await writeFile(sourcePath, upload.data);
 
   const bundle = await createProductBundle(sourcePath, jobDir, { sourceName: safeName, jobId });
+  await pruneOldJobs(jobId, 2);
   send(
     response,
     200,
@@ -413,6 +414,7 @@ function renderAppHtml() {
         runtimeKeynoteMovie: 'Keynote rendered movie',
         downloadHtml: 'Download HTML Runtime',
         downloadPptx: 'Download PPTX',
+        downloadSegmentedPptx: 'Download high-fidelity step PPTX',
         exportKeynote: 'Export Keynote',
         downloadIr: 'Download IR',
         downloadReport: 'Download report',
@@ -492,6 +494,7 @@ function renderAppHtml() {
         runtimeKeynoteMovie: 'Keynote 渲染影片',
         downloadHtml: '下载 HTML 运行时',
         downloadPptx: '下载 PPTX',
+        downloadSegmentedPptx: '下载高保真分段 PPTX',
         exportKeynote: '导出 Keynote',
         downloadIr: '下载 IR',
         downloadReport: '下载报告',
@@ -571,6 +574,7 @@ function renderAppHtml() {
         runtimeKeynoteMovie: 'Keynote 渲染影片',
         downloadHtml: '下載 HTML 執行時',
         downloadPptx: '下載 PPTX',
+        downloadSegmentedPptx: '下載高保真分段 PPTX',
         exportKeynote: '匯出 Keynote',
         downloadIr: '下載 IR',
         downloadReport: '下載報告',
@@ -750,6 +754,7 @@ function renderAppHtml() {
           '<div class="link-row">' +
             downloadLink(result.downloads.html, t('downloadHtml'), true) +
             downloadLink(result.downloads.pptx, t('downloadPptx')) +
+            downloadLink(result.downloads.segmentedPptx, t('downloadSegmentedPptx')) +
             downloadLink(result.downloads.ir, t('downloadIr')) +
             downloadLink(result.downloads.report, t('downloadReport')) +
           '</div>' +
@@ -968,6 +973,27 @@ function safeJobDir(jobId) {
   const jobDir = path.resolve(jobsRoot, jobId);
   if (!jobDir.startsWith(jobsRoot)) throw new Error("Invalid job path.");
   return jobDir;
+}
+
+async function pruneOldJobs(currentJobId, keepCount) {
+  const entries = await readdir(jobsRoot, { withFileTypes: true });
+  const jobs = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const jobDir = path.join(jobsRoot, entry.name);
+    try {
+      const stats = await stat(jobDir);
+      jobs.push({ id: entry.name, dir: jobDir, mtimeMs: stats.mtimeMs });
+    } catch {
+      // Ignore transient job directories while a conversion is being written.
+    }
+  }
+  jobs.sort((a, b) => {
+    if (a.id === currentJobId) return -1;
+    if (b.id === currentJobId) return 1;
+    return b.mtimeMs - a.mtimeMs;
+  });
+  await Promise.all(jobs.slice(Math.max(1, keepCount)).map((job) => rm(job.dir, { recursive: true, force: true })));
 }
 
 function parsePositiveNumber(value) {

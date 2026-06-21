@@ -1,10 +1,10 @@
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
-import type { DeckIR } from "../ir/index.ts";
+import type { AnimationEvent, DeckIR, Slide } from "../ir/index.ts";
 import {
   aggregatePixelFidelityResults,
   comparePngFiles,
@@ -13,6 +13,7 @@ import {
 } from "../report/fidelity.ts";
 import {
   createDeckTimeline,
+  createSlideTimingPlan,
   createRuntimeFrameSnapshot,
   renderHtmlDocument,
   resolveDeckTime,
@@ -159,6 +160,36 @@ export interface VideoFramePlan {
   resolution: DeckTimeResolution;
 }
 
+export interface VideoSegmentPlanEntry {
+  id: string;
+  slideIndex: number;
+  clickIndex: number;
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+  outputName: string;
+}
+
+export interface VideoSplitCommand {
+  tool: "ffmpeg" | "avconvert";
+  command: string;
+  args: string[];
+  inputPath: string;
+  outputPath: string;
+  segment: VideoSegmentPlanEntry;
+}
+
+export interface SplitVideoSegmentsOptions {
+  ffmpegPath?: string;
+  avconvertPath?: string;
+  dryRun?: boolean;
+  runner?: (command: string, args: string[], segment: VideoSegmentPlanEntry) => void | Promise<void>;
+}
+
+export interface SplitVideoSegmentsResult {
+  commands: VideoSplitCommand[];
+}
+
 export class VideoExportDependencyError extends Error {
   readonly missing: string[];
   readonly guidance: string[];
@@ -220,6 +251,59 @@ export function createVideoFramePlan(
       resolution: resolveDeckTime(deck, timeMs)
     };
   });
+}
+
+export function createSegmentPlan(deck: DeckIR): VideoSegmentPlanEntry[] {
+  const timeline = createDeckTimeline(deck);
+  const segments: VideoSegmentPlanEntry[] = [];
+
+  for (const slideSpan of timeline.slides) {
+    const slide = deck.deck.slides[slideSpan.slideIndex];
+    const boundaries = timelineBoundaryTimes(slide, slideSpan.contentStartMs, slideSpan.endMs);
+
+    for (let index = 0; index < boundaries.length - 1; index += 1) {
+      const startMs = boundaries[index] ?? slideSpan.contentStartMs;
+      const endMs = boundaries[index + 1] ?? slideSpan.endMs;
+      if (endMs <= startMs) continue;
+      const clickIndex = index;
+      const id = `slide-${slideSpan.slideIndex + 1}-segment-${index + 1}`;
+      segments.push({
+        id,
+        slideIndex: slideSpan.slideIndex,
+        clickIndex,
+        startMs,
+        endMs,
+        durationMs: endMs - startMs,
+        outputName: `${id}.mp4`
+      });
+    }
+  }
+
+  return segments;
+}
+
+export const createVideoSegmentsFromTimeline = createSegmentPlan;
+
+export async function splitVideoIntoSegments(
+  inputMoviePath: string,
+  segments: VideoSegmentPlanEntry[],
+  outputDir: string,
+  options: SplitVideoSegmentsOptions = {}
+): Promise<SplitVideoSegmentsResult> {
+  const tool = await resolveVideoSplitTool(options);
+  const commands = segments.map((segment) => createVideoSplitCommand(tool, inputMoviePath, segment, outputDir));
+
+  if (!options.dryRun) {
+    await mkdir(outputDir, { recursive: true });
+    for (const command of commands) {
+      await (options.runner?.(command.command, command.args, command.segment) ?? run(command.command, command.args));
+      if (!options.runner) {
+        await assertOutputFile(command.outputPath, `${command.tool} did not create segment ${command.segment.id}`);
+      }
+    }
+  }
+
+  return { commands };
 }
 
 export function createVideoFrameDiagnostics(
@@ -431,6 +515,122 @@ export async function extractVideoFramesFromVideo(
     if (ownsFramesDir) await rm(framesDir, { recursive: true, force: true });
     throw error;
   }
+}
+
+function timelineBoundaryTimes(slide: Slide | undefined, contentStartMs: number, contentEndMs: number): number[] {
+  const slideDurationMs = Math.max(1, contentEndMs - contentStartMs);
+  const starts = createSlideTimingPlan(slide).starts;
+  const boundaries = new Set<number>([contentStartMs, contentEndMs]);
+
+  for (const event of slide?.timeline?.events ?? []) {
+    const startMs = clampSegmentBoundary(contentStartMs + (starts[event.id] ?? eventLocalStartMs(event)), contentStartMs, contentEndMs);
+    const endMs = clampSegmentBoundary(startMs + Math.max(0, Number(event.durationMs || 0)), contentStartMs, contentEndMs);
+    boundaries.add(startMs);
+    boundaries.add(endMs);
+  }
+
+  return Array.from(boundaries)
+    .filter((timeMs) => timeMs >= contentStartMs && timeMs <= contentStartMs + slideDurationMs)
+    .sort((a, b) => a - b);
+}
+
+function eventLocalStartMs(event: AnimationEvent): number {
+  const start = event.start;
+  const base = Number(event.delayMs || 0);
+  if (start?.type === "absolute") return Math.max(0, base + Number(start.atMs || 0));
+  if (start?.type === "trigger") return Math.max(0, base + Number(start.offsetMs || 0));
+  return Math.max(0, base);
+}
+
+function clampSegmentBoundary(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+async function resolveVideoSplitTool(options: SplitVideoSegmentsOptions): Promise<{ tool: "ffmpeg" | "avconvert"; command: string }> {
+  if (options.ffmpegPath) return { tool: "ffmpeg", command: options.ffmpegPath };
+  if (options.avconvertPath) return { tool: "avconvert", command: options.avconvertPath };
+  if (options.dryRun || options.runner) return { tool: "ffmpeg", command: "ffmpeg" };
+  if (await executableAvailable("ffmpeg")) return { tool: "ffmpeg", command: "ffmpeg" };
+  if (await executableAvailable("avconvert")) return { tool: "avconvert", command: "avconvert" };
+  if (await executableAvailable("/usr/bin/avconvert")) return { tool: "avconvert", command: "/usr/bin/avconvert" };
+
+  throw new VideoExportDependencyError(["ffmpeg"]);
+}
+
+function createVideoSplitCommand(
+  tool: { tool: "ffmpeg" | "avconvert"; command: string },
+  inputPath: string,
+  segment: VideoSegmentPlanEntry,
+  outputDir: string
+): VideoSplitCommand {
+  const outputPath = path.join(outputDir, segment.outputName);
+  const startSeconds = seconds(segment.startMs);
+  const durationSeconds = seconds(segment.durationMs);
+  const args =
+    tool.tool === "ffmpeg"
+      ? [
+          "-ss",
+          startSeconds,
+          "-i",
+          inputPath,
+          "-t",
+          durationSeconds,
+          "-c:v",
+          "libx264",
+          "-pix_fmt",
+          "yuv420p",
+          "-c:a",
+          "aac",
+          outputPath
+        ]
+      : [
+          "--source",
+          inputPath,
+          "--output",
+          outputPath,
+          "--replace",
+          "--preset",
+          "PresetHighestQuality",
+          "--start",
+          startSeconds,
+          "--duration",
+          durationSeconds
+        ];
+
+  return {
+    tool: tool.tool,
+    command: tool.command,
+    args,
+    inputPath,
+    outputPath,
+    segment
+  };
+}
+
+function seconds(ms: number): string {
+  return (Math.max(0, ms) / 1000).toFixed(3).replace(/\.?0+$/, "");
+}
+
+async function executableAvailable(command: string): Promise<boolean> {
+  if (command.includes(path.sep)) {
+    try {
+      await access(command);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return commandAvailable(command);
+}
+
+async function assertOutputFile(filePath: string, message: string): Promise<void> {
+  try {
+    if ((await stat(filePath)).size > 0) return;
+  } catch {
+    // Report a consistent split failure below.
+  }
+  throw new Error(`${message}: ${filePath}`);
 }
 
 function summarizePlan(plan: VideoExportPlan): Omit<VideoExportPlan, "frames"> {

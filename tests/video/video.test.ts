@@ -9,12 +9,14 @@ import { decodePng, encodePng, type RgbaImage } from "../../src/report/fidelity.
 import {
   captureVideoFrames,
   comparePixelFrames,
+  createSegmentPlan,
   createVideoFrameDiagnostics,
   createVideoFrameFidelityReport,
   createVideoExportPlan,
   createVideoFramePlan,
   describeVideoDependencies,
   resolveVideoDependencies,
+  splitVideoIntoSegments,
   VideoExportDependencyError
 } from "../../src/video/index.ts";
 
@@ -59,6 +61,73 @@ describe("video export planning", () => {
     assert.equal(transitionFrame?.snapshot.resolution.inTransition, true);
     assert.equal(transitionFrame?.snapshot.transition?.currentSlideIndex, 1);
     assert.equal(transitionFrame?.snapshot.slides.some((slide) => slide.phase === "previous"), true);
+  });
+
+  test("creates slide video segments from content and timeline event boundaries", () => {
+    const segments = createSegmentPlan(createDemoDeck());
+
+    assert.deepEqual(
+      segments.map((segment) => [segment.id, segment.slideIndex, segment.clickIndex, segment.startMs, segment.endMs, segment.outputName]),
+      [
+        ["slide-1-segment-1", 0, 0, 0, 350, "slide-1-segment-1.mp4"],
+        ["slide-1-segment-2", 0, 1, 350, 1050, "slide-1-segment-2.mp4"],
+        ["slide-1-segment-3", 0, 2, 1050, 1600, "slide-1-segment-3.mp4"],
+        ["slide-1-segment-4", 0, 3, 1600, 2500, "slide-1-segment-4.mp4"],
+        ["slide-1-segment-5", 0, 4, 2500, 2600, "slide-1-segment-5.mp4"],
+        ["slide-2-segment-1", 1, 0, 3500, 3700, "slide-2-segment-1.mp4"],
+        ["slide-2-segment-2", 1, 1, 3700, 4320, "slide-2-segment-2.mp4"],
+        ["slide-2-segment-3", 1, 2, 4320, 5300, "slide-2-segment-3.mp4"]
+      ]
+    );
+    assert.deepEqual(
+      segments.map((segment) => segment.durationMs),
+      [350, 700, 550, 900, 100, 200, 620, 980]
+    );
+  });
+
+  test("creates dry-run commands for ffmpeg and avconvert segment splitting", async () => {
+    const segments = createSegmentPlan(createDemoDeck()).slice(0, 1);
+    const ffmpeg = await splitVideoIntoSegments("/tmp/keynote movie.m4v", segments, "/tmp/segments", {
+      dryRun: true,
+      ffmpegPath: "/opt/bin/ffmpeg"
+    });
+    const avconvert = await splitVideoIntoSegments("/tmp/keynote movie.m4v", segments, "/tmp/segments", {
+      dryRun: true,
+      avconvertPath: "/usr/bin/avconvert"
+    });
+
+    assert.deepEqual(ffmpeg.commands[0]?.args, [
+      "-ss",
+      "0",
+      "-i",
+      "/tmp/keynote movie.m4v",
+      "-t",
+      "0.35",
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "/tmp/segments/slide-1-segment-1.mp4"
+    ]);
+    assert.equal(ffmpeg.commands[0]?.tool, "ffmpeg");
+    assert.equal(ffmpeg.commands[0]?.command, "/opt/bin/ffmpeg");
+    assert.deepEqual(avconvert.commands[0]?.args, [
+      "--source",
+      "/tmp/keynote movie.m4v",
+      "--output",
+      "/tmp/segments/slide-1-segment-1.mp4",
+      "--replace",
+      "--preset",
+      "PresetHighestQuality",
+      "--start",
+      "0",
+      "--duration",
+      "0.35"
+    ]);
+    assert.equal(avconvert.commands[0]?.tool, "avconvert");
+    assert.equal(avconvert.commands[0]?.command, "/usr/bin/avconvert");
   });
 
   test("exposes clear dependency error details", () => {
