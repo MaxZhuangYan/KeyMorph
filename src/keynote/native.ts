@@ -5657,6 +5657,7 @@ function cleanTextCandidate(value: string): string | undefined {
     text = text.replaceAll(marker, " ");
   }
   text = cleanHumanTextResidue(text);
+  text = cleanNativeTextPrefixResidue(text);
   text = text.replace(/^[|:;,\-_.\s]+|[|:;,\-_.\s]+$/g, "").replace(/\s+/g, " ").trim();
   if (!text || isContainerMarker(text)) {
     return undefined;
@@ -5677,6 +5678,13 @@ function cleanHumanTextResidue(value: string): string {
   }
   text = cleanDuplicatedAsciiTail(text);
   return text;
+}
+
+function cleanNativeTextPrefixResidue(value: string): string {
+  let text = value.trim();
+  text = text.replace(/^[A-Z0-9](?=(?:Epoch|DePIN)\b)/, "");
+  text = text.replace(/^[A-Z0-9](?=V\d\b)/, "");
+  return text.trim();
 }
 
 function looksLikePresentationText(text: string): boolean {
@@ -5770,10 +5778,15 @@ function isLikelyNativeNoiseText(text: string): boolean {
   if (/[\p{Script=Han}]/u.test(text) && /[A-Za-z0-9][*\\]$/.test(text)) {
     return true;
   }
-  if (/[\p{Script=Han}]/u.test(text) && /["'“”‘’]?[A-Za-z0-9+&()]{1,4}$/.test(text)) {
+  const shortAsciiTail = text.match(/["'“”‘’]?([A-Za-z0-9+&()]{1,4})$/)?.[1];
+  if (/[\p{Script=Han}]/u.test(text) && shortAsciiTail && !isAllowedNativeShortAsciiTail(shortAsciiTail)) {
     return true;
   }
   return false;
+}
+
+function isAllowedNativeShortAsciiTail(value: string): boolean {
+  return new Set(["AI", "API", "App", "Demo", "MVP", "NOM", "UI", "V1", "V2", "Web"]).has(value);
 }
 
 function hasNativeLocaleResidue(text: string): boolean {

@@ -326,6 +326,9 @@ describe("Keynote bridge", () => {
         protoString("XBO Transition\u0012$a"),
         protoString("AI Agent 社会模拟游戏"),
         protoString("Epoch 1 $NOM 上链 Agent 链上身份 资产可交易"),
+        protoString("9Epoch 1 $NOM 上链 Agent 链上身份 资产可交易"),
+        protoString("ODePIN 网络 玩家设备贡献算力"),
+        protoString("DV1 链下原型 可运行的Demo"),
         protoString("图片 8"),
         protoString("E.l"),
         protoString("decimal"),
@@ -338,7 +341,12 @@ describe("Keynote bridge", () => {
     assert.equal(validateIR(deck).valid, true);
     const text = deck.deck.slides[0]?.objects.filter((object) => object.type === "text").map((object) => object.text.plainText);
 
-    assert.deepEqual(text, ["AI Agent 社会模拟游戏", "Epoch 1 $NOM 上链 Agent 链上身份 资产可交易"]);
+    assert.deepEqual(text, [
+      "AI Agent 社会模拟游戏",
+      "Epoch 1 $NOM 上链 Agent 链上身份 资产可交易",
+      "DePIN 网络 玩家设备贡献算力",
+      "V1 链下原型 可运行的Demo"
+    ]);
   });
 
   test("uses native snapshot images instead of low-confidence text fallback", async () => {
