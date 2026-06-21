@@ -2982,9 +2982,8 @@ function nativeBuildEventFromEvidence(
     };
   }
   if (build.effect && /motion-path/i.test(build.effect) && build.motionPath) {
-    const startPoint = build.motionPath.points[0];
-    const endPoint = build.motionPath.points[build.motionPath.points.length - 1];
-    if (startPoint && endPoint) {
+    const motionKeyframes = nativeMotionPathKeyframes(build.motionPath.points);
+    if (motionKeyframes) {
       return {
         id: nativeBuildEventId(slideId, build, timing, index, targetIndex, resolution.object.id, "motion-path"),
         kind: "keyframes",
@@ -2998,18 +2997,12 @@ function nativeBuildEventFromEvidence(
           {
             property: "transform.translateX",
             interpolation: "number",
-            keyframes: [
-              { offset: 0, value: startPoint.x },
-              { offset: 1, value: endPoint.x }
-            ]
+            keyframes: motionKeyframes.map((keyframe) => ({ offset: keyframe.offset, value: keyframe.x }))
           },
           {
             property: "transform.translateY",
             interpolation: "number",
-            keyframes: [
-              { offset: 0, value: startPoint.y },
-              { offset: 1, value: endPoint.y }
-            ]
+            keyframes: motionKeyframes.map((keyframe) => ({ offset: keyframe.offset, value: keyframe.y }))
           }
         ],
         metadata: nativeBuildEventMetadata(build, timing, resolution, "motion-path")
@@ -3352,6 +3345,18 @@ function nativeBuildEventMetadata(
     ...(timing?.startsWithPrevious !== undefined ? { nativeBuildStartsWithPrevious: timing.startsWithPrevious } : {}),
     ...(timing?.afterPrevious !== undefined ? { nativeBuildAfterPrevious: timing.afterPrevious } : {})
   };
+}
+
+function nativeMotionPathKeyframes(points: Array<{ x: number; y: number }>): Array<{ offset: number; x: number; y: number }> | undefined {
+  if (points.length < 2) {
+    return undefined;
+  }
+  const denominator = points.length - 1;
+  return points.map((point, index) => ({
+    offset: Number((index / denominator).toFixed(6)),
+    x: point.x,
+    y: point.y
+  }));
 }
 
 function nativeBuildGranularity(effect: string | undefined): "character" | "word" | "line" | "object" | undefined {
@@ -4183,11 +4188,11 @@ function nativeMotionPathEvidenceFromPayload(payload: Uint8Array): NativeIwaMoti
   if (!first || !last || !isZeroishPoint(first) || !isFiniteMotionPoint(last)) {
     return undefined;
   }
-  const points = [
-    { x: 0, y: 0 },
-    { x: roundGeometryNumber(last.x), y: roundGeometryNumber(last.y) }
-  ];
-  if (Math.abs(points[1]!.x) < 0.001 && Math.abs(points[1]!.y) < 0.001) {
+  const points = pointClusters.map((point, index) =>
+    index === 0 ? { x: 0, y: 0 } : { x: roundGeometryNumber(point.x), y: roundGeometryNumber(point.y) }
+  );
+  const lastPoint = points[points.length - 1];
+  if (!lastPoint || Math.abs(lastPoint.x) < 0.001 && Math.abs(lastPoint.y) < 0.001) {
     return undefined;
   }
   const extentPoints = nativeMotionPathExtentPoints(pathPayload);

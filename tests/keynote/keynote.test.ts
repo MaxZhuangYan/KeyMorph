@@ -790,7 +790,10 @@ describe("Keynote bridge", () => {
               direction: "Action",
               effect: "apple:action-motion-path",
               durationSeconds: 1,
-              motionPath: { x: 50, y: -252 }
+              motionPath: [
+                { x: 40, y: 0 },
+                { x: 50, y: -252 }
+              ]
             })
           }
         ]),
@@ -829,11 +832,18 @@ describe("Keynote bridge", () => {
     if (motion?.kind !== "keyframes") throw new Error("Expected motion path keyframes.");
     assert.deepEqual(motion.tracks.find((track) => track.property === "transform.translateX")?.keyframes, [
       { offset: 0, value: 0 },
+      { offset: 0.5, value: 40 },
       { offset: 1, value: 50 }
     ]);
     assert.deepEqual(motion.tracks.find((track) => track.property === "transform.translateY")?.keyframes, [
       { offset: 0, value: 0 },
+      { offset: 0.5, value: 0 },
       { offset: 1, value: -252 }
+    ]);
+    assert.deepEqual(motion.metadata?.nativeMotionPathPoints, [
+      { x: 0, y: 0 },
+      { x: 40, y: 0 },
+      { x: 50, y: -252 }
     ]);
     assert.equal(motion.metadata?.nativeMotionPathRelative, true);
     assert.deepEqual(motion.metadata?.nativeMotionPathExtentPoints, [{ x: 50, y: 252 }]);
@@ -1435,7 +1445,7 @@ function nativeBuildPayload(values: {
   effect: string;
   durationSeconds: number;
   delaySeconds?: number;
-  motionPath?: { x: number; y: number };
+  motionPath?: { x: number; y: number } | Array<{ x: number; y: number }>;
 }): Uint8Array {
   return concat([
     protoBytes(protoVarint(1, values.targetId), 1),
@@ -1499,11 +1509,13 @@ function nativeTextDrawablePayload(values: {
   ]);
 }
 
-function nativeMotionPathPayload(point: { x: number; y: number }): Uint8Array {
+function nativeMotionPathPayload(pointOrPoints: { x: number; y: number } | Array<{ x: number; y: number }>): Uint8Array {
+  const points = Array.isArray(pointOrPoints) ? pointOrPoints : [pointOrPoints];
+  const last = points[points.length - 1] ?? { x: 0, y: 0 };
   const zero = nativeMotionPathPointCluster({ x: 0, y: 0 });
-  const end = nativeMotionPathPointCluster(point);
-  const extent = nativeMotionPathPoint({ x: Math.abs(point.x), y: Math.abs(point.y) });
-  return protoBytes(concat([protoBytes(concat([zero, end]), 1), protoBytes(extent, 2)]), 8);
+  const pathPoints = points.map(nativeMotionPathPointCluster);
+  const extent = nativeMotionPathPoint({ x: Math.abs(last.x), y: Math.abs(last.y) });
+  return protoBytes(concat([protoBytes(concat([zero, ...pathPoints]), 1), protoBytes(extent, 2)]), 8);
 }
 
 function nativeMotionPathPointCluster(point: { x: number; y: number }): Uint8Array {
