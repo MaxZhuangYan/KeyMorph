@@ -280,6 +280,189 @@ describe("PPTX export", () => {
     assert.ok(parsed.conversion?.degradedFeatures.some((feature) => feature.code === "presentationml-autoreverse-behavior"));
   });
 
+  test("imports Keynote-style dissolve and wipe animEffect filters", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-test-"));
+    const out = path.join(dir, "keynote-effects.pptx");
+
+    await exportIrToPptx(createAnimatedDeck(), out);
+    await patchPptxXml(out, "ppt/slides/slide1.xml", (source) =>
+      source.replace(
+        /<p:animEffect transition="in" filter="fade">[\s\S]*?<\/p:animEffect>/,
+        `<p:animEffect transition="in" filter="dissolve">
+  <p:cBhvr>
+    <p:cTn id="4" dur="900" fill="hold">
+      <p:stCondLst><p:cond delay="100"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="2"/></p:tgtEl>
+  </p:cBhvr>
+</p:animEffect>`
+      ).replace(
+        /<p:animMotion[\s\S]*?<\/p:animMotion>/,
+        `<p:animEffect transition="out" filter="wipe(left)">
+  <p:cBhvr>
+    <p:cTn id="10" dur="600" fill="hold">
+      <p:stCondLst><p:cond delay="400"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="3"/></p:tgtEl>
+  </p:cBhvr>
+</p:animEffect>`
+      )
+    );
+
+    const parsed = await parsePptxToIr(out);
+    const events = parsed.deck.slides[0].timeline?.events ?? [];
+    const dissolve = events.find((event) => event.kind === "keyframes" && event.metadata?.pptxEffect === "dissolve");
+    const wipe = events.find((event) => event.kind === "keyframes" && event.metadata?.pptxEffect === "wipe");
+
+    assert.equal(dissolve?.kind, "keyframes");
+    if (dissolve?.kind !== "keyframes") throw new Error("Expected imported dissolve keyframes.");
+    assert.equal(dissolve.durationMs, 900);
+    assert.deepEqual(dissolve.tracks.find((track) => track.property === "opacity")?.keyframes, [
+      { offset: 0, value: 0 },
+      { offset: 1, value: 1 }
+    ]);
+
+    assert.equal(wipe?.kind, "keyframes");
+    if (wipe?.kind !== "keyframes") throw new Error("Expected imported wipe keyframes.");
+    assert.equal(wipe.metadata?.pptxWipeDirection, "left");
+    assert.ok(wipe.tracks.some((track) => track.property === "bounds"));
+    assert.ok(wipe.tracks.some((track) => track.property === "opacity"));
+    assert.equal(
+      parsed.conversion?.unsupportedFeatures.some(
+        (feature) => feature.code === "presentationml-animation-effect" && /dissolve|wipe/.test(feature.description)
+      ),
+      false
+    );
+  });
+
+  test("imports Keynote-exported ppt_x and ppt_y property animations as translation", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-test-"));
+    const out = path.join(dir, "ppt-xy.pptx");
+
+    await exportIrToPptx(createAnimatedDeck(), out);
+    await patchPptxXml(out, "ppt/slides/slide1.xml", (source) =>
+      source.replace(
+        /<p:animEffect transition="in" filter="fade">[\s\S]*?<\/p:animEffect>/,
+        `<p:anim calcmode="lin" valueType="num">
+  <p:cBhvr>
+    <p:cTn id="4" dur="800" fill="hold">
+      <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="2"/></p:tgtEl>
+    <p:attrNameLst><p:attrName>ppt_x</p:attrName></p:attrNameLst>
+  </p:cBhvr>
+  <p:tavLst>
+    <p:tav tm="0"><p:val><p:fltVal val="0"/></p:val></p:tav>
+    <p:tav tm="100000"><p:val><p:fltVal val="0.25"/></p:val></p:tav>
+  </p:tavLst>
+</p:anim>`
+      ).replace(
+        /<p:animMotion[\s\S]*?<\/p:animMotion>/,
+        `<p:anim calcmode="lin" valueType="num">
+  <p:cBhvr>
+    <p:cTn id="10" dur="600" fill="hold">
+      <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="3"/></p:tgtEl>
+    <p:attrNameLst><p:attrName>ppt_y</p:attrName></p:attrNameLst>
+  </p:cBhvr>
+  <p:tavLst>
+    <p:tav tm="0"><p:val><p:fltVal val="0"/></p:val></p:tav>
+    <p:tav tm="100000"><p:val><p:fltVal val="-0.5"/></p:val></p:tav>
+  </p:tavLst>
+</p:anim>`
+      )
+    );
+
+    const parsed = await parsePptxToIr(out);
+    const events = parsed.deck.slides[0].timeline?.events ?? [];
+    const x = events.find(
+      (event) => event.kind === "keyframes" && event.tracks.some((track) => track.property === "transform.translateX")
+    );
+    const y = events.find(
+      (event) => event.kind === "keyframes" && event.tracks.some((track) => track.property === "transform.translateY")
+    );
+
+    assert.equal(x?.kind, "keyframes");
+    assert.equal(y?.kind, "keyframes");
+    if (x?.kind !== "keyframes" || y?.kind !== "keyframes") throw new Error("Expected imported ppt_x/ppt_y keyframes.");
+    assert.deepEqual(x.tracks.find((track) => track.property === "transform.translateX")?.keyframes, [
+      { offset: 0, value: 0 },
+      { offset: 1, value: 320 }
+    ]);
+    assert.deepEqual(y.tracks.find((track) => track.property === "transform.translateY")?.keyframes, [
+      { offset: 0, value: 0 },
+      { offset: 1, value: -360 }
+    ]);
+    assert.equal(
+      parsed.conversion?.unsupportedFeatures.some(
+        (feature) => feature.code === "presentationml-anim-property" && /ppt_[xy]/.test(feature.description)
+      ),
+      false
+    );
+  });
+
+  test("imports Keynote-exported ppt_x and ppt_y expression animations", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-test-"));
+    const out = path.join(dir, "ppt-xy-expression.pptx");
+
+    await exportIrToPptx(createAnimatedDeck(), out);
+    await patchPptxXml(out, "ppt/slides/slide1.xml", (source) =>
+      source.replace(
+        /<p:animEffect transition="in" filter="fade">[\s\S]*?<\/p:animEffect>/,
+        `<p:anim calcmode="lin" valueType="num">
+  <p:cBhvr>
+    <p:cTn id="4" dur="800" fill="hold">
+      <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="2"/></p:tgtEl>
+    <p:attrNameLst><p:attrName>ppt_x</p:attrName></p:attrNameLst>
+  </p:cBhvr>
+  <p:tavLst>
+    <p:tav tm="0"><p:val><p:strVal val="#ppt_x"/></p:val></p:tav>
+    <p:tav tm="100000"><p:val><p:strVal val="#ppt_x+128"/></p:val></p:tav>
+  </p:tavLst>
+</p:anim>`
+      ).replace(
+        /<p:animMotion[\s\S]*?<\/p:animMotion>/,
+        `<p:anim calcmode="lin" valueType="num">
+  <p:cBhvr>
+    <p:cTn id="10" dur="600" fill="hold">
+      <p:stCondLst><p:cond delay="0"/></p:stCondLst>
+    </p:cTn>
+    <p:tgtEl><p:spTgt spid="3"/></p:tgtEl>
+    <p:attrNameLst><p:attrName>ppt_y</p:attrName></p:attrNameLst>
+  </p:cBhvr>
+  <p:tavLst>
+    <p:tav tm="0"><p:val><p:strVal val="#ppt_y-#ppt_h/2"/></p:val></p:tav>
+    <p:tav tm="100000"><p:val><p:strVal val="#ppt_y"/></p:val></p:tav>
+  </p:tavLst>
+</p:anim>`
+      )
+    );
+
+    const parsed = await parsePptxToIr(out);
+    const events = parsed.deck.slides[0].timeline?.events ?? [];
+    const x = events.find(
+      (event) => event.kind === "keyframes" && event.tracks.some((track) => track.property === "transform.translateX")
+    );
+    const y = events.find(
+      (event) => event.kind === "keyframes" && event.tracks.some((track) => track.property === "transform.translateY")
+    );
+
+    assert.equal(x?.kind, "keyframes");
+    assert.equal(y?.kind, "keyframes");
+    if (x?.kind !== "keyframes" || y?.kind !== "keyframes") throw new Error("Expected imported ppt_x/ppt_y expression keyframes.");
+    assert.deepEqual(x.tracks.find((track) => track.property === "transform.translateX")?.keyframes, [
+      { offset: 0, value: 0 },
+      { offset: 1, value: 128 }
+    ]);
+    assert.deepEqual(y.tracks.find((track) => track.property === "transform.translateY")?.keyframes, [
+      { offset: 0, value: -36 },
+      { offset: 1, value: 0 }
+    ]);
+  });
+
   test("reports unsupported command and effect metadata without dropping supported effects", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-test-"));
     const out = path.join(dir, "unsupported-metadata.pptx");

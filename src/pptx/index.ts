@@ -183,6 +183,7 @@ function parseSlideXml(
 ): ParsedSlide {
   const objects: IRObject[] = [];
   const shapeIdToObjectId = new Map<string, string>();
+  const objectBoundsById = new Map<string, { x: number; y: number; width: number; height: number }>();
   const shapeSources = source.match(/<p:sp\b[\s\S]*?<\/p:sp>/g) ?? [];
   const rels = parseRelationships(getTextEntry(entries, relationshipsPathForPart(slidePath)) ?? "");
 
@@ -221,39 +222,50 @@ function parseSlideXml(
     }
     if (sourceShapeId && objects.some((object) => object.id === id)) {
       shapeIdToObjectId.set(sourceShapeId, id);
+      objectBoundsById.set(id, bounds);
     }
   });
 
   const pictureSources = source.match(/<p:pic\b[\s\S]*?<\/p:pic>/g) ?? [];
   pictureSources.forEach((pictureXml, pictureIndex) => {
     const id = `slide-${index + 1}-picture-${pictureIndex + 1}`;
+    const sourceShapeId = readShapeSourceId(pictureXml);
     const relId = pictureXml.match(/<a:blip\b[^>]*r:embed="([^"]+)"/)?.[1];
     const target = relId ? rels.get(relId) : undefined;
     const imagePath = target ? normalizePartPath(pathJoinPart(path.posix.dirname(slidePath), target)) : undefined;
     const imageData = imagePath ? entries.get(imagePath) : undefined;
     const contentType = imagePath ? contentTypeFromPartPath(imagePath) : undefined;
     const dataUriValue = imageData && contentType ? `data:${contentType};base64,${Buffer.from(imageData).toString("base64")}` : undefined;
+    const bounds = readShapeBounds(pictureXml, slideSize, {
+      x: 96 + (shapeSources.length + pictureIndex) * 28,
+      y: 96 + (shapeSources.length + pictureIndex) * 28,
+      width: 400,
+      height: 240
+    });
     objects.push({
       id,
       type: "image",
       name: readShapeName(pictureXml) ?? "Picture",
-      bounds: readShapeBounds(pictureXml, slideSize, {
-        x: 96 + (shapeSources.length + pictureIndex) * 28,
-        y: 96 + (shapeSources.length + pictureIndex) * 28,
-        width: 400,
-        height: 240
-      }),
+      bounds,
       opacity: 1,
       source: {
         ...(dataUriValue ? { dataUri: dataUriValue } : {}),
         ...(!dataUriValue && imagePath ? { uri: `pptx://${imagePath}` } : {}),
         metadata: imagePath ? { pptxImagePath: imagePath, mimeType: contentType ?? "" } : undefined
       },
-      metadata: relId ? { pptxRelationshipId: relId, ...(imagePath ? { pptxImagePath: imagePath } : {}) } : undefined
+      metadata: {
+        ...(sourceShapeId ? { pptxShapeId: sourceShapeId } : {}),
+        ...(relId ? { pptxRelationshipId: relId } : {}),
+        ...(imagePath ? { pptxImagePath: imagePath } : {})
+      }
     });
+    if (sourceShapeId) {
+      shapeIdToObjectId.set(sourceShapeId, id);
+      objectBoundsById.set(id, bounds);
+    }
   });
 
-  const timing = parseSlideTiming(source, index, slideSize, shapeIdToObjectId);
+  const timing = parseSlideTiming(source, index, slideSize, shapeIdToObjectId, objectBoundsById);
   const maxEventEnd = timing.events.reduce((max, event) => Math.max(max, eventStartMs(event) + (event.durationMs ?? 0)), 0);
 
   return {
@@ -500,7 +512,8 @@ function parseSlideTiming(
   source: string,
   slideIndex: number,
   slideSize: { width: number; height: number },
-  shapeIdToObjectId: Map<string, string>
+  shapeIdToObjectId: Map<string, string>,
+  objectBoundsById: Map<string, { x: number; y: number; width: number; height: number }> = new Map()
 ): TimingParseResult {
   const timingXml = extractXmlElements(source, "timing")[0];
   const result: TimingParseResult = {
@@ -524,6 +537,7 @@ function parseSlideTiming(
       parsedEvents.length,
       slideSize,
       shapeIdToObjectId,
+      objectBoundsById,
       result.unsupportedFeatures,
       result.degradedFeatures
     );
@@ -560,14 +574,15 @@ function parseSupportedTimingEvent(
   eventIndex: number,
   slideSize: { width: number; height: number },
   shapeIdToObjectId: Map<string, string>,
+  objectBoundsById: Map<string, { x: number; y: number; width: number; height: number }>,
   unsupportedFeatures: UnsupportedFeature[],
   degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
   if (node.tag === "animEffect") {
-    return parseFadeEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
+    return parseAnimEffect(node.xml, slideIndex, eventIndex, shapeIdToObjectId, objectBoundsById, unsupportedFeatures, degradedFeatures);
   }
   if (node.tag === "anim") {
-    return parsePropertyAnimation(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
+    return parsePropertyAnimation(node.xml, slideIndex, eventIndex, slideSize, shapeIdToObjectId, objectBoundsById, unsupportedFeatures, degradedFeatures);
   }
   if (node.tag === "set") {
     return parseVisibilitySet(node.xml, slideIndex, eventIndex, shapeIdToObjectId, unsupportedFeatures, degradedFeatures);
@@ -595,17 +610,102 @@ function applyTimingContext(event: AnimationEvent, context: TimingSequenceContex
   }
 }
 
-function parseFadeEffect(
+function parseAnimEffect(
   node: string,
   slideIndex: number,
   eventIndex: number,
   shapeIdToObjectId: Map<string, string>,
+  objectBoundsById: Map<string, { x: number; y: number; width: number; height: number }>,
   unsupportedFeatures: UnsupportedFeature[],
   degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
   const attrs = readXmlAttributes(node, "animEffect");
   const filter = String(attrs.get("filter") ?? "").toLowerCase();
-  if (!filter.includes("fade")) {
+  const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
+  if (!targetId) return undefined;
+
+  const transition = String(attrs.get("transition") ?? "in").toLowerCase();
+  const fadesOut = transition === "out";
+  const timing = readTimingNodeSemantics(node, 500, slideIndex, "animEffect", degradedFeatures);
+  if (isFadeLikeAnimEffect(filter)) {
+    return {
+      id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+      kind: "keyframes",
+      label: fadesOut ? "Fade out" : "Fade in",
+      targetId,
+      start: { type: "absolute", atMs: readTimingDelay(node) },
+      durationMs: timing.durationMs,
+      easing: "linear",
+      fill: timing.fill,
+      tracks: [
+        {
+          property: "opacity",
+          keyframes: [
+            { offset: 0, value: fadesOut ? 1 : 0 },
+            { offset: 1, value: fadesOut ? 0 : 1 }
+          ]
+        }
+      ],
+      metadata: { ...timing.metadata, pptxEffect: filter.includes("dissolve") ? "dissolve" : "fade", pptxTransition: fadesOut ? "out" : "in" }
+    };
+  }
+
+  const wipeDirection = parseWipeDirection(filter);
+  const bounds = objectBoundsById.get(targetId);
+  if (wipeDirection && bounds) {
+    return {
+      id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+      kind: "keyframes",
+      label: fadesOut ? `Wipe ${wipeDirection} out` : `Wipe ${wipeDirection} in`,
+      targetId,
+      start: { type: "absolute", atMs: readTimingDelay(node) },
+      durationMs: timing.durationMs,
+      easing: "linear",
+      fill: timing.fill,
+      tracks: wipeEffectTracks(bounds, wipeDirection, fadesOut),
+      metadata: {
+        ...timing.metadata,
+        pptxEffect: "wipe",
+        pptxFilter: filter,
+        pptxWipeDirection: wipeDirection,
+        pptxTransition: fadesOut ? "out" : "in",
+        pptxDegradation: "PowerPoint/Keynote wipe is approximated with object bounds reveal instead of a true mask."
+      }
+    };
+  }
+
+  if (wipeDirection && !bounds) {
+    degradedFeatures.push({
+      code: "presentationml-wipe-bounds",
+      severity: "warning",
+      area: "animation",
+      description: `PowerPoint wipe(${wipeDirection}) was imported as opacity because the target bounds were unavailable.`,
+      sourcePath: `ppt/slides/slide${slideIndex + 1}.xml#/p:timing/p:animEffect`,
+      fallback: "Use an opacity fade for the target object."
+    });
+    return {
+      id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
+      kind: "keyframes",
+      label: fadesOut ? "Wipe out" : "Wipe in",
+      targetId,
+      start: { type: "absolute", atMs: readTimingDelay(node) },
+      durationMs: timing.durationMs,
+      easing: "linear",
+      fill: timing.fill,
+      tracks: [
+        {
+          property: "opacity",
+          keyframes: [
+            { offset: 0, value: fadesOut ? 1 : 0 },
+            { offset: 1, value: fadesOut ? 0 : 1 }
+          ]
+        }
+      ],
+      metadata: { ...timing.metadata, pptxEffect: "wipe", pptxFilter: filter, pptxTransition: fadesOut ? "out" : "in" }
+    };
+  }
+
+  {
     const metadata = describeAnimEffectMetadata(node);
     unsupportedFeatures.push({
       code: "presentationml-animation-effect",
@@ -617,40 +717,15 @@ function parseFadeEffect(
     });
     return undefined;
   }
-
-  const targetId = resolveTimingTarget(node, slideIndex, shapeIdToObjectId, unsupportedFeatures);
-  if (!targetId) return undefined;
-
-  const transition = String(attrs.get("transition") ?? "in").toLowerCase();
-  const fadesOut = transition === "out";
-  const timing = readTimingNodeSemantics(node, 500, slideIndex, "animEffect", degradedFeatures);
-  return {
-    id: `slide-${slideIndex + 1}-anim-${eventIndex + 1}`,
-    kind: "keyframes",
-    label: fadesOut ? "Fade out" : "Fade in",
-    targetId,
-    start: { type: "absolute", atMs: readTimingDelay(node) },
-    durationMs: timing.durationMs,
-    easing: "linear",
-    fill: timing.fill,
-    tracks: [
-      {
-        property: "opacity",
-        keyframes: [
-          { offset: 0, value: fadesOut ? 1 : 0 },
-          { offset: 1, value: fadesOut ? 0 : 1 }
-        ]
-      }
-    ],
-    metadata: { ...timing.metadata, pptxEffect: "fade", pptxTransition: fadesOut ? "out" : "in" }
-  };
 }
 
 function parsePropertyAnimation(
   node: string,
   slideIndex: number,
   eventIndex: number,
+  slideSize: { width: number; height: number },
   shapeIdToObjectId: Map<string, string>,
+  objectBoundsById: Map<string, { x: number; y: number; width: number; height: number }>,
   unsupportedFeatures: UnsupportedFeature[],
   degradedFeatures: DegradedFeature[]
 ): AnimationEvent | undefined {
@@ -659,7 +734,7 @@ function parsePropertyAnimation(
 
   const attrNames = readTimingAttrNames(node);
   const property = firstMappedAnimProperty(attrNames);
-  const values = readPropertyAnimationKeyframes(node, property);
+  const values = readPropertyAnimationKeyframes(node, property, slideSize, objectBoundsById.get(targetId));
   if (!property || values.length < 2) {
     const attrs = readXmlAttributes(node, "anim");
     unsupportedFeatures.push({
@@ -1459,43 +1534,55 @@ function firstMappedAnimProperty(attrNames: string[]): string | undefined {
   for (const attrName of attrNames) {
     const normalized = attrName.toLowerCase();
     if (normalized === "opacity" || normalized === "style.opacity" || normalized.endsWith(".opacity")) return "opacity";
+    if (normalized === "ppt_x" || normalized === "pptx" || normalized.endsWith(".ppt_x")) return "transform.translateX";
+    if (normalized === "ppt_y" || normalized === "ppty" || normalized.endsWith(".ppt_y")) return "transform.translateY";
   }
   return undefined;
 }
 
-function readPropertyAnimationKeyframes(node: string, property: string | undefined): { offset: number; value: number }[] {
+function readPropertyAnimationKeyframes(
+  node: string,
+  property: string | undefined,
+  slideSize: { width: number; height: number },
+  targetBounds?: { x: number; y: number; width: number; height: number }
+): { offset: number; value: number }[] {
   if (!property) return [];
   const tavs = Array.from(node.matchAll(/<p:tav\b[\s\S]*?<\/p:tav>/g)).map((match) => match[0]);
   const values = tavs
     .map((tav, index) => {
       const attrs = readXmlAttributes(tav, "tav");
-      const rawValue = readNumericAnimationValue(tav);
+      const rawValue = readNumericAnimationValue(tav, property, targetBounds);
       if (rawValue === undefined) return undefined;
       return {
         offset: parseAnimationOffset(attrs.get("tm"), index, tavs.length),
-        value: normalizePropertyAnimationValue(property, rawValue)
+        value: normalizePropertyAnimationValue(property, rawValue, slideSize)
       };
     })
     .filter((value): value is { offset: number; value: number } => Boolean(value));
   if (values.length >= 2) return values.sort((left, right) => left.offset - right.offset);
 
-  const from = readNumericAnimationValue(extractXmlElements(node, "from")[0] ?? "");
-  const to = readNumericAnimationValue(extractXmlElements(node, "to")[0] ?? "");
+  const from = readNumericAnimationValue(extractXmlElements(node, "from")[0] ?? "", property, targetBounds);
+  const to = readNumericAnimationValue(extractXmlElements(node, "to")[0] ?? "", property, targetBounds);
   if (from === undefined || to === undefined) return [];
   return [
-    { offset: 0, value: normalizePropertyAnimationValue(property, from) },
-    { offset: 1, value: normalizePropertyAnimationValue(property, to) }
+    { offset: 0, value: normalizePropertyAnimationValue(property, from, slideSize) },
+    { offset: 1, value: normalizePropertyAnimationValue(property, to, slideSize) }
   ];
 }
 
-function readNumericAnimationValue(node: string): number | undefined {
+function readNumericAnimationValue(
+  node: string,
+  property?: string,
+  targetBounds?: { x: number; y: number; width: number; height: number }
+): number | undefined {
   const value =
     readXmlAttributes(node, "fltVal").get("val") ??
     readXmlAttributes(node, "intVal").get("val") ??
     readXmlAttributes(node, "strVal").get("val");
   if (value === undefined) return undefined;
   const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : undefined;
+  if (Number.isFinite(numeric)) return numeric;
+  return readPptExpressionAnimationValue(value, property, targetBounds);
 }
 
 function parseAnimationOffset(value: string | undefined, index: number, count: number): number {
@@ -1506,9 +1593,181 @@ function parseAnimationOffset(value: string | undefined, index: number, count: n
   return Math.min(1, Math.max(0, Math.round(normalized * 10000) / 10000));
 }
 
-function normalizePropertyAnimationValue(property: string, value: number): number {
+function normalizePropertyAnimationValue(property: string, value: number, slideSize: { width: number; height: number }): number {
   if (property === "opacity") return normalizeOpacityValue(value);
+  if (property === "transform.translateX") return motionCoordinateToPx(value, slideSize.width);
+  if (property === "transform.translateY") return motionCoordinateToPx(value, slideSize.height);
   return value;
+}
+
+function readPptExpressionAnimationValue(
+  value: string,
+  property?: string,
+  targetBounds?: { x: number; y: number; width: number; height: number }
+): number | undefined {
+  const expression = unescapeXml(value).trim();
+  if (!expression) return undefined;
+  const baseline = pptAnimationBaseline(property, targetBounds);
+  if (expression === "#ppt_x" || expression === "#ppt_y") return 0;
+  const resolved = expression
+    .replaceAll("#ppt_x", String(baseline.x))
+    .replaceAll("#ppt_y", String(baseline.y))
+    .replaceAll("#ppt_w", String(Math.max(0, targetBounds?.width ?? 0)))
+    .replaceAll("#ppt_h", String(Math.max(0, targetBounds?.height ?? 0)));
+  if (!/^[\d+\-*/().\s]+$/.test(resolved)) return undefined;
+  const evaluated = evaluateSimpleNumericExpression(resolved);
+  if (evaluated === undefined) return undefined;
+  return evaluated - (property === "transform.translateY" ? baseline.y : property === "transform.translateX" ? baseline.x : 0);
+}
+
+function pptAnimationBaseline(property?: string, targetBounds?: { x: number; y: number; width: number; height: number }): { x: number; y: number } {
+  if (property === "transform.translateX") return { x: targetBounds?.x ?? 0, y: 0 };
+  if (property === "transform.translateY") return { x: 0, y: targetBounds?.y ?? 0 };
+  return { x: targetBounds?.x ?? 0, y: targetBounds?.y ?? 0 };
+}
+
+function evaluateSimpleNumericExpression(expression: string): number | undefined {
+  const parser = new NumericExpressionParser(expression);
+  const value = parser.parseExpression();
+  if (value === undefined || !parser.atEnd()) return undefined;
+  return Number.isFinite(value) ? value : undefined;
+}
+
+class NumericExpressionParser {
+  private index = 0;
+
+  constructor(private readonly source: string) {}
+
+  atEnd(): boolean {
+    this.skipWhitespace();
+    return this.index >= this.source.length;
+  }
+
+  parseExpression(): number | undefined {
+    let value = this.parseTerm();
+    if (value === undefined) return undefined;
+    while (true) {
+      this.skipWhitespace();
+      const operator = this.peek();
+      if (operator !== "+" && operator !== "-") return value;
+      this.index += 1;
+      const right = this.parseTerm();
+      if (right === undefined) return undefined;
+      value = operator === "+" ? value + right : value - right;
+    }
+  }
+
+  private parseTerm(): number | undefined {
+    let value = this.parseFactor();
+    if (value === undefined) return undefined;
+    while (true) {
+      this.skipWhitespace();
+      const operator = this.peek();
+      if (operator !== "*" && operator !== "/") return value;
+      this.index += 1;
+      const right = this.parseFactor();
+      if (right === undefined || (operator === "/" && right === 0)) return undefined;
+      value = operator === "*" ? value * right : value / right;
+    }
+  }
+
+  private parseFactor(): number | undefined {
+    this.skipWhitespace();
+    const operator = this.peek();
+    if (operator === "+" || operator === "-") {
+      this.index += 1;
+      const value = this.parseFactor();
+      return value === undefined ? undefined : operator === "-" ? -value : value;
+    }
+    if (operator === "(") {
+      this.index += 1;
+      const value = this.parseExpression();
+      this.skipWhitespace();
+      if (this.peek() !== ")") return undefined;
+      this.index += 1;
+      return value;
+    }
+    return this.parseNumber();
+  }
+
+  private parseNumber(): number | undefined {
+    this.skipWhitespace();
+    const match = this.source.slice(this.index).match(/^\d*\.?\d+(?:e[+-]?\d+)?/i);
+    if (!match) return undefined;
+    this.index += match[0].length;
+    const value = Number(match[0]);
+    return Number.isFinite(value) ? value : undefined;
+  }
+
+  private peek(): string | undefined {
+    return this.source[this.index];
+  }
+
+  private skipWhitespace(): void {
+    while (/\s/.test(this.source[this.index] ?? "")) this.index += 1;
+  }
+}
+
+function isFadeLikeAnimEffect(filter: string): boolean {
+  return filter.includes("fade") || filter.includes("dissolve");
+}
+
+function parseWipeDirection(filter: string): "left" | "right" | "up" | "down" | undefined {
+  const normalized = filter.toLowerCase();
+  if (!normalized.includes("wipe")) return undefined;
+  if (/\b(?:from)?left\b|\(left\)/.test(normalized)) return "left";
+  if (/\b(?:from)?right\b|\(right\)/.test(normalized)) return "right";
+  if (/\b(?:from)?up\b|\btop\b|\(up\)|\(top\)/.test(normalized)) return "up";
+  if (/\b(?:from)?down\b|\bbottom\b|\(down\)|\(bottom\)/.test(normalized)) return "down";
+  return "left";
+}
+
+function wipeEffectTracks(
+  bounds: { x: number; y: number; width: number; height: number },
+  direction: "left" | "right" | "up" | "down",
+  out: boolean
+) {
+  const collapsed = collapsedWipeBounds(bounds, direction);
+  return [
+    {
+      property: "bounds",
+      interpolation: "matrix",
+      keyframes: out
+        ? [
+            { offset: 0, value: bounds },
+            { offset: 1, value: collapsed }
+          ]
+        : [
+            { offset: 0, value: collapsed },
+            { offset: 1, value: bounds }
+          ]
+    },
+    {
+      property: "opacity",
+      interpolation: "number",
+      keyframes: out
+        ? [
+            { offset: 0, value: 1 },
+            { offset: 1, value: 0 }
+          ]
+        : [
+            { offset: 0, value: 0 },
+            { offset: 0.05, value: 1 },
+            { offset: 1, value: 1 }
+          ]
+    }
+  ];
+}
+
+function collapsedWipeBounds(
+  bounds: { x: number; y: number; width: number; height: number },
+  direction: "left" | "right" | "up" | "down"
+): { x: number; y: number; width: number; height: number } {
+  const minSize = 1;
+  if (direction === "right") return { ...bounds, width: minSize };
+  if (direction === "left") return { ...bounds, x: bounds.x + bounds.width - minSize, width: minSize };
+  if (direction === "down") return { ...bounds, height: minSize };
+  return { ...bounds, y: bounds.y + bounds.height - minSize, height: minSize };
 }
 
 function normalizeOpacityValue(value: number): number {
