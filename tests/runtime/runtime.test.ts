@@ -48,6 +48,14 @@ describe("HTML runtime rendering", () => {
     assert.match(markup, /Any slide deck becomes/);
   });
 
+  test("ignores non-positive stageScale for export-mode styling", () => {
+    const html = renderHtmlDocument(createDemoDeck(), { stageScale: 0 });
+
+    assert.match(html, /background: #202124/);
+    assert.match(html, /padding: 24px/);
+    assert.match(html, /box-shadow: 0 18px 55px/);
+  });
+
   test("renders native character-build text as grapheme spans", () => {
     const deck = createCharacterBuildDeck();
     const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);

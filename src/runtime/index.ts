@@ -162,7 +162,7 @@ export function renderHtmlDocument(deck: DeckIR, options: HtmlRuntimeOptions = {
   const controls = options.controls ?? true;
   const initialSlideIndex = options.initialSlideIndex ?? 0;
   const runtimeOptions = JSON.stringify({ stageScale: options.stageScale }).replaceAll("<", "\\u003c");
-  const exportMode = typeof options.stageScale === "number" && Number.isFinite(options.stageScale);
+  const exportMode = typeof options.stageScale === "number" && Number.isFinite(options.stageScale) && options.stageScale > 0;
 
   return `<!doctype html>
 <html lang="en">
