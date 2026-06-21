@@ -481,6 +481,70 @@ describe("Keynote bridge", () => {
     assert.equal(deck.conversion?.messages.some((message) => message.code === "keynote-native-build-animations-recovered"), true);
   });
 
+  test("assigns stable native morph keys for unique repeated text and assets", async () => {
+    const textDir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-native-text-morph-keys-"));
+    const textKeyPath = path.join(textDir, "morph-text.key");
+    await mkdir(path.join(textKeyPath, "Index"), { recursive: true });
+    await writeFile(path.join(textKeyPath, "Index", "Slide-1.iwa"), protoString("Shared Title"));
+    await writeFile(path.join(textKeyPath, "Index", "Slide-2.iwa"), protoString("Shared Title"));
+
+    const textDeck = await parseNativeKeynoteToIr(textKeyPath);
+    assert.equal(validateIR(textDeck).valid, true);
+    const firstText = textDeck.deck.slides[0]?.objects.find((object) => object.type === "text" && object.text.plainText === "Shared Title");
+    const secondText = textDeck.deck.slides[1]?.objects.find((object) => object.type === "text" && object.text.plainText === "Shared Title");
+    assert.match(firstText?.morphKey ?? "", /^native:text:/);
+    assert.equal(secondText?.morphKey, firstText?.morphKey);
+    assert.equal(firstText?.metadata?.nativeMorphKeySource, "text-content");
+    assert.equal(textDeck.deck.slides[0]?.metadata?.nativeMorphKeyCount, 1);
+    assert.equal(textDeck.deck.slides[1]?.metadata?.nativeMorphKeyCount, 1);
+
+    const assetDir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-native-asset-morph-keys-"));
+    const assetKeyPath = path.join(assetDir, "morph-asset.key");
+    await mkdir(path.join(assetKeyPath, "Data"), { recursive: true });
+    await mkdir(path.join(assetKeyPath, "Index"), { recursive: true });
+    await writeFile(path.join(assetKeyPath, "Data", "hero-42.png"), pngBytes(320, 180));
+    await writeFile(
+      path.join(assetKeyPath, "Index", "Slide-1.iwa"),
+      iwaArchiveRecord(111, [
+        { type: 3005, payload: nativeImagePlacementPayload(42, { x: 10, y: 20, width: 100, height: 80 }), dataReferences: [42] }
+      ])
+    );
+    await writeFile(
+      path.join(assetKeyPath, "Index", "Slide-2.iwa"),
+      iwaArchiveRecord(222, [
+        { type: 3005, payload: nativeImagePlacementPayload(42, { x: 210, y: 120, width: 180, height: 140 }), dataReferences: [42] }
+      ])
+    );
+
+    const assetDeck = await parseNativeKeynoteToIr(assetKeyPath);
+    assert.equal(validateIR(assetDeck).valid, true);
+    const firstImage = assetDeck.deck.slides[0]?.objects.find((object) => object.type === "image");
+    const secondImage = assetDeck.deck.slides[1]?.objects.find((object) => object.type === "image");
+    assert.equal(firstImage?.morphKey, "native:asset-data:42");
+    assert.equal(secondImage?.morphKey, firstImage?.morphKey);
+    assert.equal(firstImage?.metadata?.nativeMorphKeySource, "asset-data-id");
+    assert.equal(assetDeck.deck.slides[0]?.metadata?.nativeMorphKeyCount, 1);
+    assert.equal(assetDeck.deck.slides[1]?.metadata?.nativeMorphKeyCount, 1);
+
+    const checksumDir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-native-checksum-morph-keys-"));
+    const checksumKeyPath = path.join(checksumDir, "morph-checksum.key");
+    await mkdir(path.join(checksumKeyPath, "Data"), { recursive: true });
+    await mkdir(path.join(checksumKeyPath, "Index"), { recursive: true });
+    const sharedImageBytes = pngBytes(320, 180);
+    await writeFile(path.join(checksumKeyPath, "Data", "hero.png"), sharedImageBytes);
+    await writeFile(path.join(checksumKeyPath, "Data", "copy.png"), sharedImageBytes);
+    await writeFile(path.join(checksumKeyPath, "Index", "Slide-1.iwa"), protoString("Data/hero.png"));
+    await writeFile(path.join(checksumKeyPath, "Index", "Slide-2.iwa"), protoString("Data/copy.png"));
+
+    const checksumDeck = await parseNativeKeynoteToIr(checksumKeyPath);
+    assert.equal(validateIR(checksumDeck).valid, true);
+    const firstChecksumImage = checksumDeck.deck.slides[0]?.objects.find((object) => object.type === "image");
+    const secondChecksumImage = checksumDeck.deck.slides[1]?.objects.find((object) => object.type === "image");
+    assert.match(firstChecksumImage?.morphKey ?? "", /^native:asset-checksum:/);
+    assert.equal(secondChecksumImage?.morphKey, firstChecksumImage?.morphKey);
+    assert.equal(firstChecksumImage?.metadata?.nativeMorphKeySource, "asset-checksum");
+  });
+
   test("preserves repeated native image placements so build targets can resolve", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-repeated-placement-"));
     const keyPath = path.join(dir, "repeat.key");
@@ -509,6 +573,14 @@ describe("Keynote bridge", () => {
     assert.equal(validateIR(deck).valid, true);
     const imageObjects = deck.deck.slides[0]?.objects.filter((object) => object.type === "image") ?? [];
     assert.equal(imageObjects.length, 2);
+    assert.deepEqual(
+      imageObjects.map((object) => object.morphKey),
+      [undefined, undefined]
+    );
+    assert.deepEqual(
+      imageObjects.map((object) => object.metadata?.nativeMorphKeySuppressedReason),
+      ["duplicate-within-slide", "duplicate-within-slide"]
+    );
     assert.deepEqual(
       imageObjects.map((object) => object.metadata?.nativeArchiveIdentifier).sort(),
       ["111", "222"]

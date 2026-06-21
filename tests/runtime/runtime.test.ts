@@ -216,6 +216,16 @@ describe("HTML runtime rendering", () => {
     assert.deepEqual(state?.style?.fill, { type: "solid", color: "#800080" });
   });
 
+  test("does not pair incompatible object types by geometry fallback", () => {
+    const deck = createGeometryFallbackDeck();
+    const previousSlide = deck.deck.slides[0];
+    const currentSlide = deck.deck.slides[1];
+    const resolved = resolveMorphTransitionObjectStates(deck, previousSlide, currentSlide, currentSlide.transition, 0.5);
+
+    assert.deepEqual(resolved.pairs, []);
+    assert.equal(resolved.states.size, 0);
+  });
+
   test("builds a deck-level timeline that includes incoming slide transitions", () => {
     const deck = createDemoDeck();
     const timeline = createDeckTimeline(deck);
@@ -600,6 +610,51 @@ function createMorphTransitionDeck(): DeckIR {
               strategy: "morph",
               matching: { matchBy: ["morphKey"] },
               properties: ["bounds", "transform", "opacity", "fill"]
+            }
+          },
+          timeline: { durationMs: 1000, events: [] }
+        }
+      ]
+    }
+  };
+}
+
+function createGeometryFallbackDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "geometry-fallback",
+      size: { width: 300, height: 200, unit: "px" },
+      slides: [
+        {
+          id: "a",
+          objects: [
+            {
+              id: "title",
+              type: "text",
+              bounds: { x: 10, y: 20, width: 100, height: 80 },
+              text: { plainText: "Title", runs: [{ text: "Title", style: { fontSize: 24 } }] }
+            }
+          ],
+          timeline: { durationMs: 1000, events: [] }
+        },
+        {
+          id: "b",
+          objects: [
+            {
+              id: "placeholder",
+              type: "placeholder",
+              placeholderType: "custom",
+              bounds: { x: 10, y: 20, width: 100, height: 80 }
+            }
+          ],
+          transition: {
+            type: "morph",
+            durationMs: 1000,
+            morph: {
+              strategy: "morph",
+              matching: { matchBy: ["geometry"], fallback: "geometry", tolerance: 0.1 },
+              properties: ["bounds", "opacity"]
             }
           },
           timeline: { durationMs: 1000, events: [] }

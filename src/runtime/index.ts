@@ -1283,10 +1283,10 @@ function runtimeScript(): string {
         if (matchBy.includes("objectId") && candidate.id === toObject.id) return true;
         if (matchBy.includes("name") && toObject.name && candidate.name === toObject.name && candidate.type === toObject.type) return true;
         if (matchBy.includes("type") && candidate.type === toObject.type) return true;
-        if (matchBy.includes("geometry") && similarGeometry(candidate, toObject, options?.matching?.tolerance)) return true;
+        if (matchBy.includes("geometry") && morphGeometryCompatible(candidate, toObject) && similarGeometry(candidate, toObject, options?.matching?.tolerance)) return true;
         if (fallback === "name" && toObject.name && candidate.name === toObject.name) return true;
         if (fallback === "type" && candidate.type === toObject.type) return true;
-        if (fallback === "geometry" && similarGeometry(candidate, toObject, options?.matching?.tolerance)) return true;
+        if (fallback === "geometry" && morphGeometryCompatible(candidate, toObject) && similarGeometry(candidate, toObject, options?.matching?.tolerance)) return true;
         return false;
       });
       if (fromObject) {
@@ -1304,6 +1304,7 @@ function runtimeScript(): string {
     const normalizedDistance = (Math.abs(from.width - to.width) + Math.abs(from.height - to.height) + Math.abs(from.x - to.x) + Math.abs(from.y - to.y)) / maxDimension;
     return normalizedDistance <= tolerance;
   };
+  const morphGeometryCompatible = (fromObject, toObject) => fromObject?.type === toObject?.type;
   const applyMorphEvent = (slide, states, event, progress) => {
     const pairs = event.pairs?.length
       ? event.pairs
@@ -2198,10 +2199,10 @@ function inferMorphTransitionPairs(
       if (matchBy.includes("objectId") && candidate.id === toObject.id) return true;
       if (matchBy.includes("name") && toObject.name && candidate.name === toObject.name && candidate.type === toObject.type) return true;
       if (matchBy.includes("type") && candidate.type === toObject.type) return true;
-      if (matchBy.includes("geometry") && similarGeometry(candidate, toObject, options?.matching?.tolerance)) return true;
+      if (matchBy.includes("geometry") && morphGeometryCompatible(candidate, toObject) && similarGeometry(candidate, toObject, options?.matching?.tolerance)) return true;
       if (fallback === "name" && toObject.name && candidate.name === toObject.name) return true;
       if (fallback === "type" && candidate.type === toObject.type) return true;
-      if (fallback === "geometry" && similarGeometry(candidate, toObject, options?.matching?.tolerance)) return true;
+      if (fallback === "geometry" && morphGeometryCompatible(candidate, toObject) && similarGeometry(candidate, toObject, options?.matching?.tolerance)) return true;
       return false;
     });
     if (!fromObject) continue;
@@ -2224,6 +2225,10 @@ function similarGeometry(fromObject: IRObject, toObject: IRObject, tolerance = 0
       Math.abs(from.y - to.y)) /
     maxDimension;
   return normalizedDistance <= tolerance;
+}
+
+function morphGeometryCompatible(fromObject: IRObject, toObject: IRObject): boolean {
+  return fromObject.type === toObject.type;
 }
 
 export function createSlideTimingPlan(slide: Slide | undefined): SlideTimingPlan {

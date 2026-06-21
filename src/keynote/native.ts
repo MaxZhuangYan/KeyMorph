@@ -301,6 +301,7 @@ interface NativeAssetReference {
   sourceMimeType?: string;
   width?: number;
   height?: number;
+  checksum?: string;
   dataId?: string;
   embedded?: boolean;
   renderProxy?: NativeAssetRenderProxy;
@@ -1125,6 +1126,7 @@ function createNativeAssetCatalog(
     const assetId = stableAssetId(assetPath);
     const dataId = dataIdFromAssetPath(assetPath);
     const embedded = renderable !== undefined;
+    const checksum = `sha256:${sha256Hex(data)}`;
     const asset: Asset = {
       id: assetId,
       kind: classification.kind,
@@ -1132,7 +1134,7 @@ function createNativeAssetCatalog(
       name,
       mimeType: renderable?.mimeType ?? classification.mimeType,
       ...(imageDimensions ? { width: imageDimensions.width, height: imageDimensions.height } : {}),
-      checksum: `sha256:${sha256Hex(data)}`,
+      checksum,
       metadata: {
         nativeSourcePath: assetPath,
         byteLength: data.byteLength,
@@ -1173,6 +1175,7 @@ function createNativeAssetCatalog(
       sourceMimeType: classification.mimeType,
       width: asset.width,
       height: asset.height,
+      checksum,
       embedded,
       ...(renderable?.proxy
         ? {
@@ -1487,6 +1490,7 @@ function buildNativeSlides(
       : textObjects.length > 0 || nativeTextObjects.length > 0 || assetObjects.length > 0
         ? [...textObjectsToKeep, ...nativeTextObjects, ...assetObjects]
         : [createPlaceholderObject(slideId, entry.path, deckSize)];
+    const nativeMorphKeyCount = applyNativeMorphKeys(objects);
     const buildAnimationRecovery = recoverNativeBuildAnimations(slideId, objects, scan.archiveMessages);
 
     const nativeTransition = inferNativeSlideTransition(slideId, index, scan.animationHints, index > 0 ? `slide-${index}` : undefined);
@@ -1537,6 +1541,7 @@ function buildNativeSlides(
         nativeBuildAnimationRecoveredCount: buildAnimationRecovery.events.length,
         nativeBuildAnimationUnresolvedCount: buildAnimationRecovery.unresolvedBuildCount,
         nativeBuildTimingDependencyCount: buildAnimationRecovery.dependencyEdges.length,
+        nativeMorphKeyCount,
         ...(buildAnimationRecovery.buildRecords.length > 0
           ? { nativeBuildRecords: buildAnimationRecovery.buildRecords.slice(0, 24) }
           : {}),
@@ -2153,11 +2158,12 @@ function createAssetObject(
     nativeAssetPath: asset.path,
     ...(asset.dataId ? { nativeAssetDataId: asset.dataId } : {}),
     ...(asset.width !== undefined && asset.height !== undefined
-      ? {
-          nativeAssetWidth: asset.width,
-          nativeAssetHeight: asset.height
-        }
-      : {}),
+        ? {
+            nativeAssetWidth: asset.width,
+            nativeAssetHeight: asset.height
+          }
+        : {}),
+    ...(asset.checksum ? { nativeAssetChecksum: asset.checksum } : {}),
     ...(asset.renderProxy
       ? {
           nativeAssetRenderableProxy: true,
@@ -2303,6 +2309,92 @@ function applyNativePlacementGroupMetadata(objects: IRObject[]): void {
       };
     }
   }
+}
+
+function applyNativeMorphKeys(objects: IRObject[]): number {
+  const candidates = new Map<IRObject, { key: string; source: string }>();
+  const counts = new Map<string, number>();
+  for (const object of flattenNativeObjects(objects)) {
+    const candidate = nativeMorphKeyCandidate(object);
+    if (!candidate) {
+      continue;
+    }
+    candidates.set(object, candidate);
+    counts.set(candidate.key, (counts.get(candidate.key) ?? 0) + 1);
+  }
+
+  let applied = 0;
+  for (const [object, candidate] of candidates) {
+    if (counts.get(candidate.key) !== 1) {
+      object.metadata = {
+        ...(object.metadata ?? {}),
+        nativeMorphKeyCandidate: candidate.key,
+        nativeMorphKeySource: candidate.source,
+        nativeMorphKeySuppressedReason: "duplicate-within-slide"
+      };
+      continue;
+    }
+    object.morphKey = candidate.key;
+    object.metadata = {
+      ...(object.metadata ?? {}),
+      nativeMorphKeySource: candidate.source
+    };
+    applied += 1;
+  }
+  return applied;
+}
+
+function nativeMorphKeyCandidate(object: IRObject): { key: string; source: string } | undefined {
+  if (object.type === "image" || object.type === "media") {
+    if (object.metadata?.nativeFallback === "full-slide-preview") {
+      return undefined;
+    }
+    const dataId = nativeMetadataString(object.metadata?.nativeAssetDataId);
+    if (dataId) {
+      return { key: `native:asset-data:${dataId}`, source: "asset-data-id" };
+    }
+    const checksum = nativeMetadataString(object.metadata?.nativeAssetChecksum);
+    if (checksum) {
+      return { key: `native:asset-checksum:${nativeMorphKeyHash(checksum)}`, source: "asset-checksum" };
+    }
+    const assetId = object.source.assetId;
+    if (assetId) {
+      return { key: `native:asset:${assetId}`, source: "asset-id" };
+    }
+    const proxyChecksum = nativeMetadataString(object.metadata?.nativeAssetRenderableProxyChecksum);
+    if (proxyChecksum) {
+      return { key: `native:asset-checksum:${nativeMorphKeyHash(proxyChecksum)}`, source: "asset-checksum" };
+    }
+  }
+
+  if (object.type === "text") {
+    const text = normalizeNativeMorphText(object.text.plainText);
+    if (text) {
+      return { key: `native:text:${nativeMorphKeyHash(text)}`, source: "text-content" };
+    }
+  }
+
+  return undefined;
+}
+
+function normalizeNativeMorphText(text: string | undefined): string | undefined {
+  const normalized = text?.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized || normalized.length < 2 || normalized.length > 240) {
+    return undefined;
+  }
+  return normalized;
+}
+
+function nativeMorphKeyHash(value: string): string {
+  return sha256Hex(new TextEncoder().encode(value)).slice(0, 20);
+}
+
+function nativeMetadataString(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") {
+    return undefined;
+  }
+  const text = String(value).trim();
+  return text || undefined;
 }
 
 function nativePlacementGroupKey(object: IRObject): string | undefined {
