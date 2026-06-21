@@ -1096,7 +1096,7 @@ describe("Keynote bridge", () => {
             payload: nativeParagraphStylePayload({
               fontFamily: "HelveticaNeue-Medium",
               fontSize: 106,
-              color: { red: 1, green: 1, blue: 1, alpha: 1 },
+              paragraphColor: { red: 0.25, green: 0.5, blue: 1, alpha: 1 },
               alignment: 2
             }),
             objectReferences: [9400]
@@ -1130,7 +1130,7 @@ describe("Keynote bridge", () => {
     assert.deepEqual(object.text.runs?.[0]?.style, {
       fontFamily: "HelveticaNeue-Medium",
       fontSize: 46,
-      color: "#ffffff"
+      color: "#4080ff"
     });
     assert.equal(object.text.paragraphs?.[0]?.alignment, "left");
     assert.equal(object.metadata?.nativeTextStyleInheritanceResolvedCount, 1);
@@ -1766,6 +1766,7 @@ function nativeParagraphStylePayload(values: {
   fontFamily?: string;
   fontSize?: number;
   color?: { red: number; green: number; blue: number; alpha: number };
+  paragraphColor?: { red: number; green: number; blue: number; alpha: number };
   alignment?: number;
   lineHeight?: number;
 }): Uint8Array {
@@ -1775,6 +1776,7 @@ function nativeParagraphStylePayload(values: {
     protoBytes(
       concat([
         ...(values.alignment !== undefined ? [protoVarint(1, values.alignment)] : []),
+        ...(values.paragraphColor ? [protoBytes(protoBytes(nativeColorPayload(values.paragraphColor), 1), 32)] : []),
         ...(values.lineHeight !== undefined ? [protoFixed32(13, values.lineHeight), protoBytes(protoFixed32(2, values.lineHeight), 13)] : [])
       ]),
       12

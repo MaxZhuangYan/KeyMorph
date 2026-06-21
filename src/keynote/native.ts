@@ -2273,11 +2273,18 @@ function nativeTextStyleAtOffset(
 ): TextStyle {
   const paragraphStyle = resolveNativeStyleForOffset(textEntry.paragraphStyleRuns, offset, textStyleMap)?.record?.style;
   const characterStyle = resolveNativeStyleForOffset(textEntry.characterStyleRuns, offset, textStyleMap)?.record?.style;
+  const hasNativeStyle = Boolean(paragraphStyle || characterStyle);
+  const nativeFallbackStyle = hasNativeStyle ? withoutFallbackColor(fallbackStyle) : fallbackStyle;
   return compactTextStyle({
-    ...fallbackStyle,
+    ...nativeFallbackStyle,
     ...paragraphStyle,
     ...characterStyle
   });
+}
+
+function withoutFallbackColor(style: TextStyle): TextStyle {
+  const { color: _color, ...rest } = style;
+  return rest;
 }
 
 function resolveNativeStyleForOffset(
@@ -3833,7 +3840,10 @@ function nativeTextStyleRecordFromPayload(styleId: string, type: number, payload
   const parentStyleId = nativeIdFromNumber(numericValueAtFieldPath(payload, [1, 3, 1]));
   const fontSize = numericValueAtFieldPath(payload, [11, 3]);
   const fontFamily = stringValueAtFieldPath(payload, [11, 5]);
-  const color = nativeColorAtFieldPath(payload, [11, 7]) ?? nativeColorAtFieldPath(payload, [11, 46, 1]);
+  const color =
+    nativeColorAtFieldPath(payload, [11, 7]) ??
+    nativeColorAtFieldPath(payload, [11, 46, 1]) ??
+    nativeColorAtFieldPath(payload, [12, 32, 1]);
   const alignment = type === 2022 ? nativeParagraphAlignment(numericValueAtFieldPath(payload, [12, 1])) : undefined;
   const lineHeight = numericValueAtFieldPath(payload, [12, 13, 2]) ?? numericValueAtFieldPath(payload, [12, 4]);
 
@@ -3846,7 +3856,7 @@ function nativeTextStyleRecordFromPayload(styleId: string, type: number, payload
     ...(parentStyleId ? ["1.3.1"] : []),
     ...(fontSize !== undefined ? ["11.3"] : []),
     ...(fontFamily ? ["11.5"] : []),
-    ...(color ? ["11.7", "11.46.1"] : []),
+    ...(color ? ["11.7", "11.46.1", "12.32.1"] : []),
     ...(alignment ? ["12.1"] : []),
     ...(lineHeight !== undefined ? ["12.13.2", "12.4"] : [])
   ];
