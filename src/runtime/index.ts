@@ -176,6 +176,7 @@ export function renderHtmlDocument(deck: DeckIR, options: HtmlRuntimeOptions = {
     .km-slide-layer { position: absolute; inset: 0; overflow: hidden; transform-origin: center center; }
     .km-object { position: absolute; box-sizing: border-box; overflow: hidden; transform-origin: center center; }
     .km-text, .km-shape-text { white-space: pre-wrap; display: flex; align-items: flex-start; }
+    .km-text-char { display: inline-block; white-space: pre; }
     .km-image, .km-media { object-fit: contain; user-select: none; -webkit-user-drag: none; }
     .km-controls { display: ${controls ? "grid" : "none"}; grid-template-columns: auto auto auto 1fr auto auto; gap: 10px; align-items: center; padding: 12px 16px; background: #111827; border-top: 1px solid rgba(255,255,255,.12); }
     button { border: 1px solid rgba(255,255,255,.18); color: #f8fafc; background: #1f2937; border-radius: 6px; padding: 8px 11px; font: inherit; cursor: pointer; }
@@ -691,6 +692,20 @@ function runtimeScript(): string {
   };
   const strokeColorCss = (stroke) => colorCss(stroke?.color) || "transparent";
   const textOf = (object, statePatch) => statePatch?.text?.plainText || (statePatch?.text?.runs || []).map((run) => run.text).join("") || object.text?.plainText || (object.text?.runs || []).map((run) => run.text).join("") || "";
+  const graphemes = (text) => {
+    const value = String(text || "");
+    if (typeof Intl !== "undefined" && Intl.Segmenter) return Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value), (item) => item.segment);
+    return Array.from(value);
+  };
+  const characterTextHtml = (text) => graphemes(text).map((char, index) => '<span class="km-text-char" data-char-index="' + index + '">' + esc(char) + '</span>').join("");
+  const hasCharacterBuild = (object) => {
+    for (const slide of deck.deck.slides || []) {
+      for (const event of slide.timeline?.events || []) {
+        if (event.targetId === object.id && event.metadata?.nativeBuildGranularity === "character") return true;
+      }
+    }
+    return false;
+  };
   const textStyleOf = (object, statePatch) => {
     const run = statePatch?.text?.runs?.[0] || object.text?.runs?.[0];
     return run?.style || statePatch?.style?.textStyle || object.initialState?.style?.textStyle || object.style?.textStyle || {};
@@ -866,7 +881,7 @@ function runtimeScript(): string {
   };
   const objectHtml = (object) => {
     const common = 'class="km-object km-' + esc(object.type) + '" data-object-id="' + esc(object.id) + '" style="' + boxStyle(object) + ';';
-    if (object.type === "text") return '<div ' + common + textStyleCss(object) + '">' + esc(textOf(object)) + '</div>';
+    if (object.type === "text") return '<div ' + common + textStyleCss(object) + '">' + (hasCharacterBuild(object) ? characterTextHtml(textOf(object)) : esc(textOf(object))) + '</div>';
     if (object.type === "image") return '<img ' + common + '" src="' + esc(sourceUrl(object.source)) + '" alt="' + esc(object.altText || object.name || "") + '">';
     if (object.type === "media") {
       const tag = object.mediaType === "audio" ? "audio" : "video";
@@ -874,7 +889,7 @@ function runtimeScript(): string {
       return '<' + tag + ' ' + common + '" src="' + esc(sourceUrl(object.source)) + '"' + poster + ' muted playsinline></' + tag + '>';
     }
     if (object.type === "group") return '<div ' + common + 'overflow:visible">' + (object.children || []).map(objectHtml).join("") + '</div>';
-    if (object.type === "shape" && object.text) return '<div ' + common + textStyleCss(object) + '">' + esc(textOf(object)) + '</div>';
+    if (object.type === "shape" && object.text) return '<div ' + common + textStyleCss(object) + '">' + (hasCharacterBuild(object) ? characterTextHtml(textOf(object)) : esc(textOf(object))) + '</div>';
     return '<div ' + common + '"></div>';
   };
   const layerHtml = (slide, layerName) => {
@@ -1390,7 +1405,36 @@ function runtimeScript(): string {
     return states;
   };
   const computeEffectiveSlideObjectStates = (slide, timeMs) => applyEffectiveGroupStates(slide?.objects || [], computeSlideObjectStates(slide, timeMs));
-  const applyObjectState = (el, object, statePatch) => {
+  const characterOpacityAt = (event, index, count, timeMs) => {
+    const duration = Math.max(1, Number(event.durationMs || 1));
+    const start = event.start?.type === "absolute" ? Number(event.start.atMs || 0) : Number(event.delayMs || 0);
+    const local = Number(timeMs || 0) - start;
+    const from = String(event.metadata?.nativeBuildDirection || "").toLowerCase() === "out" ? 1 : 0;
+    const to = from === 1 ? 0 : 1;
+    if (local <= 0) return event.fill === "backwards" || event.fill === "both" ? from : undefined;
+    if (local >= duration) return event.fill === "forwards" || event.fill === "both" ? to : undefined;
+    const span = duration / Math.max(1, count);
+    const progress = clamp((local - index * span) / Math.max(1, span), 0, 1);
+    return from + (to - from) * easeProgress(progress, event.easing);
+  };
+  const applyCharacterTextState = (el, object, statePatch, slide, timeMs) => {
+    const text = textOf(object, statePatch);
+    const chars = graphemes(text);
+    const spans = Array.from(el.querySelectorAll(".km-text-char"));
+    if (spans.length !== chars.length || spans.some((span, index) => span.textContent !== chars[index])) {
+      el.innerHTML = characterTextHtml(text);
+    }
+    const activeEvents = (slide?.timeline?.events || []).filter((event) => event.targetId === object.id && event.metadata?.nativeBuildGranularity === "character");
+    for (const [index, span] of Array.from(el.querySelectorAll(".km-text-char")).entries()) {
+      let opacity = 1;
+      for (const event of activeEvents) {
+        const value = characterOpacityAt(event, index, chars.length, timeMs);
+        if (value !== undefined) opacity = value;
+      }
+      span.style.opacity = String(opacity);
+    }
+  };
+  const applyObjectState = (el, object, statePatch, slide, timeMs) => {
     if (!el || !object || !statePatch) return;
     const b = statePatch.bounds || { x: 0, y: 0, width: 100, height: 100 };
     el.style.left = Number(b.x || 0) + "px";
@@ -1402,7 +1446,12 @@ function runtimeScript(): string {
     el.style.transform = transformCss(statePatch.transform);
     el.style.filter = filterCss(statePatch.filter);
     if (object.type === "text" || (object.type === "shape" && object.text)) {
-      el.textContent = textOf(object, statePatch);
+      if (hasCharacterBuild(object)) {
+        el.style.opacity = String(object.opacity ?? 1);
+        applyCharacterTextState(el, object, statePatch, slide, timeMs);
+      } else {
+        el.textContent = textOf(object, statePatch);
+      }
       applyTextStyle(el, object, statePatch);
     }
     if (object.type === "shape" || object.type === "placeholder") {
@@ -1415,7 +1464,7 @@ function runtimeScript(): string {
   const applySlideFrame = (layer, slide, timeMs) => {
     const states = computeSlideObjectStates(slide, timeMs);
     for (const object of flattenObjects(slide?.objects || [])) {
-      applyObjectState(layer.querySelector('[data-object-id="' + CSS.escape(object.id) + '"]'), object, states.get(object.id));
+      applyObjectState(layer.querySelector('[data-object-id="' + CSS.escape(object.id) + '"]'), object, states.get(object.id), slide, timeMs);
     }
     return states;
   };
@@ -1545,7 +1594,7 @@ function runtimeScript(): string {
       if (!toObject) continue;
       const blended = resolved.states.get(pair.toObjectId);
       if (!blended) continue;
-      applyObjectState(currentLayer.querySelector('[data-object-id="' + CSS.escape(pair.toObjectId) + '"]'), toObject, blended);
+      applyObjectState(currentLayer.querySelector('[data-object-id="' + CSS.escape(pair.toObjectId) + '"]'), toObject, blended, currentSlide, 0);
       const sourceEl = previousLayer.querySelector('[data-object-id="' + CSS.escape(pair.fromObjectId) + '"]');
       if (sourceEl) sourceEl.style.opacity = "0";
     }
@@ -1871,7 +1920,7 @@ function renderObjectMarkup(object: IRObject, deck?: DeckIR): string {
   const common = `class="km-object km-${object.type}" data-object-id="${escapeHtml(object.id)}" style="${style}"`;
 
   if (object.type === "text") {
-    return `<div ${common}>${escapeHtml(textContent(object))}</div>`;
+    return `<div ${common}>${renderTextObjectContent(object, deck)}</div>`;
   }
   if (object.type === "image") {
     return `<img ${common} src="${escapeHtml(resolveObjectSourceUrl(object.source, deck))}" alt="${escapeHtml(object.altText ?? object.name ?? "")}">`;
@@ -1884,9 +1933,35 @@ function renderObjectMarkup(object: IRObject, deck?: DeckIR): string {
     return `<div ${common}>${object.children.map((child) => renderObjectMarkup(child, deck)).join("")}</div>`;
   }
   if (object.type === "shape" && object.text) {
-    return `<div ${common}>${escapeHtml(textContent(object as ShapeObject & TextObject))}</div>`;
+    return `<div ${common}>${renderTextObjectContent(object as ShapeObject & TextObject, deck)}</div>`;
   }
   return `<div ${common}></div>`;
+}
+
+function renderTextObjectContent(object: TextObject | (ShapeObject & TextObject), deck?: DeckIR): string {
+  const text = textContent(object);
+  if (!hasCharacterBuildEvent(object.id, deck)) {
+    return escapeHtml(text);
+  }
+  return splitGraphemes(text)
+    .map((char, index) => `<span class="km-text-char" data-char-index="${index}">${escapeHtml(char)}</span>`)
+    .join("");
+}
+
+function hasCharacterBuildEvent(objectId: string, deck?: DeckIR): boolean {
+  return Boolean(
+    deck?.deck.slides.some((slide) =>
+      slide.timeline?.events.some((event) => event.targetId === objectId && event.metadata?.nativeBuildGranularity === "character")
+    )
+  );
+}
+
+function splitGraphemes(text: string): string[] {
+  const Segmenter = (Intl as typeof Intl & { Segmenter?: new (locale?: string, options?: { granularity?: "grapheme" }) => { segment(value: string): Iterable<{ segment: string }> } }).Segmenter;
+  if (Segmenter) {
+    return Array.from(new Segmenter(undefined, { granularity: "grapheme" }).segment(text), (item) => item.segment);
+  }
+  return Array.from(text);
 }
 
 function resolveObjectSourceUrl(source: ObjectSource | undefined, deck: DeckIR | undefined): string {

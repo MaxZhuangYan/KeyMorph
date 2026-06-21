@@ -44,6 +44,16 @@ describe("HTML runtime rendering", () => {
     assert.match(markup, /Any slide deck becomes/);
   });
 
+  test("renders native character-build text as grapheme spans", () => {
+    const deck = createCharacterBuildDeck();
+    const markup = renderSlideMarkup(deck.deck.slides[0]!, deck);
+
+    assert.match(markup, /class="km-text-char"/);
+    assert.equal((markup.match(/data-char-index=/g) ?? []).length, 4);
+    assert.match(markup, />逐</);
+    assert.match(renderHtmlDocument(deck), /applyCharacterTextState/);
+  });
+
   test("converts keyframe event tracks to CSS frames", () => {
     const event = createDemoDeck().deck.slides[0].timeline?.events[0];
 
@@ -586,6 +596,58 @@ function createMorphTransitionDeck(): DeckIR {
             }
           },
           timeline: { durationMs: 1000, events: [] }
+        }
+      ]
+    }
+  };
+}
+
+function createCharacterBuildDeck(): DeckIR {
+  return {
+    irVersion: "keymorph.ir.v1",
+    deck: {
+      id: "character-build",
+      size: { width: 400, height: 200, unit: "px" },
+      slides: [
+        {
+          id: "slide",
+          objects: [
+            {
+              id: "title",
+              type: "text",
+              bounds: { x: 0, y: 0, width: 300, height: 80 },
+              text: {
+                plainText: "逐字溶解",
+                runs: [{ text: "逐字溶解", style: { fontSize: 32 } }]
+              }
+            }
+          ],
+          timeline: {
+            durationMs: 1000,
+            events: [
+              {
+                id: "character-dissolve",
+                kind: "keyframes",
+                targetId: "title",
+                durationMs: 1000,
+                fill: "both",
+                tracks: [
+                  {
+                    property: "opacity",
+                    interpolation: "number",
+                    keyframes: [
+                      { offset: 0, value: 0 },
+                      { offset: 1, value: 1 }
+                    ]
+                  }
+                ],
+                metadata: {
+                  nativeBuildGranularity: "character",
+                  nativeBuildDirection: "In"
+                }
+              }
+            ]
+          }
         }
       ]
     }
