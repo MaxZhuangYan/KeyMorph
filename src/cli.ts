@@ -25,6 +25,8 @@ import {
   describeVideoDependencies,
   exportIrToVideo,
   extractVideoFramesFromVideo,
+  readMovieDurationMs,
+  scaleSegmentPlanToDuration,
   splitVideoIntoSegments,
   type VideoDependencyStatus,
   type VideoExportOptions,
@@ -1283,10 +1285,15 @@ async function createSegmentedMoviePptx(input: {
     return { segmentPlanPath: null, pptxPath: null };
   }
 
-  const segments = createSegmentPlan(input.deck);
+  const rawSegments = createSegmentPlan(input.deck);
+  const movieDurationMs = await readOptionalMovieDurationMs(input.paths.keynoteMovie);
+  const segments = movieDurationMs ? scaleSegmentPlanToDuration(rawSegments, movieDurationMs) : rawSegments;
   await writeJson(input.paths.segmentPlan, {
     generatedAt: input.createdAt,
     sourceMovie: input.runtime.moviePath,
+    sourceTimelineDurationMs: rawSegments.length ? Math.max(...rawSegments.map((segment) => segment.endMs)) : 0,
+    movieDurationMs: movieDurationMs ?? null,
+    scaledToMovieDuration: Boolean(movieDurationMs),
     mode: "movie-segment-pptx",
     message: "Each entry maps one Keynote-rendered movie interval to one PPTX slide with an embedded full-slide video.",
     segments
@@ -1312,6 +1319,14 @@ async function createSegmentedMoviePptx(input: {
       pptxPath: null,
       message: `Segmented high-fidelity PPTX export failed. Install ffmpeg or use macOS avconvert, then rerun conversion. ${errorMessage(error)}`
     };
+  }
+}
+
+async function readOptionalMovieDurationMs(moviePath: string): Promise<number | undefined> {
+  try {
+    return await readMovieDurationMs(moviePath);
+  } catch {
+    return undefined;
   }
 }
 

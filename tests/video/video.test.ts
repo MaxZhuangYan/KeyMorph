@@ -15,7 +15,9 @@ import {
   createVideoExportPlan,
   createVideoFramePlan,
   describeVideoDependencies,
+  readMovieDurationMs,
   resolveVideoDependencies,
+  scaleSegmentPlanToDuration,
   splitVideoIntoSegments,
   VideoExportDependencyError
 } from "../../src/video/index.ts";
@@ -130,6 +132,37 @@ describe("video export planning", () => {
     assert.equal(avconvert.commands[0]?.command, "/usr/bin/avconvert");
   });
 
+  test("scales segment plans to the rendered movie duration and merges tiny cuts", () => {
+    const segments = [
+      { id: "slide-1-segment-1", slideIndex: 0, clickIndex: 0, startMs: 0, endMs: 2500, durationMs: 2500, outputName: "slide-1-segment-1.mp4" },
+      { id: "slide-2-segment-1", slideIndex: 1, clickIndex: 0, startMs: 2500, endMs: 5000, durationMs: 2500, outputName: "slide-2-segment-1.mp4" },
+      { id: "slide-2-segment-2", slideIndex: 1, clickIndex: 1, startMs: 5000, endMs: 5001, durationMs: 1, outputName: "slide-2-segment-2.mp4" },
+      { id: "slide-2-segment-3", slideIndex: 1, clickIndex: 2, startMs: 5001, endMs: 10000, durationMs: 4999, outputName: "slide-2-segment-3.mp4" }
+    ];
+
+    const scaled = scaleSegmentPlanToDuration(segments, 128817);
+
+    assert.equal(scaled[0]?.startMs, 0);
+    assert.equal(scaled.at(-1)?.endMs, 128817);
+    assert.equal(scaled.length, 3);
+    assert.deepEqual(
+      scaled.map((segment) => [segment.id, segment.clickIndex, segment.durationMs, segment.outputName]),
+      [
+        ["slide-1-segment-1", 0, 32204, "slide-1-segment-1.mp4"],
+        ["slide-2-segment-1", 0, 32217, "slide-2-segment-1.mp4"],
+        ["slide-2-segment-2", 1, 64396, "slide-2-segment-2.mp4"]
+      ]
+    );
+  });
+
+  test("reads ISO BMFF movie duration from the mvhd atom", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-movie-duration-"));
+    const moviePath = path.join(dir, "movie.m4v");
+    await writeFile(moviePath, isoBmffMovieBytes({ timescale: 600, duration: 77290 }));
+
+    assert.equal(await readMovieDurationMs(moviePath), 128817);
+  });
+
   test("exposes clear dependency error details", () => {
     const error = new VideoExportDependencyError(["playwright", "ffmpeg"]);
 
@@ -240,6 +273,40 @@ describe("video export planning", () => {
 
 function image(width: number, height: number, data: number[]): RgbaImage {
   return { width, height, data: new Uint8Array(data) };
+}
+
+function isoBmffMovieBytes(input: { timescale: number; duration: number }): Uint8Array {
+  const ftyp = atom("ftyp", new Uint8Array([...ascii("mp42"), 0, 0, 0, 0, ...ascii("mp42")]));
+  const mvhdPayload = new Uint8Array(100);
+  const view = new DataView(mvhdPayload.buffer);
+  view.setUint8(0, 0);
+  view.setUint32(12, input.timescale, false);
+  view.setUint32(16, input.duration, false);
+  const moov = atom("moov", atom("mvhd", mvhdPayload));
+  return concatBytes(ftyp, moov);
+}
+
+function atom(type: string, payload: Uint8Array): Uint8Array {
+  const out = new Uint8Array(8 + payload.byteLength);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, out.byteLength, false);
+  out.set(ascii(type), 4);
+  out.set(payload, 8);
+  return out;
+}
+
+function ascii(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
+}
+
+function concatBytes(...chunks: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 const RED_RED_PNG = Buffer.from(

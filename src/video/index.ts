@@ -186,6 +186,10 @@ export interface SplitVideoSegmentsOptions {
   runner?: (command: string, args: string[], segment: VideoSegmentPlanEntry) => void | Promise<void>;
 }
 
+export interface SegmentPlanScaleOptions {
+  minSegmentDurationMs?: number;
+}
+
 export interface SplitVideoSegmentsResult {
   commands: VideoSplitCommand[];
 }
@@ -283,6 +287,36 @@ export function createSegmentPlan(deck: DeckIR): VideoSegmentPlanEntry[] {
 }
 
 export const createVideoSegmentsFromTimeline = createSegmentPlan;
+
+export function scaleSegmentPlanToDuration(
+  segments: VideoSegmentPlanEntry[],
+  targetDurationMs: number,
+  options: SegmentPlanScaleOptions = {}
+): VideoSegmentPlanEntry[] {
+  if (segments.length === 0) return [];
+  const sourceDurationMs = Math.max(...segments.map((segment) => segment.endMs));
+  if (!Number.isFinite(targetDurationMs) || targetDurationMs <= 0 || sourceDurationMs <= 0) return segments;
+
+  const scale = targetDurationMs / sourceDurationMs;
+  const scaled = segments.map((segment, index) => {
+    const startMs = index === 0 ? 0 : Math.max(0, Math.round(segment.startMs * scale));
+    const endMs = index === segments.length - 1 ? Math.round(targetDurationMs) : Math.max(0, Math.round(segment.endMs * scale));
+    return {
+      ...segment,
+      startMs,
+      endMs,
+      durationMs: Math.max(0, endMs - startMs)
+    };
+  });
+
+  return reindexSegments(mergeShortSegments(scaled, options.minSegmentDurationMs ?? 200));
+}
+
+export async function readMovieDurationMs(moviePath: string): Promise<number | undefined> {
+  const data = await readFile(moviePath);
+  const durationSeconds = readIsoBmffMovieDurationSeconds(data);
+  return durationSeconds === undefined ? undefined : Math.round(durationSeconds * 1000);
+}
 
 export async function splitVideoIntoSegments(
   inputMoviePath: string,
@@ -534,6 +568,48 @@ function timelineBoundaryTimes(slide: Slide | undefined, contentStartMs: number,
     .sort((a, b) => a - b);
 }
 
+function mergeShortSegments(segments: VideoSegmentPlanEntry[], minDurationMs: number): VideoSegmentPlanEntry[] {
+  if (segments.length === 0 || minDurationMs <= 0) return segments;
+  const merged: VideoSegmentPlanEntry[] = [];
+
+  for (const segment of segments) {
+    const durationMs = Math.max(0, segment.endMs - segment.startMs);
+    const previous = merged[merged.length - 1];
+    if (durationMs < minDurationMs && previous && previous.slideIndex === segment.slideIndex) {
+      previous.endMs = segment.endMs;
+      previous.durationMs = Math.max(0, previous.endMs - previous.startMs);
+      continue;
+    }
+    merged.push({ ...segment, durationMs });
+  }
+
+  const last = merged[merged.length - 1];
+  const previous = merged[merged.length - 2];
+  if (last && previous && last.durationMs < minDurationMs && previous.slideIndex === last.slideIndex) {
+    previous.endMs = last.endMs;
+    previous.durationMs = Math.max(0, previous.endMs - previous.startMs);
+    merged.pop();
+  }
+
+  return merged;
+}
+
+function reindexSegments(segments: VideoSegmentPlanEntry[]): VideoSegmentPlanEntry[] {
+  const perSlide = new Map<number, number>();
+  return segments.map((segment) => {
+    const index = (perSlide.get(segment.slideIndex) ?? 0) + 1;
+    perSlide.set(segment.slideIndex, index);
+    const id = `slide-${segment.slideIndex + 1}-segment-${index}`;
+    return {
+      ...segment,
+      id,
+      clickIndex: index - 1,
+      durationMs: Math.max(0, segment.endMs - segment.startMs),
+      outputName: `${id}.mp4`
+    };
+  });
+}
+
 function eventLocalStartMs(event: AnimationEvent): number {
   const start = event.start;
   const base = Number(event.delayMs || 0);
@@ -631,6 +707,62 @@ async function assertOutputFile(filePath: string, message: string): Promise<void
     // Report a consistent split failure below.
   }
   throw new Error(`${message}: ${filePath}`);
+}
+
+function readIsoBmffMovieDurationSeconds(data: Uint8Array): number | undefined {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  return readIsoBmffAtoms(view, 0, data.byteLength, []);
+}
+
+function readIsoBmffAtoms(view: DataView, start: number, end: number, pathParts: string[]): number | undefined {
+  let offset = start;
+  while (offset + 8 <= end) {
+    const size32 = view.getUint32(offset, false);
+    const type = atomType(view, offset + 4);
+    let headerSize = 8;
+    let size = size32;
+    if (size32 === 1) {
+      if (offset + 16 > end) return undefined;
+      size = readUint64(view, offset + 8);
+      headerSize = 16;
+    } else if (size32 === 0) {
+      size = end - offset;
+    }
+    if (size < headerSize || offset + size > end) return undefined;
+
+    const childStart = offset + headerSize;
+    const childEnd = offset + size;
+    if (type === "mvhd" && pathParts[pathParts.length - 1] === "moov") {
+      return readMovieHeaderDurationSeconds(view, childStart, childEnd);
+    }
+    if (type === "moov") {
+      const duration = readIsoBmffAtoms(view, childStart, childEnd, [...pathParts, type]);
+      if (duration !== undefined) return duration;
+    }
+    offset += size;
+  }
+  return undefined;
+}
+
+function readMovieHeaderDurationSeconds(view: DataView, start: number, end: number): number | undefined {
+  if (start + 20 > end) return undefined;
+  const version = view.getUint8(start);
+  const fieldsStart = start + 4;
+  const timescaleOffset = version === 1 ? fieldsStart + 16 : fieldsStart + 8;
+  const durationOffset = version === 1 ? fieldsStart + 20 : fieldsStart + 12;
+  if (durationOffset + (version === 1 ? 8 : 4) > end) return undefined;
+  const timescale = view.getUint32(timescaleOffset, false);
+  const duration = version === 1 ? readUint64(view, durationOffset) : view.getUint32(durationOffset, false);
+  if (!timescale || !Number.isFinite(duration)) return undefined;
+  return duration / timescale;
+}
+
+function atomType(view: DataView, offset: number): string {
+  return String.fromCharCode(view.getUint8(offset), view.getUint8(offset + 1), view.getUint8(offset + 2), view.getUint8(offset + 3));
+}
+
+function readUint64(view: DataView, offset: number): number {
+  return view.getUint32(offset, false) * 2 ** 32 + view.getUint32(offset + 4, false);
 }
 
 function summarizePlan(plan: VideoExportPlan): Omit<VideoExportPlan, "frames"> {
