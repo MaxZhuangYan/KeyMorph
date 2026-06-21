@@ -1,4 +1,5 @@
 import { copyFile, cp, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -150,6 +151,7 @@ export interface ProductBundlePaths {
   keynoteMovie: string;
   segmentsDir: string;
   segmentPlan: string;
+  segmentPostersDir: string;
   nativeAssetsDir: string;
   rebuiltPptx: string;
   segmentedPptx: string;
@@ -1310,7 +1312,8 @@ async function createSegmentedMoviePptx(input: {
       input.paths.segmentsDir,
       input.splitOptions
     );
-    const segmentedDeck = createSegmentedMovieDeck(input.deck, split.commands);
+    const posters = await createSegmentPosters(split.commands, input.paths.segmentPostersDir);
+    const segmentedDeck = createSegmentedMovieDeck(input.deck, split.commands, posters);
     await exportIrToPptx(segmentedDeck, input.paths.segmentedPptx);
     return { segmentPlanPath: "segment-plan.json", pptxPath: "segmented.pptx" };
   } catch (error) {
@@ -1330,10 +1333,47 @@ async function readOptionalMovieDurationMs(moviePath: string): Promise<number | 
   }
 }
 
-function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmentsResult["commands"]): DeckIR {
+async function createSegmentPosters(commands: SplitVideoSegmentsResult["commands"], outputDir: string): Promise<Map<string, string>> {
+  const posters = new Map<string, string>();
+  await mkdir(outputDir, { recursive: true });
+  for (const command of commands) {
+    const posterPath = await createSegmentPoster(command.outputPath, command.segment.durationMs, outputDir, command.segment.id);
+    if (posterPath) posters.set(command.segment.id, posterPath);
+  }
+  return posters;
+}
+
+async function createSegmentPoster(videoPath: string, durationMs: number, outputDir: string, id: string): Promise<string | undefined> {
+  const sampleMs = Math.max(500, Math.min(durationMs * 0.9, durationMs - 250));
+  const sampleVideo = path.join(outputDir, `${id}-poster-source.mp4`);
+  try {
+    await runCommand("/usr/bin/avconvert", [
+      "--source",
+      videoPath,
+      "--output",
+      sampleVideo,
+      "--replace",
+      "--preset",
+      "PresetHighestQuality",
+      "--start",
+      formatSeconds(sampleMs / 1000),
+      "--duration",
+      "0.5"
+    ]);
+    await runCommand("/usr/bin/qlmanage", ["-t", "-s", "1280", "-o", outputDir, sampleVideo]);
+    const generated = `${sampleVideo}.png`;
+    if (await fileExistsWithContent(generated)) return generated;
+  } catch {
+    // Poster generation is an editing-view enhancement; keep conversion usable without it.
+  }
+  return undefined;
+}
+
+function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmentsResult["commands"], posters: Map<string, string> = new Map()): DeckIR {
   const slides: Slide[] = commands.map((command, index) => {
     const sourceSlide = sourceDeck.deck.slides[command.segment.slideIndex];
     const objectId = `segment-video-${index + 1}`;
+    const posterPath = posters.get(command.segment.id);
     return {
       id: `segment-slide-${index + 1}`,
       index,
@@ -1348,6 +1388,7 @@ function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmen
           bounds: { x: 0, y: 0, width: sourceDeck.deck.size.width, height: sourceDeck.deck.size.height },
           opacity: 1,
           source: { uri: command.outputPath },
+          posterSource: posterPath ? { uri: posterPath } : undefined,
           playback: { autoplay: true, startMs: 0, endMs: command.segment.durationMs },
           metadata: {
             sourceSlideId: sourceSlide?.id ?? null,
@@ -1487,6 +1528,7 @@ function createBundlePaths(jobDir: string, sourceName: string): ProductBundlePat
     keynoteMovie: path.join(jobDir, "keynote-movie.m4v"),
     segmentsDir: path.join(jobDir, "segments"),
     segmentPlan: path.join(jobDir, "segment-plan.json"),
+    segmentPostersDir: path.join(jobDir, "posters"),
     nativeAssetsDir: path.join(jobDir, "assets", "native"),
     rebuiltPptx: path.join(jobDir, "rebuilt.pptx"),
     segmentedPptx: path.join(jobDir, "segmented.pptx"),
@@ -1696,6 +1738,27 @@ async function renameIfExists(from: string, to: string): Promise<boolean> {
   await mkdir(path.dirname(to), { recursive: true });
   await rename(from, to);
   return true;
+}
+
+function formatSeconds(value: number): string {
+  if (!Number.isFinite(value)) return "0";
+  const rounded = Math.round(Math.max(0, value) * 1000) / 1000;
+  return Object.is(rounded, -0) ? "0" : String(rounded);
+}
+
+function runCommand(command: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${command} exited with code ${code}: ${stderr}`));
+    });
+  });
 }
 
 function sanitizeFileName(fileName: string): string {

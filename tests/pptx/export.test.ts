@@ -75,6 +75,25 @@ describe("PPTX export", () => {
     assert.match(relsXml, /Id="rId4"[^>]+office\/2007\/relationships\/media"[^>]+Target="\.\.\/media\/media1\.mp4"/);
   });
 
+  test("exports media posterSource as the PPTX video poster image", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-video-poster-"));
+    const videoPath = path.join(dir, "segment.mp4");
+    const posterPath = path.join(dir, "poster.png");
+    const out = path.join(dir, "video-poster.pptx");
+    const poster = pngBytes(12, 7);
+    const deck = createMediaDeck(videoPath);
+    const media = deck.deck.slides[0].objects[0];
+    if (media.type !== "media") throw new Error("Expected media object.");
+    media.posterSource = { uri: posterPath };
+    await writeFile(videoPath, mp4Bytes());
+    await writeFile(posterPath, poster);
+
+    await exportIrToPptx(deck, out);
+
+    const entries = readZipEntries(await readFile(out));
+    assert.deepEqual(Array.from(entries.get("ppt/media/poster1.png") ?? []), Array.from(poster));
+  });
+
   test("exports segmented movie slides with timed auto-advance and click advance disabled", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-segment-advance-"));
     const videoPath = path.join(dir, "segment.mp4");

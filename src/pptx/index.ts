@@ -502,7 +502,9 @@ async function collectPptxMedia(deck: DeckIR): Promise<PptxMediaCollection> {
       const videoRelId = kind === "image" ? undefined : `rId${nextRelIndex++}`;
       const mediaRelId = kind === "image" ? undefined : `rId${nextRelIndex++}`;
       const partName = kind === "image" ? `image${nextImageIndex}.${extension}` : `media${nextMediaIndex}.${extension}`;
-      const posterPartName = kind === "image" ? undefined : `poster${nextPosterIndex}.png`;
+      const posterResolved = object.type === "media" ? await resolveObjectSourceBytes(object.posterSource, deck) : undefined;
+      const posterExtension = posterResolved ? imageExtensionForContentType(posterResolved.contentType) : "png";
+      const posterPartName = kind === "image" || !posterExtension ? undefined : `poster${nextPosterIndex}.${posterExtension}`;
       const partPath = `ppt/media/${partName}`;
       media.push({
         objectId: object.id,
@@ -517,10 +519,10 @@ async function collectPptxMedia(deck: DeckIR): Promise<PptxMediaCollection> {
         kind,
         posterPartPath: posterPartName ? `ppt/media/${posterPartName}` : undefined,
         posterTarget: posterPartName ? `../media/${posterPartName}` : undefined,
-        posterData: posterPartName ? defaultVideoPosterPng() : undefined
+        posterData: posterPartName ? posterResolved?.data ?? defaultVideoPosterPng() : undefined
       });
       contentTypes.set(extension, resolved.contentType);
-      if (posterPartName) contentTypes.set("png", "image/png");
+      if (posterPartName) contentTypes.set(posterExtension, posterResolved?.contentType ?? "image/png");
       parts.push(media[media.length - 1]!);
       if (kind === "image") nextImageIndex += 1;
       else {
