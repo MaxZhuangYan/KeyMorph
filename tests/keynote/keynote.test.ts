@@ -1217,6 +1217,44 @@ describe("Keynote bridge", () => {
     assert.deepEqual(object.metadata?.nativeTextStyleIds, ["9300"]);
   });
 
+  test("keeps fallback text color when native stylesheet has no explicit color", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-style-fallback-color-"));
+    const keyPath = path.join(dir, "fallback-color.key");
+    await mkdir(path.join(keyPath, "Index"), { recursive: true });
+
+    await writeFile(
+      path.join(keyPath, "Index", "DocumentStylesheet.iwa"),
+      iwaArchiveRecord(9350, [
+        {
+          type: 2022,
+          payload: nativeParagraphStylePayload({
+            fontFamily: "HelveticaNeue-Medium",
+            fontSize: 46,
+            alignment: 0
+          }),
+          objectReferences: [9350]
+        }
+      ])
+    );
+    await writeFile(
+      path.join(keyPath, "Index", "Slide-1.iwa"),
+      iwaArchiveRecord(1200, [
+        { type: 2001, payload: nativeStyledTextContentPayload("Fallback color", { paragraphStyleId: 9350 }) }
+      ])
+    );
+
+    const deck = await parseNativeKeynoteToIr(keyPath);
+    assert.equal(validateIR(deck).valid, true);
+    const object = deck.deck.slides[0]?.objects.find((candidate) => candidate.type === "text");
+    assert.equal(object?.type, "text");
+    if (object?.type !== "text") throw new Error("Expected fallback text.");
+    assert.deepEqual(object.text.runs?.[0]?.style, {
+      fontFamily: "HelveticaNeue-Medium",
+      fontSize: 46,
+      color: "#111827"
+    });
+  });
+
   test("inherits native text style properties through stylesheet parent links", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-keynote-style-inheritance-"));
     const keyPath = path.join(dir, "style-inheritance.key");

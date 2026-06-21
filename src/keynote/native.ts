@@ -2277,7 +2277,8 @@ function nativeTextStyleAtOffset(
   const paragraphStyle = resolveNativeStyleForOffset(textEntry.paragraphStyleRuns, offset, textStyleMap)?.record?.style;
   const characterStyle = resolveNativeStyleForOffset(textEntry.characterStyleRuns, offset, textStyleMap)?.record?.style;
   const hasNativeStyle = Boolean(paragraphStyle || characterStyle);
-  const nativeFallbackStyle = hasNativeStyle ? withoutFallbackColor(fallbackStyle) : fallbackStyle;
+  const hasNativeColor = paragraphStyle?.color !== undefined || characterStyle?.color !== undefined;
+  const nativeFallbackStyle = hasNativeStyle && hasNativeColor ? withoutFallbackColor(fallbackStyle) : fallbackStyle;
   return compactTextStyle({
     ...nativeFallbackStyle,
     ...paragraphStyle,
