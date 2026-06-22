@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 
 import { createDemoDeck } from "../../src/demo/createDemoDeck.ts";
 import { validateIR } from "../../src/ir/index.ts";
-import { exportIrToPptx } from "../../src/pptx/index.ts";
+import { exportIrToPptx, parsePptxToIr } from "../../src/pptx/index.ts";
 import { encodePng, type RgbaImage } from "../../src/report/fidelity.ts";
 import {
   createProductApiResponse,
@@ -231,6 +231,64 @@ describe("product bundle workflow", () => {
     assert.ok((await stat(path.join(bundleDir, "segmented.pptx"))).size > 0);
     assert.ok((await stat(path.join(bundleDir, "hybrid.pptx"))).size > 0);
     assert.ok((await stat(path.join(bundleDir, "static-steps.pptx"))).size > 0);
+  });
+
+  test("keeps hybrid PPTX v5-compatible by preserving full videos and only meaningful holds", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-product-hybrid-v5-"));
+    const inputPath = path.join(dir, "source.key");
+    const bundleDir = path.join(dir, "bundle");
+    await writeFile(inputPath, "stub keynote package", "utf8");
+
+    const redPoster = encodePng(image(4, 4, new Array(4 * 4).fill([255, 0, 0, 255]).flat()));
+    const bluePoster = encodePng(image(4, 4, new Array(4 * 4).fill([0, 0, 255, 255]).flat()));
+
+    const bundle = await createProductBundle(inputPath, bundleDir, {
+      jobId: "hybrid-v5-job",
+      allowKeynoteAutomation: true,
+      keynoteBridgeExport: async (_keynotePath, pptxPath) => {
+        await exportIrToPptx(createDemoDeck(), pptxPath);
+      },
+      keynoteMovieExport: async (_keynotePath, moviePath) => {
+        await writeFile(moviePath, "stub movie", "utf8");
+      },
+      segmentVideoSplit: async (inputMoviePath, segments, outputDir) => {
+        await mkdir(outputDir, { recursive: true });
+        const segment = { ...segments[0], endMs: segments[0].startMs + 3000, durationMs: 3000 };
+        const outputPath = path.join(outputDir, segment.outputName);
+        await writeFile(outputPath, mp4Bytes());
+        return {
+          commands: [
+            {
+              tool: "ffmpeg" as const,
+              command: "ffmpeg",
+              args: [],
+              inputPath: inputMoviePath,
+              outputPath,
+              segment
+            }
+          ]
+        };
+      },
+      segmentPosterCreate: async (_videoPath, _durationMs, outputDir, id) => {
+        const firstPosterPath = path.join(outputDir, `${id}-red-1.png`);
+        const duplicatePosterPath = path.join(outputDir, `${id}-red-2.png`);
+        const finalPosterPath = path.join(outputDir, `${id}-blue.png`);
+        await writeFile(firstPosterPath, redPoster);
+        await writeFile(duplicatePosterPath, redPoster);
+        await writeFile(finalPosterPath, bluePoster);
+        return [firstPosterPath, duplicatePosterPath, finalPosterPath];
+      }
+    });
+
+    const manifest = JSON.parse(await readFile(path.join(bundleDir, "manifest.json"), "utf8")) as ProductBundleManifest;
+    const hybrid = await parsePptxToIr(bundle.paths.hybridPptx);
+    const videoSlides = hybrid.deck.slides.filter((slide) => slide.objects.some((object) => object.type === "media"));
+    const holdSlides = hybrid.deck.slides.filter((slide) => slide.objects.some((object) => object.type === "image"));
+
+    assert.equal(manifest.artifacts.hybridPptx, "hybrid.pptx");
+    assert.equal(videoSlides.length, 1);
+    assert.equal(holdSlides.length, 2);
+    assert.equal(hybrid.deck.slides.length, 3);
   });
 
   test("materializes used native Keynote package images into bundle-local runtime assets", async () => {

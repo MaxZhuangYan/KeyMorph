@@ -1329,13 +1329,22 @@ async function createSegmentedMoviePptx(input: {
     let staticFrames: StaticStepFrame[];
     if (input.createPoster) {
       await mkdir(input.paths.segmentPostersDir, { recursive: true });
+      const posterFrames: StaticStepFrame[] = [];
       for (const command of split.commands) {
         const posterPaths = normalizePosterPaths(
           await input.createPoster(command.outputPath, command.segment.durationMs, input.paths.segmentPostersDir, command.segment.id)
         );
         if (posterPaths[0]) posters.set(command.segment.id, posterPaths[0]);
+        for (const [posterIndex, posterPath] of posterPaths.entries()) {
+          posterFrames.push({
+            id: `${command.segment.id}-poster-${posterIndex + 1}`,
+            imagePath: posterPath,
+            segment: command.segment,
+            sampleMs: posterSampleMs(command.segment.durationMs, posterIndex, posterPaths.length)
+          });
+        }
       }
-      staticFrames = createStaticFramesFromPosters(split.commands, posters);
+      staticFrames = posterFrames.length ? posterFrames : createStaticFramesFromPosters(split.commands, posters);
     } else {
       for (const [id, posterPath] of await createSegmentPosters(split.commands, input.paths.segmentPostersDir)) {
         posters.set(id, posterPath);
@@ -1347,7 +1356,8 @@ async function createSegmentedMoviePptx(input: {
     const staticStepsDeck = createStaticStepDeck(input.deck, staticFrames);
     const staticPptxPath = staticStepsDeck ? "static-steps.pptx" : null;
     if (staticStepsDeck) await exportIrToPptx(staticStepsDeck, input.paths.staticStepsPptx);
-    const hybridDeck = createHybridStepDeck(input.deck, split.commands, posters, staticFrames);
+    const hybridFrames = await selectMeaningfulHybridHoldFrames(staticFrames);
+    const hybridDeck = createHybridStepDeck(input.deck, split.commands, posters, hybridFrames);
     const hybridPptxPath = hybridDeck ? "hybrid.pptx" : null;
     if (hybridDeck) await exportIrToPptx(hybridDeck, input.paths.hybridPptx);
     return { segmentPlanPath: "segment-plan.json", pptxPath: "segmented.pptx", staticPptxPath, hybridPptxPath };
@@ -1383,6 +1393,14 @@ async function createSegmentPosters(commands: SplitVideoSegmentsResult["commands
 async function createSegmentPoster(videoPath: string, durationMs: number, outputDir: string, id: string): Promise<string | undefined> {
   const sampleMs = Math.max(500, Math.min(durationMs * 0.9, durationMs - 250));
   return createSegmentPosterAt(videoPath, sampleMs, outputDir, `${id}-poster`);
+}
+
+function posterSampleMs(durationMs: number, index: number, count: number): number {
+  const duration = Math.max(1, Math.round(durationMs));
+  if (count <= 1) return Math.max(0, Math.min(duration - 1, Math.round(duration * 0.9)));
+  if (index >= count - 1) return Math.max(0, duration - 250);
+  const ratio = (index + 1) / count;
+  return Math.max(0, Math.min(duration - 1, Math.round(duration * ratio)));
 }
 
 interface StaticStepFrame {
@@ -1461,6 +1479,50 @@ async function dedupeStaticFrames(frames: StaticStepFrame[]): Promise<StaticStep
   const last = frames[frames.length - 1];
   if (last && kept[kept.length - 1]?.imagePath !== last.imagePath) kept.push(last);
   return kept;
+}
+
+async function selectMeaningfulHybridHoldFrames(frames: StaticStepFrame[]): Promise<StaticStepFrame[]> {
+  const framesBySegment = groupStaticFramesBySegment(frames);
+  const selected: StaticStepFrame[] = [];
+  for (const segmentFrames of framesBySegment.values()) {
+    selected.push(...(await selectMeaningfulSegmentHoldFrames(segmentFrames)));
+  }
+  return selected;
+}
+
+async function selectMeaningfulSegmentHoldFrames(frames: StaticStepFrame[]): Promise<StaticStepFrame[]> {
+  const sorted = [...frames].sort((a, b) => a.sampleMs - b.sampleMs);
+  const finalFrame = sorted[sorted.length - 1];
+  if (!finalFrame) return [];
+  const selected: StaticStepFrame[] = [];
+  for (const frame of sorted.slice(0, -1).reverse()) {
+    if (frame.sampleMs < finalFrame.sampleMs - 500 && (await frameLooksMeaningfullyDifferent(frame, finalFrame))) {
+      selected.push(frame);
+      break;
+    }
+  }
+  selected.push(finalFrame);
+  return selected;
+}
+
+async function frameLooksMeaningfullyDifferent(a: StaticStepFrame, b: StaticStepFrame): Promise<boolean> {
+  if (a.imagePath === b.imagePath) return false;
+  try {
+    const comparison = await comparePngFiles(a.imagePath, b.imagePath, { threshold: 0.02 });
+    return comparison.mismatchRatio >= 0.035 || comparison.pixelFidelityScore <= 0.965;
+  } catch {
+    return true;
+  }
+}
+
+function groupStaticFramesBySegment(frames: StaticStepFrame[]): Map<string, StaticStepFrame[]> {
+  const framesBySegment = new Map<string, StaticStepFrame[]>();
+  for (const frame of frames) {
+    const list = framesBySegment.get(frame.segment.id) ?? [];
+    list.push(frame);
+    framesBySegment.set(frame.segment.id, list);
+  }
+  return framesBySegment;
 }
 
 function normalizePosterPaths(value: string | string[] | undefined): string[] {
@@ -1596,28 +1658,17 @@ function createHybridStepDeck(
   posters: Map<string, string>,
   frames: StaticStepFrame[]
 ): DeckIR | undefined {
-  if (frames.length === 0) return undefined;
+  if (commands.length === 0) return undefined;
   const slides: Slide[] = [];
-  const framesBySegment = new Map<string, StaticStepFrame[]>();
-  for (const frame of frames) {
-    const list = framesBySegment.get(frame.segment.id) ?? [];
-    list.push(frame);
-    framesBySegment.set(frame.segment.id, list);
-  }
+  const framesBySegment = groupStaticFramesBySegment(frames);
 
   for (const command of commands) {
     const segmentFrames = (framesBySegment.get(command.segment.id) ?? []).sort((a, b) => a.sampleMs - b.sampleMs);
-    if (segmentFrames.length === 0) continue;
-    let cursorMs = 0;
+    const videoSlideIndex = slides.length;
+    slides.push(createHybridVideoSlide(sourceDeck, command, posters.get(command.segment.id), videoSlideIndex));
     for (const frame of segmentFrames) {
-      const videoDurationMs = Math.max(1, frame.sampleMs - cursorMs);
-      if (videoDurationMs > 80) {
-        const videoSlideIndex = slides.length;
-        slides.push(createHybridVideoSlide(sourceDeck, command, posters.get(command.segment.id), videoSlideIndex, cursorMs, videoDurationMs));
-      }
       const holdSlideIndex = slides.length;
       slides.push(createHybridHoldSlide(sourceDeck, frame, holdSlideIndex));
-      cursorMs = Math.max(cursorMs, frame.sampleMs);
     }
   }
 
@@ -1642,7 +1693,7 @@ function createHybridStepDeck(
           severity: "info",
           code: "hybrid-video-static-pptx",
           message:
-            "Generated from Keynote-rendered movie segments, alternating autoplay video intervals with click-held static visual states."
+            "Generated from Keynote-rendered movie segments, preserving each smooth video interval and adding click-held visual states only when the rendered movie shows a meaningful completed state."
         }
       ],
       degradedFeatures: [
@@ -1662,16 +1713,15 @@ function createHybridVideoSlide(
   sourceDeck: DeckIR,
   command: SplitVideoSegmentsResult["commands"][number],
   posterPath: string | undefined,
-  index: number,
-  seekMs: number,
-  durationMs: number
+  index: number
 ): Slide {
   const sourceSlide = sourceDeck.deck.slides[command.segment.slideIndex];
   const objectId = `hybrid-video-${index + 1}`;
+  const durationMs = command.segment.durationMs;
   return {
     id: `hybrid-video-slide-${index + 1}`,
     index,
-    name: `${sourceSlide?.name ?? `Slide ${command.segment.slideIndex + 1}`} · video to ${Math.round(seekMs + durationMs)}ms`,
+    name: `${sourceSlide?.name ?? `Slide ${command.segment.slideIndex + 1}`} · smooth segment ${command.segment.clickIndex + 1}`,
     background: { type: "solid", color: "#000000" },
     objects: [
       {
@@ -1683,13 +1733,13 @@ function createHybridVideoSlide(
         opacity: 1,
         source: { uri: command.outputPath },
         posterSource: posterPath ? { uri: posterPath } : undefined,
-        playback: { autoplay: true, startMs: seekMs, endMs: seekMs + durationMs },
+        playback: { autoplay: true, startMs: 0, endMs: durationMs },
         metadata: {
           sourceSlideId: sourceSlide?.id ?? null,
           sourceSlideIndex: command.segment.slideIndex,
           sourceClickIndex: command.segment.clickIndex,
           sourceSegmentStartMs: command.segment.startMs,
-          sourceSegmentSeekMs: seekMs,
+          sourceSegmentSeekMs: 0,
           sourceSegmentDurationMs: durationMs,
           keymorphHybridVideo: true
         }
@@ -1703,7 +1753,7 @@ function createHybridVideoSlide(
           kind: "media",
           targetId: objectId,
           action: "play",
-          seekMs,
+          seekMs: 0,
           start: { type: "absolute", atMs: 0 },
           durationMs: 1,
           fill: "forwards"
