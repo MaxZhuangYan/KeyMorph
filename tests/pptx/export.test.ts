@@ -119,6 +119,32 @@ describe("PPTX export", () => {
     assert.ok(slideXml.indexOf("<p:transition") < slideXml.indexOf("<p:timing>"));
   });
 
+  test("exports click-step segmented movie slides without timed auto-advance", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-segment-click-step-"));
+    const videoPath = path.join(dir, "segment.mp4");
+    const out = path.join(dir, "segment-click-step.pptx");
+    const deck = createMediaDeck(videoPath);
+    const slide = deck.deck.slides[0];
+    slide.transition = {
+      type: "cut",
+      trigger: "click",
+      durationMs: 0,
+      metadata: {
+        keymorphSegmentedMovie: true,
+        advanceMode: "click-after-playback",
+        playbackDurationMs: 1234
+      }
+    };
+    await writeFile(videoPath, mp4Bytes());
+
+    await exportIrToPptx(deck, out);
+
+    const slideXml = await readPptxXml(out, "ppt/slides/slide1.xml");
+    assert.doesNotMatch(slideXml, /advTm=/);
+    assert.doesNotMatch(slideXml, /<p:transition/);
+    assert.match(slideXml, /playFrom\(0\)/);
+  });
+
   test("preserves custom slide size and bounds instead of forcing wide layout", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "keymorph-pptx-custom-size-"));
     const out = path.join(dir, "custom-size.pptx");

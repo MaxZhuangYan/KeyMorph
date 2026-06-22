@@ -1297,7 +1297,9 @@ async function createSegmentedMoviePptx(input: {
     movieDurationMs: movieDurationMs ?? null,
     scaledToMovieDuration: Boolean(movieDurationMs),
     mode: "movie-segment-pptx",
-    message: "Each entry maps one Keynote-rendered movie interval to one PPTX slide with an embedded full-slide video.",
+    advanceMode: "click-after-playback",
+    message:
+      "Each entry maps one Keynote-rendered movie interval to one PPTX slide with an embedded full-slide video. Slides play automatically when entered, hold on the segment poster/final frame, and wait for the presenter click before advancing.",
     segments
   });
 
@@ -1418,12 +1420,13 @@ function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmen
       },
       transition: {
         type: "cut",
-        trigger: index === commands.length - 1 ? "click" : "auto",
+        trigger: "click",
         durationMs: 0,
         metadata: {
           keymorphSegmentedMovie: true,
-          disableClickAdvanceUntilMs: command.segment.durationMs,
-          autoAdvanceAfterMs: command.segment.durationMs
+          advanceMode: "click-after-playback",
+          holdFinalFrame: true,
+          playbackDurationMs: command.segment.durationMs
         }
       },
       metadata: {
@@ -1455,7 +1458,7 @@ function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmen
           severity: "info",
           code: "segmented-movie-pptx",
           message:
-            "Generated from Keynote's rendered movie, split at KeyMorph timeline boundaries, and embedded as one full-slide video per PPTX slide."
+            "Generated from Keynote's rendered movie, split at KeyMorph timeline boundaries, and embedded as one click-advanced full-slide video step per PPTX slide."
         }
       ],
       degradedFeatures: [
