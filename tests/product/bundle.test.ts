@@ -84,6 +84,7 @@ describe("product bundle workflow", () => {
     assert.equal(response.downloads.source, "/demo/out/jobs/api-job/source.ir.json");
     assert.equal(response.downloads.videoPlan, "/demo/out/jobs/api-job/video-plan.json");
     assert.equal(response.downloads.videoStatus, "/demo/out/jobs/api-job/video-status.json");
+    assert.equal(response.downloads.hybridPptx, null);
     assert.equal(response.downloads.staticStepsPptx, null);
     assert.equal(response.downloads.baselineStatus, "/demo/out/jobs/api-job/baseline-status.json");
     assert.equal(response.downloads.baselineFidelity, null);
@@ -223,9 +224,12 @@ describe("product bundle workflow", () => {
     assert.equal(manifest.artifacts.segmentPlan, "segment-plan.json");
     assert.equal(manifest.artifacts.segmentedPptx, "segmented.pptx");
     assert.equal(manifest.artifacts.staticStepsPptx, "static-steps.pptx");
+    assert.equal(manifest.artifacts.hybridPptx, "hybrid.pptx");
     assert.equal(response.downloads.segmentedPptx, "/demo/out/jobs/segmented-job/segmented.pptx");
+    assert.equal(response.downloads.hybridPptx, "/demo/out/jobs/segmented-job/hybrid.pptx");
     assert.equal(response.downloads.staticStepsPptx, "/demo/out/jobs/segmented-job/static-steps.pptx");
     assert.ok((await stat(path.join(bundleDir, "segmented.pptx"))).size > 0);
+    assert.ok((await stat(path.join(bundleDir, "hybrid.pptx"))).size > 0);
     assert.ok((await stat(path.join(bundleDir, "static-steps.pptx"))).size > 0);
   });
 
@@ -575,9 +579,12 @@ describe("product bundle workflow", () => {
     assert.match(source, /Keynote 基準對比需要原始 \.key 來源檔/);
     assert.match(source, /下载高清丝滑动画 PPTX/);
     assert.match(source, /下載高清流暢動畫 PPTX/);
+    assert.match(source, /下载动画\+定格混合 PPTX/);
+    assert.match(source, /下載動畫\+定格混合 PPTX/);
     assert.match(source, /下载兜底静态步骤 PPTX/);
     assert.match(source, /下載備用靜態步驟 PPTX/);
     assert.match(source, /downloadLink\(result\.downloads\.segmentedPptx, t\('downloadSegmentedPptx'\)\)/);
+    assert.match(source, /downloadLink\(result\.downloads\.hybridPptx, t\('downloadHybridPptx'\)\)/);
     assert.match(source, /downloadLink\(result\.downloads\.staticStepsPptx, t\('downloadStaticStepsPptx'\)\)/);
     assert.match(source, /pruneOldJobs\(jobId, 2\)/);
     assert.match(source, /baselineCanRun/);

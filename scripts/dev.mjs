@@ -415,6 +415,7 @@ function renderAppHtml() {
         downloadHtml: 'Download HTML Runtime',
         downloadPptx: 'Download PPTX',
         downloadSegmentedPptx: 'Download smooth animated PPTX',
+        downloadHybridPptx: 'Download hybrid video + hold PPTX',
         downloadStaticStepsPptx: 'Download fallback static-step PPTX',
         exportKeynote: 'Export Keynote',
         downloadIr: 'Download IR',
@@ -496,6 +497,7 @@ function renderAppHtml() {
         downloadHtml: '下载 HTML 运行时',
         downloadPptx: '下载 PPTX',
         downloadSegmentedPptx: '下载高清丝滑动画 PPTX',
+        downloadHybridPptx: '下载动画+定格混合 PPTX',
         downloadStaticStepsPptx: '下载兜底静态步骤 PPTX',
         exportKeynote: '导出 Keynote',
         downloadIr: '下载 IR',
@@ -577,6 +579,7 @@ function renderAppHtml() {
         downloadHtml: '下載 HTML 執行時',
         downloadPptx: '下載 PPTX',
         downloadSegmentedPptx: '下載高清流暢動畫 PPTX',
+        downloadHybridPptx: '下載動畫+定格混合 PPTX',
         downloadStaticStepsPptx: '下載備用靜態步驟 PPTX',
         exportKeynote: '匯出 Keynote',
         downloadIr: '下載 IR',
@@ -758,6 +761,7 @@ function renderAppHtml() {
             downloadLink(result.downloads.html, t('downloadHtml'), true) +
             downloadLink(result.downloads.pptx, t('downloadPptx')) +
             downloadLink(result.downloads.segmentedPptx, t('downloadSegmentedPptx')) +
+            downloadLink(result.downloads.hybridPptx, t('downloadHybridPptx')) +
             downloadLink(result.downloads.staticStepsPptx, t('downloadStaticStepsPptx')) +
             downloadLink(result.downloads.ir, t('downloadIr')) +
             downloadLink(result.downloads.report, t('downloadReport')) +

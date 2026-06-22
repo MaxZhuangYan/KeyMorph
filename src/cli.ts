@@ -157,6 +157,7 @@ export interface ProductBundlePaths {
   rebuiltPptx: string;
   segmentedPptx: string;
   staticStepsPptx: string;
+  hybridPptx: string;
   lossReport: string;
   manifest: string;
   videoPlan: string;
@@ -191,6 +192,7 @@ export interface ProductBundleManifest {
     segmentPlan: string | null;
     segmentedPptx: string | null;
     staticStepsPptx: string | null;
+    hybridPptx: string | null;
     nativeAssets: string | null;
     rebuiltPptx: string;
     lossReport: string;
@@ -399,6 +401,7 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
   manifest.artifacts.segmentPlan = segmented.segmentPlanPath;
   manifest.artifacts.segmentedPptx = segmented.pptxPath;
   manifest.artifacts.staticStepsPptx = segmented.staticPptxPath;
+  manifest.artifacts.hybridPptx = segmented.hybridPptxPath;
   if (segmented.pptxPath) {
     manifest.report.recommendedFixes = Array.from(
       new Set([
@@ -805,6 +808,7 @@ export function createProductApiResponse(bundle: ProductBundleResult, basePath: 
       pptx: `${base}/rebuilt.pptx`,
       segmentedPptx: bundle.manifest.artifacts.segmentedPptx ? `${base}/${bundle.manifest.artifacts.segmentedPptx}` : null,
       staticStepsPptx: bundle.manifest.artifacts.staticStepsPptx ? `${base}/${bundle.manifest.artifacts.staticStepsPptx}` : null,
+      hybridPptx: bundle.manifest.artifacts.hybridPptx ? `${base}/${bundle.manifest.artifacts.hybridPptx}` : null,
       key: null,
       report: `${base}/loss-report.json`,
       manifest: `${base}/manifest.json`,
@@ -1289,9 +1293,9 @@ async function createSegmentedMoviePptx(input: {
   splitVideo?: ProductBundleOptions["segmentVideoSplit"];
   createPoster?: ProductBundleOptions["segmentPosterCreate"];
   splitOptions: SplitVideoSegmentsOptions;
-}): Promise<{ segmentPlanPath: string | null; pptxPath: string | null; staticPptxPath: string | null; message?: string }> {
+}): Promise<{ segmentPlanPath: string | null; pptxPath: string | null; staticPptxPath: string | null; hybridPptxPath: string | null; message?: string }> {
   if (input.runtime.mode !== "keynote-movie" || !input.runtime.moviePath) {
-    return { segmentPlanPath: null, pptxPath: null, staticPptxPath: null };
+    return { segmentPlanPath: null, pptxPath: null, staticPptxPath: null, hybridPptxPath: null };
   }
 
   const rawSegments = createSegmentPlan(input.deck);
@@ -1311,7 +1315,7 @@ async function createSegmentedMoviePptx(input: {
   });
 
   if (segments.length === 0) {
-    return { segmentPlanPath: "segment-plan.json", pptxPath: null, staticPptxPath: null, message: "No playable timeline segments were found for segmented PPTX export." };
+    return { segmentPlanPath: "segment-plan.json", pptxPath: null, staticPptxPath: null, hybridPptxPath: null, message: "No playable timeline segments were found for segmented PPTX export." };
   }
 
   try {
@@ -1343,12 +1347,16 @@ async function createSegmentedMoviePptx(input: {
     const staticStepsDeck = createStaticStepDeck(input.deck, staticFrames);
     const staticPptxPath = staticStepsDeck ? "static-steps.pptx" : null;
     if (staticStepsDeck) await exportIrToPptx(staticStepsDeck, input.paths.staticStepsPptx);
-    return { segmentPlanPath: "segment-plan.json", pptxPath: "segmented.pptx", staticPptxPath };
+    const hybridDeck = createHybridStepDeck(input.deck, split.commands, posters, staticFrames);
+    const hybridPptxPath = hybridDeck ? "hybrid.pptx" : null;
+    if (hybridDeck) await exportIrToPptx(hybridDeck, input.paths.hybridPptx);
+    return { segmentPlanPath: "segment-plan.json", pptxPath: "segmented.pptx", staticPptxPath, hybridPptxPath };
   } catch (error) {
     return {
       segmentPlanPath: "segment-plan.json",
       pptxPath: null,
       staticPptxPath: null,
+      hybridPptxPath: null,
       message: `Segmented high-fidelity PPTX export failed. Install ffmpeg or use macOS avconvert, then rerun conversion. ${errorMessage(error)}`
     };
   }
@@ -1409,7 +1417,7 @@ function segmentStaticSampleTimes(durationMs: number): number[] {
   for (let timeMs = 1000; timeMs < duration - 250; timeMs += 2000) {
     times.add(timeMs);
   }
-  if (duration > 1500) times.add(Math.max(500, duration - 750));
+  if (duration > 1500) times.add(Math.max(500, duration - 250));
   return Array.from(times)
     .filter((timeMs) => timeMs >= 0 && timeMs < duration)
     .sort((a, b) => a - b);
@@ -1582,6 +1590,186 @@ function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmen
   };
 }
 
+function createHybridStepDeck(
+  sourceDeck: DeckIR,
+  commands: SplitVideoSegmentsResult["commands"],
+  posters: Map<string, string>,
+  frames: StaticStepFrame[]
+): DeckIR | undefined {
+  if (frames.length === 0) return undefined;
+  const slides: Slide[] = [];
+  const framesBySegment = new Map<string, StaticStepFrame[]>();
+  for (const frame of frames) {
+    const list = framesBySegment.get(frame.segment.id) ?? [];
+    list.push(frame);
+    framesBySegment.set(frame.segment.id, list);
+  }
+
+  for (const command of commands) {
+    const segmentFrames = (framesBySegment.get(command.segment.id) ?? []).sort((a, b) => a.sampleMs - b.sampleMs);
+    if (segmentFrames.length === 0) continue;
+    let cursorMs = 0;
+    for (const frame of segmentFrames) {
+      const videoDurationMs = Math.max(1, frame.sampleMs - cursorMs);
+      if (videoDurationMs > 80) {
+        const videoSlideIndex = slides.length;
+        slides.push(createHybridVideoSlide(sourceDeck, command, posters.get(command.segment.id), videoSlideIndex, cursorMs, videoDurationMs));
+      }
+      const holdSlideIndex = slides.length;
+      slides.push(createHybridHoldSlide(sourceDeck, frame, holdSlideIndex));
+      cursorMs = Math.max(cursorMs, frame.sampleMs);
+    }
+  }
+
+  if (slides.length === 0) return undefined;
+  return {
+    irVersion: IR_VERSION,
+    metadata: {
+      ...(sourceDeck.metadata ?? {}),
+      title: `${sourceDeck.metadata?.title ?? sourceDeck.deck.title ?? "Keynote"} hybrid playback`,
+      sourceApplication: "KeyMorph hybrid video/static PPTX"
+    },
+    deck: {
+      id: `${sourceDeck.deck.id}-hybrid`,
+      title: `${sourceDeck.deck.title ?? "Keynote"} hybrid playback`,
+      size: sourceDeck.deck.size,
+      slides
+    },
+    conversion: {
+      status: "partial",
+      messages: [
+        {
+          severity: "info",
+          code: "hybrid-video-static-pptx",
+          message:
+            "Generated from Keynote-rendered movie segments, alternating autoplay video intervals with click-held static visual states."
+        }
+      ],
+      degradedFeatures: [
+        {
+          code: "hybrid-video-static-pptx-not-editable",
+          severity: "info",
+          area: "media",
+          description: "Hybrid PPTX preserves rendered animation intervals and completed visual states, but replaces editable slide objects with videos and images.",
+          fallback: "Edit the source Keynote deck and rerun conversion to refresh the hybrid draft."
+        }
+      ]
+    }
+  };
+}
+
+function createHybridVideoSlide(
+  sourceDeck: DeckIR,
+  command: SplitVideoSegmentsResult["commands"][number],
+  posterPath: string | undefined,
+  index: number,
+  seekMs: number,
+  durationMs: number
+): Slide {
+  const sourceSlide = sourceDeck.deck.slides[command.segment.slideIndex];
+  const objectId = `hybrid-video-${index + 1}`;
+  return {
+    id: `hybrid-video-slide-${index + 1}`,
+    index,
+    name: `${sourceSlide?.name ?? `Slide ${command.segment.slideIndex + 1}`} · video to ${Math.round(seekMs + durationMs)}ms`,
+    background: { type: "solid", color: "#000000" },
+    objects: [
+      {
+        id: objectId,
+        type: "media",
+        mediaType: "video",
+        name: command.segment.outputName,
+        bounds: { x: 0, y: 0, width: sourceDeck.deck.size.width, height: sourceDeck.deck.size.height },
+        opacity: 1,
+        source: { uri: command.outputPath },
+        posterSource: posterPath ? { uri: posterPath } : undefined,
+        playback: { autoplay: true, startMs: seekMs, endMs: seekMs + durationMs },
+        metadata: {
+          sourceSlideId: sourceSlide?.id ?? null,
+          sourceSlideIndex: command.segment.slideIndex,
+          sourceClickIndex: command.segment.clickIndex,
+          sourceSegmentStartMs: command.segment.startMs,
+          sourceSegmentSeekMs: seekMs,
+          sourceSegmentDurationMs: durationMs,
+          keymorphHybridVideo: true
+        }
+      }
+    ],
+    timeline: {
+      durationMs,
+      events: [
+        {
+          id: `hybrid-play-${index + 1}`,
+          kind: "media",
+          targetId: objectId,
+          action: "play",
+          seekMs,
+          start: { type: "absolute", atMs: 0 },
+          durationMs: 1,
+          fill: "forwards"
+        }
+      ]
+    },
+    transition: {
+      type: "cut",
+      trigger: "auto",
+      durationMs: 0,
+      metadata: {
+        keymorphSegmentedMovie: true,
+        autoAdvanceAfterMs: durationMs,
+        disableClickAdvanceUntilMs: durationMs,
+        keymorphHybridVideo: true
+      }
+    },
+    metadata: {
+      sourceSlideId: sourceSlide?.id ?? null,
+      sourceSlideIndex: command.segment.slideIndex,
+      sourceClickIndex: command.segment.clickIndex,
+      keymorphHybridVideo: true
+    }
+  };
+}
+
+function createHybridHoldSlide(sourceDeck: DeckIR, frame: StaticStepFrame, index: number): Slide {
+  const sourceSlide = sourceDeck.deck.slides[frame.segment.slideIndex];
+  return {
+    id: `hybrid-hold-slide-${index + 1}`,
+    index,
+    name: `${sourceSlide?.name ?? `Slide ${frame.segment.slideIndex + 1}`} · hold ${Math.round(frame.sampleMs)}ms`,
+    background: { type: "solid", color: "#000000" },
+    objects: [
+      {
+        id: `hybrid-hold-image-${index + 1}`,
+        type: "image",
+        name: `${frame.id} hold`,
+        bounds: { x: 0, y: 0, width: sourceDeck.deck.size.width, height: sourceDeck.deck.size.height },
+        opacity: 1,
+        source: { uri: frame.imagePath },
+        metadata: {
+          sourceSlideId: sourceSlide?.id ?? null,
+          sourceSlideIndex: frame.segment.slideIndex,
+          sourceClickIndex: frame.segment.clickIndex,
+          sourceMovieStartMs: frame.segment.startMs,
+          sourceMovieEndMs: frame.segment.endMs,
+          sourceSegmentSampleMs: frame.sampleMs,
+          sourceMovieSampleMs: frame.segment.startMs + frame.sampleMs,
+          keymorphHybridHold: true
+        }
+      }
+    ],
+    timeline: { durationMs: 1, events: [], dependencyGraph: { edges: [] } },
+    transition: { type: "cut", trigger: "click", durationMs: 0 },
+    metadata: {
+      sourceSlideId: sourceSlide?.id ?? null,
+      sourceSlideIndex: frame.segment.slideIndex,
+      sourceClickIndex: frame.segment.clickIndex,
+      sourceSegmentSampleMs: frame.sampleMs,
+      sourceMovieSampleMs: frame.segment.startMs + frame.sampleMs,
+      keymorphHybridHold: true
+    }
+  };
+}
+
 function createStaticStepDeck(
   sourceDeck: DeckIR,
   frames: StaticStepFrame[]
@@ -1609,6 +1797,7 @@ function createStaticStepDeck(
             sourceMovieStartMs: frame.segment.startMs,
             sourceMovieEndMs: frame.segment.endMs,
             sourceSegmentSampleMs: frame.sampleMs,
+            sourceMovieSampleMs: frame.segment.startMs + frame.sampleMs,
             keymorphStaticStep: true
           }
         }
@@ -1620,6 +1809,7 @@ function createStaticStepDeck(
         sourceSlideIndex: frame.segment.slideIndex,
         sourceClickIndex: frame.segment.clickIndex,
         sourceSegmentSampleMs: frame.sampleMs,
+        sourceMovieSampleMs: frame.segment.startMs + frame.sampleMs,
         keymorphStaticStep: true
       }
     });
@@ -1724,6 +1914,7 @@ function createBundlePaths(jobDir: string, sourceName: string): ProductBundlePat
     rebuiltPptx: path.join(jobDir, "rebuilt.pptx"),
     segmentedPptx: path.join(jobDir, "segmented.pptx"),
     staticStepsPptx: path.join(jobDir, "static-steps.pptx"),
+    hybridPptx: path.join(jobDir, "hybrid.pptx"),
     lossReport: path.join(jobDir, "loss-report.json"),
     manifest: path.join(jobDir, "manifest.json"),
     videoPlan: path.join(jobDir, "video-plan.json"),
@@ -1774,6 +1965,7 @@ function createBundleManifest(input: {
       segmentPlan: null,
       segmentedPptx: null,
       staticStepsPptx: null,
+      hybridPptx: null,
       nativeAssets: null,
       rebuiltPptx: "rebuilt.pptx",
       lossReport: "loss-report.json",
@@ -2005,6 +2197,9 @@ function printBundleSummary(bundle: ProductBundleResult): void {
   console.log(`  rebuilt PPTX: ${bundle.paths.rebuiltPptx}`);
   if (bundle.manifest.artifacts.segmentedPptx) {
     console.log(`  segmented PPTX: ${bundle.paths.segmentedPptx}`);
+  }
+  if (bundle.manifest.artifacts.hybridPptx) {
+    console.log(`  hybrid PPTX: ${bundle.paths.hybridPptx}`);
   }
   if (bundle.manifest.artifacts.staticStepsPptx) {
     console.log(`  static steps PPTX: ${bundle.paths.staticStepsPptx}`);
