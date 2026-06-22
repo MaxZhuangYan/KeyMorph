@@ -55,7 +55,7 @@ export interface ProductBundleOptions {
     outputDir: string,
     options: SplitVideoSegmentsOptions
   ) => Promise<SplitVideoSegmentsResult>;
-  segmentPosterCreate?: (videoPath: string, durationMs: number, outputDir: string, id: string) => Promise<string | undefined>;
+  segmentPosterCreate?: (videoPath: string, durationMs: number, outputDir: string, id: string) => Promise<string | string[] | undefined>;
   video?: Pick<VideoExportOptions, "fps" | "scale" | "ffmpegPath">;
 }
 
@@ -1322,20 +1322,25 @@ async function createSegmentedMoviePptx(input: {
       input.splitOptions
     );
     const posters = new Map<string, string>();
+    let staticFrames: StaticStepFrame[];
     if (input.createPoster) {
       await mkdir(input.paths.segmentPostersDir, { recursive: true });
       for (const command of split.commands) {
-        const posterPath = await input.createPoster(command.outputPath, command.segment.durationMs, input.paths.segmentPostersDir, command.segment.id);
-        if (posterPath) posters.set(command.segment.id, posterPath);
+        const posterPaths = normalizePosterPaths(
+          await input.createPoster(command.outputPath, command.segment.durationMs, input.paths.segmentPostersDir, command.segment.id)
+        );
+        if (posterPaths[0]) posters.set(command.segment.id, posterPaths[0]);
       }
+      staticFrames = createStaticFramesFromPosters(split.commands, posters);
     } else {
       for (const [id, posterPath] of await createSegmentPosters(split.commands, input.paths.segmentPostersDir)) {
         posters.set(id, posterPath);
       }
+      staticFrames = await createSegmentStaticFrames(split.commands, input.paths.segmentPostersDir);
     }
     const segmentedDeck = createSegmentedMovieDeck(input.deck, split.commands, posters);
     await exportIrToPptx(segmentedDeck, input.paths.segmentedPptx);
-    const staticStepsDeck = createStaticStepDeck(input.deck, split.commands, posters);
+    const staticStepsDeck = createStaticStepDeck(input.deck, staticFrames);
     const staticPptxPath = staticStepsDeck ? "static-steps.pptx" : null;
     if (staticStepsDeck) await exportIrToPptx(staticStepsDeck, input.paths.staticStepsPptx);
     return { segmentPlanPath: "segment-plan.json", pptxPath: "segmented.pptx", staticPptxPath };
@@ -1369,7 +1374,49 @@ async function createSegmentPosters(commands: SplitVideoSegmentsResult["commands
 
 async function createSegmentPoster(videoPath: string, durationMs: number, outputDir: string, id: string): Promise<string | undefined> {
   const sampleMs = Math.max(500, Math.min(durationMs * 0.9, durationMs - 250));
-  const sampleVideo = path.join(outputDir, `${id}-poster-source.mp4`);
+  return createSegmentPosterAt(videoPath, sampleMs, outputDir, `${id}-poster`);
+}
+
+interface StaticStepFrame {
+  id: string;
+  imagePath: string;
+  segment: VideoSegmentPlanEntry;
+  sampleMs: number;
+}
+
+async function createSegmentStaticFrames(commands: SplitVideoSegmentsResult["commands"], outputDir: string): Promise<StaticStepFrame[]> {
+  const candidates: StaticStepFrame[] = [];
+  await mkdir(outputDir, { recursive: true });
+  for (const command of commands) {
+    for (const sampleMs of segmentStaticSampleTimes(command.segment.durationMs)) {
+      const imagePath = await createSegmentPosterAt(command.outputPath, sampleMs, outputDir, `${command.segment.id}-static-${sampleMs}`);
+      if (imagePath) {
+        candidates.push({
+          id: `${command.segment.id}-static-${sampleMs}`,
+          imagePath,
+          segment: command.segment,
+          sampleMs
+        });
+      }
+    }
+  }
+  return dedupeStaticFrames(candidates);
+}
+
+function segmentStaticSampleTimes(durationMs: number): number[] {
+  const duration = Math.max(1, Math.round(durationMs));
+  const times = new Set<number>([Math.max(0, Math.min(duration - 250, Math.round(duration * 0.9)))]);
+  for (let timeMs = 1000; timeMs < duration - 250; timeMs += 2000) {
+    times.add(timeMs);
+  }
+  if (duration > 1500) times.add(Math.max(500, duration - 750));
+  return Array.from(times)
+    .filter((timeMs) => timeMs >= 0 && timeMs < duration)
+    .sort((a, b) => a - b);
+}
+
+async function createSegmentPosterAt(videoPath: string, sampleMs: number, outputDir: string, id: string): Promise<string | undefined> {
+  const sampleVideo = path.join(outputDir, `${id}-source.mp4`);
   try {
     await runCommand("/usr/bin/avconvert", [
       "--source",
@@ -1388,9 +1435,48 @@ async function createSegmentPoster(videoPath: string, durationMs: number, output
     const generated = `${sampleVideo}.png`;
     if (await fileExistsWithContent(generated)) return generated;
   } catch {
-    // Poster generation is an editing-view enhancement; keep conversion usable without it.
+    // Static step extraction is best-effort; keep the rest of the bundle usable.
   }
   return undefined;
+}
+
+async function dedupeStaticFrames(frames: StaticStepFrame[]): Promise<StaticStepFrame[]> {
+  const kept: StaticStepFrame[] = [];
+  for (const frame of frames) {
+    const previous = kept[kept.length - 1];
+    if (previous) {
+      const comparison = await comparePngFiles(previous.imagePath, frame.imagePath, { threshold: 0.02 });
+      if (comparison.pixelFidelityScore >= 0.995 || comparison.mismatchRatio <= 0.001) continue;
+    }
+    kept.push(frame);
+  }
+  const last = frames[frames.length - 1];
+  if (last && kept[kept.length - 1]?.imagePath !== last.imagePath) kept.push(last);
+  return kept;
+}
+
+function normalizePosterPaths(value: string | string[] | undefined): string[] {
+  if (!value) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function createStaticFramesFromPosters(
+  commands: SplitVideoSegmentsResult["commands"],
+  posters: Map<string, string>
+): StaticStepFrame[] {
+  return commands.flatMap((command) => {
+    const imagePath = posters.get(command.segment.id);
+    return imagePath
+      ? [
+          {
+            id: `${command.segment.id}-poster`,
+            imagePath,
+            segment: command.segment,
+            sampleMs: Math.max(0, Math.round(command.segment.durationMs * 0.9))
+          }
+        ]
+      : [];
+  });
 }
 
 function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmentsResult["commands"], posters: Map<string, string> = new Map()): DeckIR {
@@ -1498,33 +1584,31 @@ function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmen
 
 function createStaticStepDeck(
   sourceDeck: DeckIR,
-  commands: SplitVideoSegmentsResult["commands"],
-  posters: Map<string, string> = new Map()
+  frames: StaticStepFrame[]
 ): DeckIR | undefined {
   const slides: Slide[] = [];
-  for (const [index, command] of commands.entries()) {
-    const posterPath = posters.get(command.segment.id);
-    if (!posterPath) continue;
-    const sourceSlide = sourceDeck.deck.slides[command.segment.slideIndex];
+  for (const [index, frame] of frames.entries()) {
+    const sourceSlide = sourceDeck.deck.slides[frame.segment.slideIndex];
     slides.push({
       id: `static-step-slide-${index + 1}`,
       index: slides.length,
-      name: `${sourceSlide?.name ?? `Slide ${command.segment.slideIndex + 1}`} · static step ${command.segment.clickIndex + 1}`,
+      name: `${sourceSlide?.name ?? `Slide ${frame.segment.slideIndex + 1}`} · static step ${index + 1}`,
       background: { type: "solid", color: "#000000" },
       objects: [
         {
           id: `static-step-image-${index + 1}`,
           type: "image",
-          name: `${command.segment.id} final frame`,
+          name: `${frame.id} frame`,
           bounds: { x: 0, y: 0, width: sourceDeck.deck.size.width, height: sourceDeck.deck.size.height },
           opacity: 1,
-          source: { uri: posterPath },
+          source: { uri: frame.imagePath },
           metadata: {
             sourceSlideId: sourceSlide?.id ?? null,
-            sourceSlideIndex: command.segment.slideIndex,
-            sourceClickIndex: command.segment.clickIndex,
-            sourceMovieStartMs: command.segment.startMs,
-            sourceMovieEndMs: command.segment.endMs,
+            sourceSlideIndex: frame.segment.slideIndex,
+            sourceClickIndex: frame.segment.clickIndex,
+            sourceMovieStartMs: frame.segment.startMs,
+            sourceMovieEndMs: frame.segment.endMs,
+            sourceSegmentSampleMs: frame.sampleMs,
             keymorphStaticStep: true
           }
         }
@@ -1533,8 +1617,9 @@ function createStaticStepDeck(
       transition: { type: "cut", trigger: "click", durationMs: 0 },
       metadata: {
         sourceSlideId: sourceSlide?.id ?? null,
-        sourceSlideIndex: command.segment.slideIndex,
-        sourceClickIndex: command.segment.clickIndex,
+        sourceSlideIndex: frame.segment.slideIndex,
+        sourceClickIndex: frame.segment.clickIndex,
+        sourceSegmentSampleMs: frame.sampleMs,
         keymorphStaticStep: true
       }
     });
@@ -1561,7 +1646,7 @@ function createStaticStepDeck(
           severity: "info",
           code: "static-step-pptx",
           message:
-            "Generated from Keynote-rendered movie segment final frames, with one static full-slide image per presenter step."
+            "Generated from deduplicated Keynote-rendered movie samples, with one static full-slide image per discovered visual step."
         }
       ],
       degradedFeatures: [
