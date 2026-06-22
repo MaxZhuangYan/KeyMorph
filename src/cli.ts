@@ -55,6 +55,7 @@ export interface ProductBundleOptions {
     outputDir: string,
     options: SplitVideoSegmentsOptions
   ) => Promise<SplitVideoSegmentsResult>;
+  segmentPosterCreate?: (videoPath: string, durationMs: number, outputDir: string, id: string) => Promise<string | undefined>;
   video?: Pick<VideoExportOptions, "fps" | "scale" | "ffmpegPath">;
 }
 
@@ -155,6 +156,7 @@ export interface ProductBundlePaths {
   nativeAssetsDir: string;
   rebuiltPptx: string;
   segmentedPptx: string;
+  staticStepsPptx: string;
   lossReport: string;
   manifest: string;
   videoPlan: string;
@@ -188,6 +190,7 @@ export interface ProductBundleManifest {
     keynoteMovie: string | null;
     segmentPlan: string | null;
     segmentedPptx: string | null;
+    staticStepsPptx: string | null;
     nativeAssets: string | null;
     rebuiltPptx: string;
     lossReport: string;
@@ -390,15 +393,17 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
     createdAt,
     runtime,
     splitVideo: options.segmentVideoSplit,
+    createPoster: options.segmentPosterCreate,
     splitOptions: { ffmpegPath: options.video?.ffmpegPath }
   });
   manifest.artifacts.segmentPlan = segmented.segmentPlanPath;
   manifest.artifacts.segmentedPptx = segmented.pptxPath;
+  manifest.artifacts.staticStepsPptx = segmented.staticPptxPath;
   if (segmented.pptxPath) {
     manifest.report.recommendedFixes = Array.from(
       new Set([
         ...manifest.report.recommendedFixes,
-        "Use segmented.pptx for highest-fidelity step-by-step playback when editability is not required."
+        "Use static-steps.pptx for presenter-controlled builds when editability is not required, or segmented.pptx when animated video playback is preferred."
       ])
     );
   } else if (segmented.message) {
@@ -799,6 +804,7 @@ export function createProductApiResponse(bundle: ProductBundleResult, basePath: 
       ir: `${base}/deck.ir.json`,
       pptx: `${base}/rebuilt.pptx`,
       segmentedPptx: bundle.manifest.artifacts.segmentedPptx ? `${base}/${bundle.manifest.artifacts.segmentedPptx}` : null,
+      staticStepsPptx: bundle.manifest.artifacts.staticStepsPptx ? `${base}/${bundle.manifest.artifacts.staticStepsPptx}` : null,
       key: null,
       report: `${base}/loss-report.json`,
       manifest: `${base}/manifest.json`,
@@ -1281,10 +1287,11 @@ async function createSegmentedMoviePptx(input: {
   createdAt: string;
   runtime: ProductRuntimeSummary;
   splitVideo?: ProductBundleOptions["segmentVideoSplit"];
+  createPoster?: ProductBundleOptions["segmentPosterCreate"];
   splitOptions: SplitVideoSegmentsOptions;
-}): Promise<{ segmentPlanPath: string | null; pptxPath: string | null; message?: string }> {
+}): Promise<{ segmentPlanPath: string | null; pptxPath: string | null; staticPptxPath: string | null; message?: string }> {
   if (input.runtime.mode !== "keynote-movie" || !input.runtime.moviePath) {
-    return { segmentPlanPath: null, pptxPath: null };
+    return { segmentPlanPath: null, pptxPath: null, staticPptxPath: null };
   }
 
   const rawSegments = createSegmentPlan(input.deck);
@@ -1304,7 +1311,7 @@ async function createSegmentedMoviePptx(input: {
   });
 
   if (segments.length === 0) {
-    return { segmentPlanPath: "segment-plan.json", pptxPath: null, message: "No playable timeline segments were found for segmented PPTX export." };
+    return { segmentPlanPath: "segment-plan.json", pptxPath: null, staticPptxPath: null, message: "No playable timeline segments were found for segmented PPTX export." };
   }
 
   try {
@@ -1314,14 +1321,29 @@ async function createSegmentedMoviePptx(input: {
       input.paths.segmentsDir,
       input.splitOptions
     );
-    const posters = await createSegmentPosters(split.commands, input.paths.segmentPostersDir);
+    const posters = new Map<string, string>();
+    if (input.createPoster) {
+      await mkdir(input.paths.segmentPostersDir, { recursive: true });
+      for (const command of split.commands) {
+        const posterPath = await input.createPoster(command.outputPath, command.segment.durationMs, input.paths.segmentPostersDir, command.segment.id);
+        if (posterPath) posters.set(command.segment.id, posterPath);
+      }
+    } else {
+      for (const [id, posterPath] of await createSegmentPosters(split.commands, input.paths.segmentPostersDir)) {
+        posters.set(id, posterPath);
+      }
+    }
     const segmentedDeck = createSegmentedMovieDeck(input.deck, split.commands, posters);
     await exportIrToPptx(segmentedDeck, input.paths.segmentedPptx);
-    return { segmentPlanPath: "segment-plan.json", pptxPath: "segmented.pptx" };
+    const staticStepsDeck = createStaticStepDeck(input.deck, split.commands, posters);
+    const staticPptxPath = staticStepsDeck ? "static-steps.pptx" : null;
+    if (staticStepsDeck) await exportIrToPptx(staticStepsDeck, input.paths.staticStepsPptx);
+    return { segmentPlanPath: "segment-plan.json", pptxPath: "segmented.pptx", staticPptxPath };
   } catch (error) {
     return {
       segmentPlanPath: "segment-plan.json",
       pptxPath: null,
+      staticPptxPath: null,
       message: `Segmented high-fidelity PPTX export failed. Install ffmpeg or use macOS avconvert, then rerun conversion. ${errorMessage(error)}`
     };
   }
@@ -1474,6 +1496,87 @@ function createSegmentedMovieDeck(sourceDeck: DeckIR, commands: SplitVideoSegmen
   };
 }
 
+function createStaticStepDeck(
+  sourceDeck: DeckIR,
+  commands: SplitVideoSegmentsResult["commands"],
+  posters: Map<string, string> = new Map()
+): DeckIR | undefined {
+  const slides: Slide[] = [];
+  for (const [index, command] of commands.entries()) {
+    const posterPath = posters.get(command.segment.id);
+    if (!posterPath) continue;
+    const sourceSlide = sourceDeck.deck.slides[command.segment.slideIndex];
+    slides.push({
+      id: `static-step-slide-${index + 1}`,
+      index: slides.length,
+      name: `${sourceSlide?.name ?? `Slide ${command.segment.slideIndex + 1}`} · static step ${command.segment.clickIndex + 1}`,
+      background: { type: "solid", color: "#000000" },
+      objects: [
+        {
+          id: `static-step-image-${index + 1}`,
+          type: "image",
+          name: `${command.segment.id} final frame`,
+          bounds: { x: 0, y: 0, width: sourceDeck.deck.size.width, height: sourceDeck.deck.size.height },
+          opacity: 1,
+          source: { uri: posterPath },
+          metadata: {
+            sourceSlideId: sourceSlide?.id ?? null,
+            sourceSlideIndex: command.segment.slideIndex,
+            sourceClickIndex: command.segment.clickIndex,
+            sourceMovieStartMs: command.segment.startMs,
+            sourceMovieEndMs: command.segment.endMs,
+            keymorphStaticStep: true
+          }
+        }
+      ],
+      timeline: { durationMs: 1, events: [], dependencyGraph: { edges: [] } },
+      transition: { type: "cut", trigger: "click", durationMs: 0 },
+      metadata: {
+        sourceSlideId: sourceSlide?.id ?? null,
+        sourceSlideIndex: command.segment.slideIndex,
+        sourceClickIndex: command.segment.clickIndex,
+        keymorphStaticStep: true
+      }
+    });
+  }
+  if (slides.length === 0) return undefined;
+
+  return {
+    irVersion: IR_VERSION,
+    metadata: {
+      ...(sourceDeck.metadata ?? {}),
+      title: `${sourceDeck.metadata?.title ?? sourceDeck.deck.title ?? "Keynote"} static build steps`,
+      sourceApplication: "KeyMorph static step PPTX"
+    },
+    deck: {
+      id: `${sourceDeck.deck.id}-static-steps`,
+      title: `${sourceDeck.deck.title ?? "Keynote"} static build steps`,
+      size: sourceDeck.deck.size,
+      slides
+    },
+    conversion: {
+      status: "partial",
+      messages: [
+        {
+          severity: "info",
+          code: "static-step-pptx",
+          message:
+            "Generated from Keynote-rendered movie segment final frames, with one static full-slide image per presenter step."
+        }
+      ],
+      degradedFeatures: [
+        {
+          code: "static-step-pptx-not-editable",
+          severity: "info",
+          area: "media",
+          description: "Static step PPTX preserves each build's completed visual state but replaces editable slide objects and animation playback with full-slide images.",
+          fallback: "Edit the source Keynote deck and rerun conversion to refresh the static step draft."
+        }
+      ]
+    }
+  };
+}
+
 async function writeMovieRuntime(paths: ProductBundlePaths): Promise<ProductRuntimeSummary> {
   await writeFile(paths.runtimeHtml, renderMovieRuntimeHtml("keynote-movie.m4v"), "utf8");
   return {
@@ -1535,6 +1638,7 @@ function createBundlePaths(jobDir: string, sourceName: string): ProductBundlePat
     nativeAssetsDir: path.join(jobDir, "assets", "native"),
     rebuiltPptx: path.join(jobDir, "rebuilt.pptx"),
     segmentedPptx: path.join(jobDir, "segmented.pptx"),
+    staticStepsPptx: path.join(jobDir, "static-steps.pptx"),
     lossReport: path.join(jobDir, "loss-report.json"),
     manifest: path.join(jobDir, "manifest.json"),
     videoPlan: path.join(jobDir, "video-plan.json"),
@@ -1584,6 +1688,7 @@ function createBundleManifest(input: {
       keynoteMovie: null,
       segmentPlan: null,
       segmentedPptx: null,
+      staticStepsPptx: null,
       nativeAssets: null,
       rebuiltPptx: "rebuilt.pptx",
       lossReport: "loss-report.json",
@@ -1815,6 +1920,9 @@ function printBundleSummary(bundle: ProductBundleResult): void {
   console.log(`  rebuilt PPTX: ${bundle.paths.rebuiltPptx}`);
   if (bundle.manifest.artifacts.segmentedPptx) {
     console.log(`  segmented PPTX: ${bundle.paths.segmentedPptx}`);
+  }
+  if (bundle.manifest.artifacts.staticStepsPptx) {
+    console.log(`  static steps PPTX: ${bundle.paths.staticStepsPptx}`);
   }
   if (bundle.manifest.artifacts.segmentPlan) {
     console.log(`  segment plan: ${bundle.paths.segmentPlan}`);
