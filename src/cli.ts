@@ -403,7 +403,7 @@ export async function createProductBundle(inputPath: string, outputDir: string, 
     manifest.report.recommendedFixes = Array.from(
       new Set([
         ...manifest.report.recommendedFixes,
-        "Use static-steps.pptx for presenter-controlled builds when editability is not required, or segmented.pptx when animated video playback is preferred."
+        "Use segmented.pptx for the smoothest high-fidelity animated playback; use static-steps.pptx only when presenter-controlled still states are preferred."
       ])
     );
   } else if (segmented.message) {
@@ -1431,7 +1431,7 @@ async function createSegmentPosterAt(videoPath: string, sampleMs: number, output
       "--duration",
       "0.5"
     ]);
-    await runCommand("/usr/bin/qlmanage", ["-t", "-s", "1280", "-o", outputDir, sampleVideo]);
+    await runCommand("/usr/bin/qlmanage", ["-t", "-s", "5120", "-o", outputDir, sampleVideo]);
     const generated = `${sampleVideo}.png`;
     if (await fileExistsWithContent(generated)) return generated;
   } catch {

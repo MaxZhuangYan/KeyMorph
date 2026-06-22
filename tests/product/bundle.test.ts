@@ -573,12 +573,12 @@ describe("product bundle workflow", () => {
     assert.match(source, /轉換保真度/);
     assert.match(source, /Keynote 基准对比需要原始 \.key 源文件/);
     assert.match(source, /Keynote 基準對比需要原始 \.key 來源檔/);
-    assert.match(source, /下载静态构件步骤 PPTX/);
-    assert.match(source, /下載靜態構件步驟 PPTX/);
-    assert.match(source, /下载动画分段 PPTX/);
-    assert.match(source, /下載動畫分段 PPTX/);
-    assert.match(source, /downloadLink\(result\.downloads\.staticStepsPptx, t\('downloadStaticStepsPptx'\)\)/);
+    assert.match(source, /下载高清丝滑动画 PPTX/);
+    assert.match(source, /下載高清流暢動畫 PPTX/);
+    assert.match(source, /下载兜底静态步骤 PPTX/);
+    assert.match(source, /下載備用靜態步驟 PPTX/);
     assert.match(source, /downloadLink\(result\.downloads\.segmentedPptx, t\('downloadSegmentedPptx'\)\)/);
+    assert.match(source, /downloadLink\(result\.downloads\.staticStepsPptx, t\('downloadStaticStepsPptx'\)\)/);
     assert.match(source, /pruneOldJobs\(jobId, 2\)/);
     assert.match(source, /baselineCanRun/);
     assert.match(source, /renderBaseline" type="button"' \+ \(baselineCanRun \? '' : ' disabled'\)/);
